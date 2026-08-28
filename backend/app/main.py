@@ -62,6 +62,15 @@ inngest.fast_api.serve(app, inngest_client, [process_case_workflow])
 def health_check():
     return {"status": "healthy"}
 
+@app.get("/")
+def serve_dashboard():
+    from fastapi.responses import FileResponse
+    import os
+    index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"status": "Dashboard not found"}
+
 
 # ── Case CRUD ────────────────────────────────────────────────────────────
 
