@@ -70,3 +70,30 @@ class DecisionResult(BaseModel):
             if self.action_parameters["channel"] not in ["email", "sms"]:
                 raise ValueError("'channel' must be 'email' or 'sms'")
         return self
+class ExecutionStatus(str, enum.Enum):
+    DRY_RUN = "dry_run"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+class ExecutionResult(BaseModel):
+    status: ExecutionStatus
+    action_taken: RecoveryActionType
+    reason: str
+    external_reference_id: Optional[str] = None
+    action_parameters_used: Dict[str, Any] = Field(default_factory=dict)
+
+class PolicyApprovedDecision(BaseModel):
+    decision: DecisionResult
+    policy_reason: str
+    idempotency_key: str
+
+class PolicyEvaluationResult(BaseModel):
+    allowed: bool
+    reason: str
+    approved_decision: Optional[PolicyApprovedDecision] = None
+
+class PipelineResult(BaseModel):
+    diagnosis: DiagnosisResult
+    decision: DecisionResult
+    policy_evaluation: PolicyEvaluationResult
+    execution_result: Optional[ExecutionResult] = None

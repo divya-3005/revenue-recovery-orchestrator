@@ -1,6 +1,10 @@
 import enum
 from typing import Tuple, Dict, Any
-from app.domain import RecoveryCaseContext, RecoveryActionType
+from app.domain import (
+    RecoveryCaseContext, RecoveryActionType, DecisionResult, 
+    PolicyApprovedDecision, PolicyEvaluationResult
+)
+import hashlib
 
 class PolicyConfig:
     MAX_RETRIES: int = 3
@@ -9,41 +13,57 @@ class PolicyConfig:
     REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE: int = 5000000 
     BLOCK_HARD_DECLINES: bool = True
 
-def evaluate_policy(case: RecoveryCaseContext, proposed_action: RecoveryActionType, proposed_parameters: Dict[str, Any] = None) -> Tuple[bool, str]:
+def _generate_idempotency_key(case: RecoveryCaseContext, decision: DecisionResult) -> str:
+    """Generates a deterministic idempotency key for the approved action."""
+    raw_key = f"{case.id}-{decision.recommended_action.value}-{case.retry_count}"
+    return hashlib.sha256(raw_key.encode('utf-8')).hexdigest()
+
+def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult) -> PolicyEvaluationResult:
     """
     Deterministic rule layer that gates the AI decision engine.
-    Returns (is_allowed, reason).
+    Returns a PolicyEvaluationResult containing the PolicyApprovedDecision if allowed.
     """
-    if proposed_parameters is None:
-        proposed_parameters = {}
+    proposed_action = decision.recommended_action
+    proposed_parameters = decision.action_parameters
+
+    def reject(reason: str) -> PolicyEvaluationResult:
+        return PolicyEvaluationResult(allowed=False, reason=reason, approved_decision=None)
+
+    def approve(reason: str) -> PolicyEvaluationResult:
+        approved = PolicyApprovedDecision(
+            decision=decision,
+            policy_reason=reason,
+            idempotency_key=_generate_idempotency_key(case, decision)
+        )
+        return PolicyEvaluationResult(allowed=True, reason=reason, approved_decision=approved)
 
     # Rule 1: Escalation and stopping are always allowed
     if proposed_action in [RecoveryActionType.ESCALATE_TO_HUMAN, RecoveryActionType.STOP]:
-        return True, f"Action {proposed_action.value} is always permitted."
+        return approve(f"Action {proposed_action.value} is always permitted.")
 
     # Rule 2: High value cases require human approval for financial actions
     if case.amount_paise > PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE:
         if proposed_action != RecoveryActionType.SEND_REMINDER: 
-            return False, f"Action blocked: Case value ({case.amount_paise} paise) exceeds automatic threshold. Human approval required."
+            return reject(f"Action blocked: Case value ({case.amount_paise} paise) exceeds automatic threshold. Human approval required.")
 
     # Rule 3: Cap discount percentage
     if proposed_action == RecoveryActionType.OFFER_DISCOUNT:
         discount_pct = proposed_parameters.get("discount_percent", 0)
         if discount_pct > PolicyConfig.MAX_DISCOUNT_PERCENT:
-            return False, f"Action blocked: Proposed discount ({discount_pct}%) exceeds policy maximum ({PolicyConfig.MAX_DISCOUNT_PERCENT}%)."
+            return reject(f"Action blocked: Proposed discount ({discount_pct}%) exceeds policy maximum ({PolicyConfig.MAX_DISCOUNT_PERCENT}%).")
         if discount_pct <= 0:
-            return False, "Action blocked: Discount percentage must be greater than zero."
+            return reject("Action blocked: Discount percentage must be greater than zero.")
 
     # Rule 4: Block retries on hard declines
     if proposed_action == RecoveryActionType.RETRY_CHARGE and PolicyConfig.BLOCK_HARD_DECLINES:
         payload = case.raw_signal_payload or {}
         reason = payload.get("reason", "").lower()
         if "hard_decline" in reason or "lost_card" in reason or "stolen" in reason:
-            return False, "Action blocked: Policy forbids retrying hard declines."
+            return reject("Action blocked: Policy forbids retrying hard declines.")
 
-    # Rule 5: Max retries cap (Now uses domain state)
+    # Rule 5: Max retries cap
     if proposed_action == RecoveryActionType.RETRY_CHARGE:
         if case.retry_count >= PolicyConfig.MAX_RETRIES:
-            return False, f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached."
+            return reject(f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached.")
 
-    return True, "Action allowed by policy."
+    return approve("Action allowed by policy.")
