@@ -10,7 +10,7 @@ import hashlib
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 from app.models import AuditLog, RecoveryCase
-from app.domain import RecoveryCaseContext, DiagnosisResult
+from app.domain import RecoveryCaseContext, DiagnosisResult, ExecutionStatus
 
 
 def _generate_audit_id(case_id: str, stage: str, logical_attempt: int) -> str:
@@ -90,6 +90,15 @@ def record_execution_checkpoint(session: Session, case: RecoveryCaseContext, exe
         reasoning=exec_result.reason
     ).on_conflict_do_nothing()
     result = session.execute(stmt)
+    
+    # Update cumulative discount if applicable
+    if exec_result.status == ExecutionStatus.SUCCESS and exec_result.action_taken == "offer_discount":
+        discount_applied = exec_result.action_parameters_used.get("discount_applied_paise", 0)
+        if discount_applied > 0:
+            db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case.id).first()
+            if db_case:
+                db_case.cumulative_discount_paise += discount_applied
+
     session.commit()
     return result.rowcount > 0
 

@@ -75,14 +75,25 @@ def test_razorpay_executor_success():
         assert len(ref_id) <= 40
 
 
-def test_razorpay_executor_unsupported_action():
-    case = _make_case()
+def test_razorpay_executor_offer_discount():
+    case = _make_case(amount_paise=100000)
     approved = _make_approved(RecoveryActionType.OFFER_DISCOUNT, {"discount_percent": 10})
 
     executor = RazorpayExecutor()
-    result = executor.execute(case, approved)
-    assert result.status == ExecutionStatus.FAILED
-    assert "not supported" in result.reason
+    with patch.object(executor.client.payment_link, 'create') as mock_create:
+        mock_create.return_value = {"id": "plink_discount_123"}
+        
+        result = executor.execute(case, approved)
+        assert result.status == ExecutionStatus.SUCCESS
+        assert result.action_taken == RecoveryActionType.OFFER_DISCOUNT
+        assert result.external_reference_id == "plink_discount_123"
+        
+        # Original amount 100000, 10% discount = 10000, new amount = 90000
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["data"]["amount"] == 90000
+        
+        assert result.action_parameters_used["discount_applied_paise"] == 10000
+        assert result.action_parameters_used["amount_charged_paise"] == 90000
 
 
 def test_razorpay_executor_api_failure():
@@ -158,7 +169,7 @@ def test_executor_rejects_raw_decision():
 
 if __name__ == "__main__":
     test_razorpay_executor_success()
-    test_razorpay_executor_unsupported_action()
+    test_razorpay_executor_offer_discount()
     test_razorpay_executor_api_failure()
     test_razorpay_executor_escalate_no_api_call()
     test_razorpay_executor_stop_no_api_call()

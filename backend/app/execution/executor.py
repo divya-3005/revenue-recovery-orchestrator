@@ -76,11 +76,21 @@ class RazorpayExecutor(ActionExecutor):
                 action_parameters_used=approved_decision.decision.action_parameters
             )
 
-        # ── Payment Link actions (RETRY_CHARGE / SEND_REMINDER) ─────────
+        # ── Payment Link actions (RETRY_CHARGE / SEND_REMINDER / OFFER_DISCOUNT) ─────────
         if action in [RecoveryActionType.RETRY_CHARGE, RecoveryActionType.SEND_REMINDER]:
             return self._create_payment_link(case, approved_decision)
+            
+        if action == RecoveryActionType.OFFER_DISCOUNT:
+            discount_percent = approved_decision.decision.action_parameters.get("discount_percent", 0)
+            discount_amount_paise = int(case.amount_paise * (discount_percent / 100.0))
+            discounted_amount = case.amount_paise - discount_amount_paise
+            
+            result = self._create_payment_link(case, approved_decision, amount_override=discounted_amount)
+            # Record the actual discount applied so it can be persisted by the caller
+            result.action_parameters_used["discount_applied_paise"] = discount_amount_paise
+            return result
 
-        # ── Unsupported actions (OFFER_DISCOUNT etc.) ────────────────────
+        # ── Unsupported actions ────────────────────
         return ExecutionResult(
             status=ExecutionStatus.FAILED,
             action_taken=action,
@@ -88,7 +98,7 @@ class RazorpayExecutor(ActionExecutor):
             action_parameters_used=approved_decision.decision.action_parameters
         )
 
-    def _create_payment_link(self, case: RecoveryCaseContext, approved_decision: PolicyApprovedDecision) -> ExecutionResult:
+    def _create_payment_link(self, case: RecoveryCaseContext, approved_decision: PolicyApprovedDecision, amount_override: int = None) -> ExecutionResult:
         """Create a Razorpay Payment Link for retry or reminder actions."""
         action = approved_decision.decision.recommended_action
 
@@ -98,14 +108,19 @@ class RazorpayExecutor(ActionExecutor):
             # Max 40 characters allowed by Razorpay API.
             reference_id = self._make_reference_id(case, action.value)
 
-            description = (
-                f"Retry payment for case {case.id}"
-                if action == RecoveryActionType.RETRY_CHARGE
-                else f"Payment reminder for case {case.id}"
-            )
+            if action == RecoveryActionType.OFFER_DISCOUNT:
+                description = f"Discounted payment for case {case.id}"
+            else:
+                description = (
+                    f"Retry payment for case {case.id}"
+                    if action == RecoveryActionType.RETRY_CHARGE
+                    else f"Payment reminder for case {case.id}"
+                )
+                
+            amount_to_charge = amount_override if amount_override is not None else case.amount_paise
 
             link_data = {
-                "amount": case.amount_paise,
+                "amount": amount_to_charge,
                 "currency": case.currency,
                 "description": description,
                 "reference_id": reference_id,
@@ -122,12 +137,16 @@ class RazorpayExecutor(ActionExecutor):
             # SDK call: payment_link.create(data) — no headers kwarg
             payment_link = self.client.payment_link.create(data=link_data)
 
+            # Important: make a copy of parameters to avoid mutating the original decision
+            params_used = approved_decision.decision.action_parameters.copy()
+            params_used["amount_charged_paise"] = amount_to_charge
+            
             return ExecutionResult(
                 status=ExecutionStatus.SUCCESS,
                 action_taken=action,
                 reason="Razorpay payment link created successfully.",
                 external_reference_id=payment_link.get("id"),
-                action_parameters_used=approved_decision.decision.action_parameters
+                action_parameters_used=params_used
             )
         except Exception as e:
             return ExecutionResult(
@@ -135,7 +154,7 @@ class RazorpayExecutor(ActionExecutor):
                 action_taken=action,
                 reason=f"Razorpay API failure: {str(e)}",
                 external_reference_id=None,
-                action_parameters_used=approved_decision.decision.action_parameters
+                action_parameters_used=approved_decision.decision.action_parameters.copy()
             )
 
     @staticmethod
