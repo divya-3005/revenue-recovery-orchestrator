@@ -143,14 +143,8 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         
     event_id = payload.get("id", "unknown_event_id")
     
-    # Idempotency check: see if case with this event_id exists in raw_signal_payload
-    existing_case = db.query(models.RecoveryCase).filter(
-        models.RecoveryCase.raw_signal_payload["event_id"].as_string() == event_id
-    ).first()
+    from sqlalchemy.dialects.postgresql import insert
     
-    if existing_case:
-        return {"status": "idempotent", "case_id": existing_case.id}
-        
     # Map payload to case fields
     if event_type == "payment.failed":
         case_type = CaseType.SUBSCRIPTION_FAILED
@@ -167,33 +161,55 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         customer_id = sub.get("customer_id") or "unknown"
         payment_rail = None
         
-    payload["event_id"] = event_id  # Store event_id inside payload for future idempotency checks
-    
-    db_case = models.RecoveryCase(
+    # Atomic INSERT ON CONFLICT DO NOTHING
+    stmt = insert(models.RecoveryCase).values(
+        id=models.generate_uuid(),
         case_type=case_type,
         amount_paise=amount_paise,
         currency=currency,
         customer_id=customer_id,
         payment_rail=payment_rail,
         raw_signal_payload=payload,
-    )
+        razorpay_event_id=event_id
+    ).on_conflict_do_nothing(
+        index_elements=['razorpay_event_id'],
+        index_where=models.RecoveryCase.razorpay_event_id.isnot(None)
+    ).returning(models.RecoveryCase.id)
+    
+    result = db.execute(stmt)
+    inserted_id = result.scalar()
+    db.commit()
+    
+    if inserted_id:
+        inserted = True
+        case_id = inserted_id
+    else:
+        inserted = False
+        # Retrieve the pre-existing case ID
+        existing_case = db.query(models.RecoveryCase).filter(
+            models.RecoveryCase.razorpay_event_id == event_id
+        ).first()
+        case_id = existing_case.id
+    
+    if not inserted:
+        return {"status": "idempotent", "case_id": case_id}
 
+    # Only create audit log and fire event if it was actually created
     audit_log = models.AuditLog(
+        case_id=case_id,
         action_type="SIGNAL_RECEIVED",
         description=f"Webhook case created for event: {event_type}",
         reasoning="Automated ingestion via Razorpay webhook"
     )
-    db_case.audit_logs.append(audit_log)
-    db.add(db_case)
+    db.add(audit_log)
     db.commit()
-    db.refresh(db_case)
 
     try:
-        inngest_client.send_sync(Event(name="case.received", data={"case_id": db_case.id}))
+        inngest_client.send_sync(Event(name="case.received", data={"case_id": case_id}))
     except Exception as e:
-        logger.warning(f"Inngest event dispatch failed for webhook case {db_case.id}: {e}.")
+        logger.warning(f"Inngest event dispatch failed for webhook case {case_id}: {e}.")
 
-    return {"status": "created", "case_id": db_case.id}
+    return {"status": "created", "case_id": case_id}
 
 
 @app.get("/api/v1/cases", response_model=List[schemas.RecoveryCaseResponse])

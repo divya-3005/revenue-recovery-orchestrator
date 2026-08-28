@@ -39,7 +39,9 @@ def generate_signature(secret: str, payload: dict) -> str:
     msg = json.dumps(payload).encode('utf-8')
     return hmac.new(secret.encode('utf-8'), msg, hashlib.sha256).hexdigest()
 
+import uuid
 def test_valid_webhook_signature_creates_case(client, mock_webhook_secret, mock_inngest_client):
+    event_id = f"evt_test_1_{uuid.uuid4().hex}"
     payload = {
         "entity": "event",
         "account_id": "acc_123",
@@ -58,7 +60,7 @@ def test_valid_webhook_signature_creates_case(client, mock_webhook_secret, mock_
             }
         },
         "created_at": 1600000000,
-        "id": "evt_test_1"
+        "id": event_id
     }
     
     signature = generate_signature(mock_webhook_secret, payload)
@@ -103,9 +105,10 @@ def test_invalid_signature_is_rejected(client, mock_webhook_secret, mock_inngest
     assert response.json()["detail"] == "Invalid signature"
 
 def test_idempotency_prevents_duplicates(client, mock_webhook_secret, mock_inngest_client):
+    event_id = f"evt_test_idempotent_{uuid.uuid4().hex}"
     payload = {
         "event": "payment.failed",
-        "id": "evt_test_idempotent",
+        "id": event_id,
         "payload": {
             "payment": {
                 "entity": {
@@ -141,7 +144,56 @@ def test_idempotency_prevents_duplicates(client, mock_webhook_secret, mock_innge
     # Verify only one case in DB for this event
     db = SessionLocal()
     cases = db.query(RecoveryCase).filter(
-        RecoveryCase.raw_signal_payload["event_id"].as_string() == "evt_test_idempotent"
+        RecoveryCase.razorpay_event_id == event_id
     ).all()
     assert len(cases) == 1
     db.close()
+
+import concurrent.futures
+
+def test_idempotency_concurrency(client, mock_webhook_secret, mock_inngest_client):
+    """
+    Fire 10 genuinely concurrent requests with an identical payload and signature.
+    Assert exactly one row exists in recovery_cases for that event_id afterward.
+    Run this test at least 20 times in a loop locally.
+    """
+    for i in range(20):
+        event_id = f"evt_concurrent_{uuid.uuid4().hex}"
+        payload = {
+            "event": "payment.failed",
+            "id": event_id,
+            "payload": {
+                "payment": {
+                    "entity": {
+                        "amount": 100,
+                        "currency": "INR",
+                        "customer_id": "cust_concurrent"
+                    }
+                }
+            }
+        }
+        
+        signature = generate_signature(mock_webhook_secret, payload)
+        headers = {"X-Razorpay-Signature": signature}
+        content = json.dumps(payload)
+        
+        def make_request():
+            return client.post("/webhooks/razorpay", content=content, headers=headers)
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(make_request) for _ in range(10)]
+            responses = [f.result() for f in futures]
+            
+        # Exactly 1 should be created, 9 should be idempotent
+        created_count = sum(1 for r in responses if r.json().get("status") == "created")
+        idempotent_count = sum(1 for r in responses if r.json().get("status") == "idempotent")
+        
+        assert created_count == 1, f"Iteration {i}: Expected 1 created, got {created_count}"
+        assert idempotent_count == 9, f"Iteration {i}: Expected 9 idempotent, got {idempotent_count}"
+        
+        db = SessionLocal()
+        cases = db.query(RecoveryCase).filter(
+            RecoveryCase.razorpay_event_id == event_id
+        ).all()
+        assert len(cases) == 1, f"Iteration {i}: Expected 1 case in DB, got {len(cases)}"
+        db.close()

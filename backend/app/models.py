@@ -22,10 +22,21 @@ class CaseStatus(str, enum.Enum):
 def generate_uuid():
     return str(uuid.uuid4())
 
+from sqlalchemy import Index, text
+
 class RecoveryCase(Base):
     __tablename__ = "recovery_cases"
+    __table_args__ = (
+        Index(
+            "ix_recovery_cases_razorpay_event_id", 
+            "razorpay_event_id", 
+            unique=True, 
+            postgresql_where=text("razorpay_event_id IS NOT NULL")
+        ),
+    )
 
     id = Column(String, primary_key=True, default=generate_uuid)
+    razorpay_event_id = Column(String(255), nullable=True)
     case_type = Column(Enum(CaseType), nullable=False, index=True)
     status = Column(Enum(CaseStatus), nullable=False, default=CaseStatus.OPEN, index=True)
     amount_paise = Column(Integer, nullable=False) # Store in smallest currency unit
