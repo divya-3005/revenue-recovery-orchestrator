@@ -24,6 +24,7 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql+psycopg://postgres:postgres@db:5432/revenue_recovery
+      - INNGEST_BASE_URL=http://host.docker.internal:8288
     depends_on:
       db:
         condition: service_healthy

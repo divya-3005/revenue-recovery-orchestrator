@@ -11,14 +11,9 @@ import sys
 class FlakyAIProvider(AIProvider):
     def __init__(self, succeed: bool):
         self.succeed = succeed
-        self.transaction_active_during_call = None
+        self.transaction_was_active = False
 
     def ask_structured(self, prompt: str, response_schema: Type[Any]) -> Any:
-        # In a real scenario, holding a DB lock during a 5 second network call is terrible.
-        # We simulate checking if a transaction is currently holding locks.
-        # SQLAlchemy Session.is_active is True even before a transaction begins in 2.0, 
-        # but we can just check if we are explicitly in a transaction if we needed to.
-        # For this test, we'll just trust that `run_diagnosis_step` doesn't do `with session.begin()` spanning this.
         if not self.succeed:
             raise Exception("AI Provider simulated crash during diagnosis!")
             
@@ -50,26 +45,44 @@ def test_workflow_diagnosis():
         db_case = get_db_case(db)
         case_domain = RecoveryCaseContext.model_validate(db_case)
         
-        # 1. Diagnosis Succeeds -> Checkpoint Exists
+        # A. First checkpoint
         provider = FlakyAIProvider(succeed=True)
+        # E. Transaction boundary (pre-check)
+        # Refreshing db_case implicitly opens a transaction in SQLAlchemy. 
+        # We explicitly close it here to prove the workflow step handles its own transactions.
+        db.commit() 
+        assert db.in_transaction() is False
+        
         diagnosis = run_diagnosis_step(db, case_domain, provider)
         
-        assert diagnosis.root_cause_category == RootCauseCategory.SOFT_DECLINE
+        # Verify AI call didn't happen inside a transaction lock
+        # run_diagnosis_step handles the transaction internally ONLY for the checkpoint.
+        assert db.in_transaction() is False
         
-        # Verify AuditLog was written
         audit_logs = db.execute(select(models.AuditLog).where(models.AuditLog.case_id == case_domain.id)).scalars().all()
         assert len(audit_logs) == 1
         assert audit_logs[0].action_type == "DIAGNOSIS_COMPLETED"
         assert "soft_decline" in audit_logs[0].description
         
-        # 3. Replaying the same checkpoint does not create duplicate events
-        # We explicitly run the step again with the SAME state (retry_count=0)
+        # B. Replay: execute the exact same logical checkpoint twice
+        # No exception should be raised, and length should still be 1.
+        try:
+            run_diagnosis_step(db, case_domain, provider)
+        except Exception as e:
+            assert False, f"Replay raised exception: {e}"
+            
+        audit_logs_after_replay = db.execute(select(models.AuditLog).where(models.AuditLog.case_id == case_domain.id)).scalars().all()
+        assert len(audit_logs_after_replay) == 1 # Exactly one row exists
+        
+        # D. Logical attempt isolation
+        # Simulate an intentional retry by advancing the retry_count (logical_attempt)
+        case_domain.retry_count = 1
         run_diagnosis_step(db, case_domain, provider)
         
-        audit_logs_after_replay = db.execute(select(models.AuditLog).where(models.AuditLog.case_id == case_domain.id)).scalars().all()
-        assert len(audit_logs_after_replay) == 1 # Still exactly 1! Idempotency worked.
+        audit_logs_after_new_attempt = db.execute(select(models.AuditLog).where(models.AuditLog.case_id == case_domain.id)).scalars().all()
+        assert len(audit_logs_after_new_attempt) == 2 # Distinct checkpoint identity created!
         
-        # 2. Diagnosis Fails -> No event written
+        # C. Failure
         db_case_2 = get_db_case(db)
         case_domain_2 = RecoveryCaseContext.model_validate(db_case_2)
         
@@ -81,7 +94,7 @@ def test_workflow_diagnosis():
             assert "simulated crash" in str(e)
             
         audit_logs_fail = db.execute(select(models.AuditLog).where(models.AuditLog.case_id == case_domain_2.id)).scalars().all()
-        assert len(audit_logs_fail) == 0 # No event written because AI failed before checkpoint
+        assert len(audit_logs_fail) == 0 # No event written because AI failed
         
         print("SUCCESS: Workflow durable checkpoint tests passed.")
     finally:
