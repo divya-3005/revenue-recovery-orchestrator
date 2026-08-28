@@ -37,8 +37,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Creating database tables if they do not exist...")
-    models.Base.metadata.create_all(bind=engine)
+    logger.info("Application starting up (skipping automatic table creation, using Alembic)...")
     yield
     logger.info("Shutting down application...")
 
