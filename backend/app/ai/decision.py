@@ -1,5 +1,6 @@
 from app.domain import RecoveryCaseContext, DiagnosisResult, DecisionResult
 from app.ai.provider import AIProvider
+from app.policy import PolicyConfig
 
 def decide_action(case: RecoveryCaseContext, diagnosis: DiagnosisResult, provider: AIProvider) -> DecisionResult:
     """
@@ -13,7 +14,7 @@ def decide_action(case: RecoveryCaseContext, diagnosis: DiagnosisResult, provide
     [CASE STATE]
     Case ID: {case.id}
     Amount: {case.amount_paise} paise
-    Retry Count: {case.retry_count} (Max allowed: 3)
+    Retry Count: {case.retry_count} (Max allowed: {PolicyConfig.MAX_RETRIES})
     Cumulative Discount Given: {case.cumulative_discount_paise} paise
     
     [DIAGNOSIS]
@@ -24,9 +25,9 @@ def decide_action(case: RecoveryCaseContext, diagnosis: DiagnosisResult, provide
     [INSTRUCTIONS]
     Propose the single best recovery action from the following list:
     1. retry_charge: Use if the diagnosis is a temporary 'soft_decline'. Provide parameter: {{"delay_hours": <int>}}. Do NOT use if max retries reached.
-    2. offer_discount: Use for 'friction' or pricing-related drop-offs. Provide parameter: {{"discount_percent": <int>}}. Do NOT exceed 15%.
+    2. offer_discount: Use for 'friction' or pricing-related drop-offs. Provide parameter: {{"discount_percent": <int>}}. Do NOT exceed {PolicyConfig.MAX_DISCOUNT_PERCENT}%.
     3. send_reminder: Use for 'missed_payment' or if the user simply needs a nudge. Provide parameter: {{"channel": "email" | "sms"}}.
-    4. escalate_to_human: Use for 'dispute', 'hard_decline', high-value cases over 50,000 INR, or if the diagnosis is 'unknown'/'low confidence'.
+    4. escalate_to_human: Use for 'dispute', 'hard_decline', high-value cases over {int(PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE / 100):,} INR, or if the diagnosis is 'unknown'/'low confidence'.
     5. stop: Use if the case is unrecoverable and should be closed (e.g., fraud confirmed).
     
     You MUST output your decision with:
