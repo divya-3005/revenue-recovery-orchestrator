@@ -119,15 +119,24 @@ class RazorpayExecutor(ActionExecutor):
                 
             amount_to_charge = amount_override if amount_override is not None else case.amount_paise
 
+            def _extract_customer_info():
+                payload = case.raw_signal_payload or {}
+                # Try razorpay webhook format
+                payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+                email = payment.get("email") or payload.get("email")
+                contact = payment.get("contact") or payload.get("contact")
+                
+                return {
+                    "contact": str(contact) if contact else "9999999999",
+                    "email": str(email) if email else "customer@example.com"
+                }
+
             link_data = {
                 "amount": amount_to_charge,
                 "currency": case.currency,
                 "description": description,
                 "reference_id": reference_id,
-                "customer": {
-                    "contact": "9999999999",   # placeholder for MVP
-                    "email": "customer@example.com"
-                },
+                "customer": _extract_customer_info(),
                 "notes": {
                     "case_id": case.id,
                     "action": action.value
