@@ -8,6 +8,8 @@ class RecoveryActionType(str, enum.Enum):
     ESCALATE_TO_HUMAN = "escalate_to_human"
     STOP = "stop"
 
+from app.domain import RecoveryCaseContext
+
 class PolicyConfig:
     MAX_RETRIES: int = 3
     MAX_DISCOUNT_PERCENT: int = 15
@@ -15,7 +17,7 @@ class PolicyConfig:
     REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE: int = 5000000 
     BLOCK_HARD_DECLINES: bool = True
 
-def evaluate_policy(case, proposed_action: RecoveryActionType, proposed_parameters: Dict[str, Any] = None) -> Tuple[bool, str]:
+def evaluate_policy(case: RecoveryCaseContext, proposed_action: RecoveryActionType, proposed_parameters: Dict[str, Any] = None) -> Tuple[bool, str]:
     """
     Deterministic rule layer that gates the AI decision engine.
     Returns (is_allowed, reason).
@@ -47,12 +49,9 @@ def evaluate_policy(case, proposed_action: RecoveryActionType, proposed_paramete
         if "hard_decline" in reason or "lost_card" in reason or "stolen" in reason:
             return False, "Action blocked: Policy forbids retrying hard declines."
 
-    # Rule 5: Max retries cap
-    # FUTURE-DEPENDENT: Requires `retry_count` state to be persisted on RecoveryCase.
+    # Rule 5: Max retries cap (Now uses domain state)
     if proposed_action == RecoveryActionType.RETRY_CHARGE:
-        # TODO: Implement when retry_count is added
-        # if getattr(case, 'retry_count', 0) >= PolicyConfig.MAX_RETRIES:
-        #     return False, f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached."
-        pass
+        if case.retry_count >= PolicyConfig.MAX_RETRIES:
+            return False, f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached."
 
     return True, "Action allowed by policy."

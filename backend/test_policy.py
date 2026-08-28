@@ -2,25 +2,36 @@ from app.policy import evaluate_policy, RecoveryActionType, PolicyConfig
 from fastapi.testclient import TestClient
 from app.main import app
 
-class MockCase:
-    def __init__(self, amount_paise, raw_signal_payload=None):
-        self.amount_paise = amount_paise
-        self.raw_signal_payload = raw_signal_payload
+from app.domain import RecoveryCaseContext
+from app.models import CaseType, CaseStatus
+import uuid
 
+def create_mock_domain_case(amount_paise, raw_signal_payload=None, retry_count=0, cumulative_discount=0):
+    return RecoveryCaseContext(
+        id=str(uuid.uuid4()),
+        case_type=CaseType.SUBSCRIPTION_FAILED,
+        status=CaseStatus.OPEN,
+        amount_paise=amount_paise,
+        currency="INR",
+        customer_id="cust-test",
+        raw_signal_payload=raw_signal_payload or {},
+        retry_count=retry_count,
+        cumulative_discount_paise=cumulative_discount
+    )
 def test_policy_escalation_always_allowed():
-    case = MockCase(amount_paise=10000000) # High value
+    case = create_mock_domain_case(amount_paise=10000000) # High value
     is_allowed, reason = evaluate_policy(case, RecoveryActionType.ESCALATE_TO_HUMAN)
     assert is_allowed is True
     assert "always permitted" in reason
 
 def test_policy_stop_always_allowed():
-    case = MockCase(amount_paise=500)
+    case = create_mock_domain_case(amount_paise=500)
     is_allowed, reason = evaluate_policy(case, RecoveryActionType.STOP)
     assert is_allowed is True
 
 def test_policy_high_value_blocks_financial_actions():
     # Value is 50,001 INR (5000100 paise) which is above the 50,000 threshold
-    case = MockCase(amount_paise=PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE + 100)
+    case = create_mock_domain_case(amount_paise=PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE + 100)
     
     # Financial action (Retry) should be blocked
     is_allowed, reason = evaluate_policy(case, RecoveryActionType.RETRY_CHARGE)
@@ -32,7 +43,7 @@ def test_policy_high_value_blocks_financial_actions():
     assert is_allowed is True
 
 def test_policy_discount_caps():
-    case = MockCase(amount_paise=100000) # 1000 INR
+    case = create_mock_domain_case(amount_paise=100000) # 1000 INR
     
     # Within cap
     is_allowed, reason = evaluate_policy(case, RecoveryActionType.OFFER_DISCOUNT, {"discount_percent": 15})
@@ -50,15 +61,27 @@ def test_policy_discount_caps():
 
 def test_policy_hard_declines_blocked():
     # Soft decline
-    soft_case = MockCase(amount_paise=100000, raw_signal_payload={"reason": "insufficient_funds"})
+    soft_case = create_mock_domain_case(amount_paise=100000, raw_signal_payload={"reason": "insufficient_funds"})
     is_allowed, _ = evaluate_policy(soft_case, RecoveryActionType.RETRY_CHARGE)
     assert is_allowed is True
     
     # Hard decline
-    hard_case = MockCase(amount_paise=100000, raw_signal_payload={"reason": "lost_card_reported"})
+    hard_case = create_mock_domain_case(amount_paise=100000, raw_signal_payload={"reason": "lost_card_reported"})
     is_allowed, reason = evaluate_policy(hard_case, RecoveryActionType.RETRY_CHARGE)
     assert is_allowed is False
     assert "forbids retrying hard declines" in reason
+
+def test_policy_max_retries_capped():
+    # Under limit
+    case = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES - 1)
+    is_allowed, _ = evaluate_policy(case, RecoveryActionType.RETRY_CHARGE)
+    assert is_allowed is True
+    
+    # At limit
+    case_blocked = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES)
+    is_allowed, reason = evaluate_policy(case_blocked, RecoveryActionType.RETRY_CHARGE)
+    assert is_allowed is False
+    assert "Max retries" in reason
 
 def test_get_policy_endpoint():
     client = TestClient(app)
@@ -76,5 +99,6 @@ if __name__ == "__main__":
     test_policy_high_value_blocks_financial_actions()
     test_policy_discount_caps()
     test_policy_hard_declines_blocked()
+    test_policy_max_retries_capped()
     test_get_policy_endpoint()
     print("SUCCESS: All policy tests passed!")
