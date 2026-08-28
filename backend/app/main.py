@@ -6,6 +6,7 @@ from typing import List
 
 from app import models, schemas
 from app.database import engine, get_db
+from app.policy import PolicyConfig
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -62,3 +63,11 @@ def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_d
 def list_cases(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     cases = db.query(models.RecoveryCase).offset(skip).limit(limit).all()
     return cases
+@app.get("/api/v1/policy", response_model=schemas.PolicyConfigResponse)
+def get_policy():
+    return schemas.PolicyConfigResponse(
+        max_retries=PolicyConfig.MAX_RETRIES,
+        max_discount_percent=PolicyConfig.MAX_DISCOUNT_PERCENT,
+        require_human_approval_above_paise=PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE,
+        block_hard_declines=PolicyConfig.BLOCK_HARD_DECLINES
+    )

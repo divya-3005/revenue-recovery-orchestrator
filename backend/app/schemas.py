@@ -31,3 +31,10 @@ class AuditLogResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+class PolicyConfigResponse(BaseModel):
+    max_retries: int
+    max_discount_percent: int
+    require_human_approval_above_paise: int
+    block_hard_declines: bool
+
+    model_config = ConfigDict(from_attributes=True)
