@@ -43,10 +43,19 @@ def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_d
         payment_rail=case_in.payment_rail,
         raw_signal_payload=case_in.raw_signal_payload,
     )
+    
+    # Create the initial audit log immediately and atomically append it
+    audit_log = models.AuditLog(
+        action_type="SIGNAL_RECEIVED",
+        description=f"Case created for signal type: {case_in.case_type.value}",
+        reasoning="Initial ingestion from external signal"
+    )
+    db_case.audit_logs.append(audit_log)
+
     db.add(db_case)
     db.commit()
     db.refresh(db_case)
-    logger.info(f"Created RecoveryCase {db_case.id} for customer {db_case.customer_id}")
+    logger.info(f"Created RecoveryCase {db_case.id} for customer {db_case.customer_id} with initial audit log")
     return db_case
 
 @app.get("/api/v1/cases", response_model=List[schemas.RecoveryCaseResponse])

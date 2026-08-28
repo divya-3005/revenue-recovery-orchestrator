@@ -1,6 +1,7 @@
-from sqlalchemy import Column, String, Integer, DateTime, Enum
+from sqlalchemy import Column, String, Integer, DateTime, Enum, ForeignKey
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
 from app.database import Base
 import enum
 import uuid
@@ -36,3 +37,19 @@ class RecoveryCase(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    audit_logs = relationship("AuditLog", back_populates="case", cascade="all, delete-orphan")
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    case_id = Column(String, ForeignKey("recovery_cases.id"), nullable=False, index=True)
+    action_type = Column(String, nullable=False, index=True)
+    description = Column(String, nullable=False)
+    reasoning = Column(String, nullable=True)
+    
+    # Append-only: No onupdate
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    case = relationship("RecoveryCase", back_populates="audit_logs")
