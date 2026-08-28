@@ -1,14 +1,6 @@
 import enum
 from typing import Tuple, Dict, Any
-
-class RecoveryActionType(str, enum.Enum):
-    RETRY_CHARGE = "retry_charge"
-    SEND_REMINDER = "send_reminder"
-    OFFER_DISCOUNT = "offer_discount"
-    ESCALATE_TO_HUMAN = "escalate_to_human"
-    STOP = "stop"
-
-from app.domain import RecoveryCaseContext
+from app.domain import RecoveryCaseContext, RecoveryActionType
 
 class PolicyConfig:
     MAX_RETRIES: int = 3

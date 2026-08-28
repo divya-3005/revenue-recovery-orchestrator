@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Dict, Optional
 import enum
 from app.models import CaseType, CaseStatus
@@ -38,3 +38,35 @@ class RecoveryCaseContext(BaseModel):
     
     # We allow ORM mapping so we can easily convert from SQLAlchemy models
     model_config = ConfigDict(from_attributes=True)
+
+class RecoveryActionType(str, enum.Enum):
+    RETRY_CHARGE = "retry_charge"
+    SEND_REMINDER = "send_reminder"
+    OFFER_DISCOUNT = "offer_discount"
+    ESCALATE_TO_HUMAN = "escalate_to_human"
+    STOP = "stop"
+
+class DecisionResult(BaseModel):
+    recommended_action: RecoveryActionType
+    action_parameters: Dict[str, Any] = Field(default_factory=dict)
+    confidence_score: float = Field(..., ge=0.0, le=1.0)
+    reasoning: str
+
+    @model_validator(mode='after')
+    def validate_parameters(self) -> 'DecisionResult':
+        if self.recommended_action == RecoveryActionType.OFFER_DISCOUNT:
+            if "discount_percent" not in self.action_parameters:
+                raise ValueError("OFFER_DISCOUNT requires 'discount_percent' parameter")
+            if not isinstance(self.action_parameters["discount_percent"], int):
+                raise ValueError("'discount_percent' must be an integer")
+        elif self.recommended_action == RecoveryActionType.RETRY_CHARGE:
+            if "delay_hours" not in self.action_parameters:
+                raise ValueError("RETRY_CHARGE requires 'delay_hours' parameter")
+            if not isinstance(self.action_parameters["delay_hours"], int):
+                raise ValueError("'delay_hours' must be an integer")
+        elif self.recommended_action == RecoveryActionType.SEND_REMINDER:
+            if "channel" not in self.action_parameters:
+                raise ValueError("SEND_REMINDER requires 'channel' parameter")
+            if self.action_parameters["channel"] not in ["email", "sms"]:
+                raise ValueError("'channel' must be 'email' or 'sms'")
+        return self

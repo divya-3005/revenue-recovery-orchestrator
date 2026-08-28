@@ -13,9 +13,19 @@ class MockPrimaryProvider(AIProvider):
     def ask_structured(self, prompt: str, response_schema):
         self.calls += 1
         if self.should_fail_api:
-            class RateLimitError(Exception): pass
-            raise RateLimitError("Mock primary provider rate limited!")
-            
+            # Raise a real SDK exception to trigger the fallback
+            try:
+                import groq
+                import httpx
+                raise groq.RateLimitError(
+                    message="Mock primary provider rate limited!", 
+                    response=httpx.Response(429, request=httpx.Request("GET", "http://test")), 
+                    body=None
+                )
+            except ImportError:
+                class DummyAPIError(Exception): pass
+                raise DummyAPIError("Mock primary provider rate limited!")
+                
         if self.should_return_malformed:
             # Simulate returning bad json that fails validation
             # E.g. passing a string for a float field
