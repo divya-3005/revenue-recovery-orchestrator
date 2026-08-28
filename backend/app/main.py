@@ -14,8 +14,12 @@ Endpoints:
 
 import logging
 import random
+import hmac
+import hashlib
+import os
+import json
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Header
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from typing import List
@@ -96,6 +100,91 @@ def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_d
 
     logger.info(f"Created RecoveryCase {db_case.id} for customer {db_case.customer_id}")
     return db_case
+
+@app.post("/webhooks/razorpay")
+async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(None), db: Session = Depends(get_db)):
+    raw_body = await request.body()
+    webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+    
+    if not webhook_secret:
+        logger.error("RAZORPAY_WEBHOOK_SECRET is not configured")
+        raise HTTPException(status_code=500, detail="Webhook configuration error")
+        
+    if not x_razorpay_signature:
+        raise HTTPException(status_code=400, detail="Missing signature")
+        
+    # Verify signature
+    expected_sig = hmac.new(
+        key=webhook_secret.encode('utf-8'),
+        msg=raw_body,
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(expected_sig, x_razorpay_signature):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+        
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+        
+    event_type = payload.get("event")
+    if event_type not in ("payment.failed", "subscription.pending"):
+        return {"status": "ignored", "reason": "unhandled_event_type"}
+        
+    event_id = payload.get("id", "unknown_event_id")
+    
+    # Idempotency check: see if case with this event_id exists in raw_signal_payload
+    existing_case = db.query(models.RecoveryCase).filter(
+        models.RecoveryCase.raw_signal_payload["event_id"].as_string() == event_id
+    ).first()
+    
+    if existing_case:
+        return {"status": "idempotent", "case_id": existing_case.id}
+        
+    # Map payload to case fields
+    if event_type == "payment.failed":
+        case_type = CaseType.SUBSCRIPTION_FAILED
+        payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+        amount_paise = payment.get("amount", 0)
+        currency = payment.get("currency", "INR")
+        customer_id = payment.get("customer_id") or payment.get("email") or "unknown"
+        payment_rail = payment.get("method")
+    elif event_type == "subscription.pending":
+        case_type = CaseType.SUBSCRIPTION_FAILED
+        sub = payload.get("payload", {}).get("subscription", {}).get("entity", {})
+        amount_paise = sub.get("charge_at_mrr", 0)  # best effort fallback
+        currency = "INR"
+        customer_id = sub.get("customer_id") or "unknown"
+        payment_rail = None
+        
+    payload["event_id"] = event_id  # Store event_id inside payload for future idempotency checks
+    
+    db_case = models.RecoveryCase(
+        case_type=case_type,
+        amount_paise=amount_paise,
+        currency=currency,
+        customer_id=customer_id,
+        payment_rail=payment_rail,
+        raw_signal_payload=payload,
+    )
+
+    audit_log = models.AuditLog(
+        action_type="SIGNAL_RECEIVED",
+        description=f"Webhook case created for event: {event_type}",
+        reasoning="Automated ingestion via Razorpay webhook"
+    )
+    db_case.audit_logs.append(audit_log)
+    db.add(db_case)
+    db.commit()
+    db.refresh(db_case)
+
+    try:
+        inngest_client.send_sync(Event(name="case.received", data={"case_id": db_case.id}))
+    except Exception as e:
+        logger.warning(f"Inngest event dispatch failed for webhook case {db_case.id}: {e}.")
+
+    return {"status": "created", "case_id": db_case.id}
 
 
 @app.get("/api/v1/cases", response_model=List[schemas.RecoveryCaseResponse])
