@@ -21,6 +21,7 @@ class GeminiProvider(AIProvider):
         
     def ask_structured(self, prompt: str, response_schema: Type[T]) -> T:
         if os.getenv("GEMINI_API_KEY", "dummy_key") == "dummy_key":
+            logger.warning("GOOGLE_API_KEY not set. Using MockAIProvider.")
             if response_schema.__name__ == "DiagnosisResult":
                 return response_schema.model_validate({"root_cause_category": "friction", "specific_reason": "mocked", "confidence_score": 0.9, "reasoning": "mocked"})
             elif response_schema.__name__ == "DecisionResult":

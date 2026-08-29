@@ -33,14 +33,14 @@ class DryRunExecutor(ActionExecutor):
 
 class RazorpayExecutor(ActionExecutor):
     """
-    Real executor that calls Razorpay's test-mode APIs.
+    Real executor that wraps the razorpay-python SDK to execute recovery actions.
 
     Supported actions:
-      - RETRY_CHARGE → creates a Payment Link (customer gets a new payment URL)
+      - RETRY_CHARGE → creates a Payment Link
       - SEND_REMINDER → creates a Payment Link with reminder messaging
+      - OFFER_DISCOUNT → creates a Payment Link with a discounted amount
       - ESCALATE_TO_HUMAN → internal action, no API call
       - STOP → internal action, no API call
-      - OFFER_DISCOUNT → not supported in MVP
     """
 
     def __init__(self):
