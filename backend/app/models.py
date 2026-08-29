@@ -14,6 +14,7 @@ class CaseType(str, enum.Enum):
 class CaseStatus(str, enum.Enum):
     OPEN = "open"
     IN_PROGRESS = "in_progress"
+    AWAITING_PAYMENT = "awaiting_payment"
     RECOVERED = "recovered"
     FAILED = "failed"
     ESCALATED = "escalated"

@@ -23,18 +23,23 @@ from sqlalchemy import select
 client = TestClient(app)
 
 
+class SuspendWorkflow(Exception):
+    pass
+
 class MockStep:
     """Simulates Inngest step.run — calls function synchronously, no memoization."""
     async def run(self, step_id, fn, **kwargs):
         return fn()
-
+        
+    async def sleep(self, step_id, duration):
+        raise SuspendWorkflow("awaiting_payment")
 
 class MockContext:
     def __init__(self, event):
         self.event = event
 
 
-# ── Test 1: Full happy path (soft decline → retry → success) ────────────
+# ── Test 1: Full happy path (soft decline → retry → awaiting payment) ────────────
 
 async def run_e2e_happy_path():
     db = SessionLocal()
@@ -81,11 +86,12 @@ async def run_e2e_happy_path():
             mock_rz = mock_rz_class.return_value
             mock_rz.payment_link.create.return_value = {"id": "plink_test_ok"}
 
-            result = await inner_process_case_workflow(ctx, step)
+            try:
+                await inner_process_case_workflow(ctx, step)
+                assert False, "Should have suspended at sleep"
+            except SuspendWorkflow as e:
+                assert str(e) == "awaiting_payment"
 
-            assert result["status"] == "recovered"
-            assert result["execution"]["action_taken"] == "retry_charge"
-            assert result["execution"]["status"] == ExecutionStatus.SUCCESS.value
             mock_rz.payment_link.create.assert_called_once()
 
             # Verify reference_id is ≤ 40 chars
@@ -104,12 +110,12 @@ async def run_e2e_happy_path():
         assert "COMMUNICATION_SENT" in action_types
         assert "ACTION_EXECUTED" in action_types
 
-        # 4. Verify case status updated to RECOVERED
+        # 4. Verify case status updated to AWAITING_PAYMENT
         db.expire_all()
         updated_case = db.query(models.RecoveryCase).filter(
             models.RecoveryCase.id == case_id
         ).first()
-        assert updated_case.status == CaseStatus.RECOVERED
+        assert updated_case.status == CaseStatus.AWAITING_PAYMENT
 
         print("PASS: E2E happy path")
     finally:
@@ -213,9 +219,9 @@ async def run_e2e_razorpay_failure():
 
             result = await inner_process_case_workflow(ctx, step)
 
-            # After 3 failed Razorpay calls, retry_count hits MAX_RETRIES (3).
-            # The 4th attempt's policy check blocks it with "Max retries reached."
-            # This is correct safety behavior: policy prevents infinite retries.
+            # After 2 failed Razorpay calls (initial + 1 retry), retry_count hits MAX_RETRIES + 1 (2).
+            # The 3rd attempt's policy check blocks it because retry_count (2) > MAX_RETRIES (1).
+            # This is correct safety behavior: policy limits to exactly 1 retry loop.
             assert result["status"] == "policy_rejected"
             assert "Max retries" in result["reason"]
 
@@ -301,8 +307,11 @@ async def run_e2e_communication():
             mock_rz = mock_rz_class.return_value
             mock_rz.payment_link.create.return_value = {"id": "plink_comms_test"}
 
-            result = await inner_process_case_workflow(ctx, step)
-            assert result["status"] == "recovered"
+            try:
+                await inner_process_case_workflow(ctx, step)
+                assert False, "Should have suspended at sleep"
+            except SuspendWorkflow:
+                pass
 
         # Verify communication was logged
         logs = db.execute(select(models.AuditLog).where(
@@ -313,6 +322,73 @@ async def run_e2e_communication():
         assert "insufficient funds" in comms_logs[0].reasoning  # the generated message
 
         print("PASS: E2E communication generation")
+    finally:
+        db.close()
+
+# ── Test 5b: Webhook confirms payment ───────────────────────────────────
+
+def test_webhook_confirms_payment():
+    db = SessionLocal()
+    try:
+        # Create a case in AWAITING_PAYMENT state
+        case = models.RecoveryCase(
+            case_type=CaseType.SUBSCRIPTION_FAILED,
+            status=CaseStatus.AWAITING_PAYMENT,
+            amount_paise=50000,
+            currency="INR",
+            customer_id="cust_webhook_test",
+            raw_signal_payload={}
+        )
+        db.add(case)
+        db.commit()
+        db.refresh(case)
+        
+        # Send payment_link.paid webhook
+        webhook_secret = "test_secret"
+        import os
+        import hmac
+        import hashlib
+        import json
+        
+        payload = {
+            "event": "payment_link.paid",
+            "payload": {
+                "payment_link": {
+                    "entity": {
+                        "notes": {
+                            "case_id": case.id
+                        }
+                    }
+                }
+            }
+        }
+        body = json.dumps(payload).encode('utf-8')
+        sig = hmac.new(
+            key=webhook_secret.encode('utf-8'),
+            msg=body,
+            digestmod=hashlib.sha256
+        ).hexdigest()
+        
+        with patch.dict(os.environ, {"RAZORPAY_WEBHOOK_SECRET": webhook_secret}):
+            response = client.post(
+                "/webhooks/razorpay", 
+                content=body, 
+                headers={"x-razorpay-signature": sig}
+            )
+            assert response.status_code == 200
+            assert response.json()["status"] == "recovered"
+            
+        # Verify status changed
+        db.refresh(case)
+        assert case.status == CaseStatus.RECOVERED
+        
+        # Verify audit log
+        logs = db.execute(select(models.AuditLog).where(
+            models.AuditLog.case_id == case.id
+        )).scalars().all()
+        assert any(l.action_type == "PAYMENT_CONFIRMED" for l in logs)
+        
+        print("PASS: Webhook confirms payment")
     finally:
         db.close()
 
@@ -438,6 +514,7 @@ if __name__ == "__main__":
     asyncio.run(run_e2e_razorpay_failure())
     test_create_case_inngest_failure_still_commits()
     asyncio.run(run_e2e_communication())
+    test_webhook_confirms_payment()
     asyncio.run(run_e2e_escalation())
     test_audit_trail_endpoint()
     test_analytics_endpoint()

@@ -138,14 +138,48 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         raise HTTPException(status_code=400, detail="Invalid JSON")
         
     event_type = payload.get("event")
-    if event_type not in ("payment.failed", "subscription.pending"):
+    if event_type not in ("payment.failed", "subscription.pending", "payment_link.paid", "payment.captured"):
         return {"status": "ignored", "reason": "unhandled_event_type"}
         
     event_id = payload.get("id", "unknown_event_id")
     
     from sqlalchemy.dialects.postgresql import insert
+    from sqlalchemy import update
     
-    # Map payload to case fields
+    if event_type in ("payment_link.paid", "payment.captured"):
+        if event_type == "payment_link.paid":
+            case_id = payload.get("payload", {}).get("payment_link", {}).get("entity", {}).get("notes", {}).get("case_id")
+        else:
+            case_id = payload.get("payload", {}).get("payment", {}).get("entity", {}).get("notes", {}).get("case_id")
+            
+        if not case_id:
+            return {"status": "ignored", "reason": "missing_case_id"}
+            
+        # Atomic UPDATE using WHERE to avoid double processing, similar to the returning() idempotency pattern
+        stmt = update(models.RecoveryCase).where(
+            models.RecoveryCase.id == case_id,
+            models.RecoveryCase.status.notin_([CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED])
+        ).values(
+            status=CaseStatus.RECOVERED
+        ).returning(models.RecoveryCase.id)
+        
+        result = db.execute(stmt)
+        updated_id = result.scalar()
+        
+        if not updated_id:
+            return {"status": "idempotent", "case_id": case_id}
+            
+        audit_log = models.AuditLog(
+            case_id=case_id,
+            action_type="PAYMENT_CONFIRMED",
+            description=f"Payment confirmed via {event_type} webhook",
+            reasoning="Automated status update"
+        )
+        db.add(audit_log)
+        db.commit()
+        return {"status": "recovered", "case_id": case_id}
+    
+    # Map payload to case fields for payment.failed and subscription.pending
     if event_type == "payment.failed":
         case_type = CaseType.SUBSCRIPTION_FAILED
         payment = payload.get("payload", {}).get("payment", {}).get("entity", {})

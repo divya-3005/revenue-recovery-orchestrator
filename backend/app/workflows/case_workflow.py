@@ -164,17 +164,28 @@ async def inner_process_case_workflow(ctx, step):
         action = decision.recommended_action
 
         if exec_result.status in [ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN]:
-            # Pick the right terminal status based on the action
             if action == RecoveryActionType.ESCALATE_TO_HUMAN:
-                final_status = CaseStatus.ESCALATED
+                await step.run(f"finalize_{attempt}", lambda: _set_status(CaseStatus.ESCALATED))
+                return {"status": CaseStatus.ESCALATED.value, "execution": exec_dict}
             elif action == RecoveryActionType.STOP:
-                final_status = CaseStatus.CLOSED
+                await step.run(f"finalize_{attempt}", lambda: _set_status(CaseStatus.CLOSED))
+                return {"status": CaseStatus.CLOSED.value, "execution": exec_dict}
             else:
-                final_status = CaseStatus.RECOVERED
-
-            await step.run(f"finalize_{attempt}",
-                           lambda s=final_status: _set_status(s))
-            return {"status": final_status.value, "execution": exec_dict}
+                # Wait for payment confirmation via webhook
+                await step.run(f"awaiting_payment_{attempt}", lambda: _set_status(CaseStatus.AWAITING_PAYMENT))
+                
+                delay_hours = decision.action_parameters.get("delay_hours", 24)
+                delay_hours = max(1, min(delay_hours, 168))
+                
+                await step.sleep(f"wait_for_payment_{attempt}", f"{delay_hours}h")
+                
+                woken_case_dict = await step.run(f"load_woken_case_{attempt}", _load_case)
+                woken_case = RecoveryCaseContext.model_validate(woken_case_dict)
+                
+                if woken_case.status in [CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED]:
+                    return {"status": woken_case.status.value, "execution": exec_dict}
+                
+                # Fall through to retry block if payment wasn't confirmed
 
         # 9. Execution failed — can we retry?
         if attempt < max_attempts - 1:
