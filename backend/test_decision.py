@@ -97,7 +97,7 @@ def test_decide_action_and_policy_integration():
     assert decision.recommended_action == RecoveryActionType.OFFER_DISCOUNT
     
     # 2. Passed into Policy Engine (Should Allow)
-    policy_result = evaluate_policy(case, decision)
+    policy_result = evaluate_policy(case, decision, diagnosis)
     assert policy_result.allowed is True
     assert policy_result.approved_decision is not None
     assert policy_result.approved_decision.idempotency_key is not None
@@ -107,7 +107,7 @@ def test_decide_action_and_policy_integration():
     bad_decision = decide_action(case, diagnosis, provider_hallucinating)
     
     # 4. Policy Engine strictly blocks it
-    policy_result = evaluate_policy(case, bad_decision)
+    policy_result = evaluate_policy(case, bad_decision, diagnosis)
     assert policy_result.allowed is False
     assert "exceeds policy maximum" in policy_result.reason
     assert policy_result.approved_decision is None

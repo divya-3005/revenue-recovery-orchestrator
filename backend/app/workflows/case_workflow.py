@@ -113,10 +113,10 @@ async def inner_process_case_workflow(ctx, step):
         decision = DecisionResult.model_validate(decision_dict)
 
         # 4. Policy check
-        def _policy(case=case_domain, dec=decision):
+        def _policy(case=case_domain, dec=decision, diag=diagnosis):
             db = SessionLocal()
             try:
-                return run_policy_step(db, case, dec).model_dump()
+                return run_policy_step(db, case, dec, diag).model_dump()
             finally:
                 db.close()
 

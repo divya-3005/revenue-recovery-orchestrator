@@ -2,7 +2,7 @@ from app.policy import evaluate_policy, RecoveryActionType, PolicyConfig
 from fastapi.testclient import TestClient
 from app.main import app
 
-from app.domain import RecoveryCaseContext, DecisionResult
+from app.domain import RecoveryCaseContext, DecisionResult, DiagnosisResult, RootCauseCategory
 from app.models import CaseType, CaseStatus
 import uuid
 
@@ -27,15 +27,23 @@ def create_mock_decision(action: RecoveryActionType, params: dict = None) -> Dec
         reasoning="Test"
     )
 
+def create_mock_diagnosis(category: RootCauseCategory = RootCauseCategory.SOFT_DECLINE) -> DiagnosisResult:
+    return DiagnosisResult(
+        root_cause_category=category,
+        specific_reason="test",
+        confidence_score=0.9,
+        reasoning="test"
+    )
+
 def test_policy_escalation_always_allowed():
     case = create_mock_domain_case(amount_paise=10000000) # High value
-    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.ESCALATE_TO_HUMAN))
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.ESCALATE_TO_HUMAN), create_mock_diagnosis())
     assert result.allowed is True
     assert "always permitted" in result.reason
 
 def test_policy_stop_always_allowed():
     case = create_mock_domain_case(amount_paise=500)
-    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.STOP))
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.STOP), create_mock_diagnosis())
     assert result.allowed is True
 
 def test_policy_high_value_blocks_financial_actions():
@@ -43,57 +51,76 @@ def test_policy_high_value_blocks_financial_actions():
     case = create_mock_domain_case(amount_paise=PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE + 100)
     
     # Financial action (Retry) should be blocked
-    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}))
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}), create_mock_diagnosis())
     assert result.allowed is False
     assert "exceeds automatic threshold" in result.reason
     
     # Non-financial action (Reminder) should still be allowed
-    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.SEND_REMINDER, {"channel": "email"}))
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.SEND_REMINDER, {"channel": "email"}), create_mock_diagnosis())
     assert result.allowed is True
 
 def test_policy_discount_caps():
     case = create_mock_domain_case(amount_paise=100000) # 1000 INR
     
     # Within cap
-    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.OFFER_DISCOUNT, {"discount_percent": 15}))
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.OFFER_DISCOUNT, {"discount_percent": 15}), create_mock_diagnosis())
     assert result.allowed is True
     
     # Above cap
-    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.OFFER_DISCOUNT, {"discount_percent": 16}))
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.OFFER_DISCOUNT, {"discount_percent": 16}), create_mock_diagnosis())
     assert result.allowed is False
     assert "exceeds policy maximum" in result.reason
     
     # Zero or negative
     try:
-        # Pydantic will actually block this at the DecisionResult level if we added that, but we didn't add negative checks there yet
         bad_decision = create_mock_decision(RecoveryActionType.OFFER_DISCOUNT, {"discount_percent": 0})
-        result = evaluate_policy(case, bad_decision)
+        result = evaluate_policy(case, bad_decision, create_mock_diagnosis())
         assert result.allowed is False
         assert "greater than zero" in result.reason
     except ValueError:
-        pass # If Pydantic catches it first, that's fine too
+        pass 
 
-def test_policy_hard_declines_blocked():
-    # Soft decline
-    soft_case = create_mock_domain_case(amount_paise=100000, raw_signal_payload={"reason": "insufficient_funds"})
-    result = evaluate_policy(soft_case, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}))
-    assert result.allowed is True
+def test_policy_webhook_hard_decline_blocked():
+    """
+    Proves that Rule 4 blocks hard declines based on the AI diagnosis,
+    even when the webhook payload doesn't contain a top-level 'reason' string.
+    """
+    # A real Razorpay webhook payload shape:
+    webhook_payload = {
+        "event": "payment.failed",
+        "payload": {
+            "payment": {
+                "entity": {
+                    "error_code": "BAD_REQUEST_ERROR",
+                    "error_reason": "lost_card"
+                }
+            }
+        }
+    }
+    hard_case = create_mock_domain_case(amount_paise=100000, raw_signal_payload=webhook_payload)
     
-    # Hard decline
-    hard_case = create_mock_domain_case(amount_paise=100000, raw_signal_payload={"reason": "lost_card_reported"})
-    result = evaluate_policy(hard_case, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}))
+    # AI accurately diagnoses this as a hard decline:
+    hard_diag = create_mock_diagnosis(RootCauseCategory.HARD_DECLINE)
+    
+    # Rule 4 should correctly block it:
+    result = evaluate_policy(hard_case, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}), hard_diag)
     assert result.allowed is False
     assert "forbids retrying hard declines" in result.reason
 
+    # Soft decline should be allowed:
+    soft_diag = create_mock_diagnosis(RootCauseCategory.SOFT_DECLINE)
+    result = evaluate_policy(hard_case, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}), soft_diag)
+    assert result.allowed is True
+
 def test_policy_max_retries_capped():
-    # Under limit
-    case = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES - 1)
-    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}))
+    # At limit (this is allowed because MAX_RETRIES = 1 means 1 retry is allowed)
+    case_allowed = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES)
+    result = evaluate_policy(case_allowed, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}), create_mock_diagnosis())
     assert result.allowed is True
     
-    # At limit
-    case_blocked = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES)
-    result = evaluate_policy(case_blocked, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}))
+    # Above limit
+    case_blocked = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES + 1)
+    result = evaluate_policy(case_blocked, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}), create_mock_diagnosis())
     assert result.allowed is False
     assert "Max retries" in result.reason
 

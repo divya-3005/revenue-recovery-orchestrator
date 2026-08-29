@@ -2,12 +2,12 @@ import enum
 from typing import Tuple, Dict, Any
 from app.domain import (
     RecoveryCaseContext, RecoveryActionType, DecisionResult, 
-    PolicyApprovedDecision, PolicyEvaluationResult
+    PolicyApprovedDecision, PolicyEvaluationResult, DiagnosisResult, RootCauseCategory
 )
 import hashlib
 
 class PolicyConfig:
-    MAX_RETRIES: int = 3
+    MAX_RETRIES: int = 1
     MAX_DISCOUNT_PERCENT: int = 15
     # Value above which automatic financial actions are blocked (50,000 INR = 5000000 paise)
     REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE: int = 5000000 
@@ -18,7 +18,7 @@ def _generate_idempotency_key(case: RecoveryCaseContext, decision: DecisionResul
     raw_key = f"{case.id}-{decision.recommended_action.value}-{case.retry_count}"
     return hashlib.sha256(raw_key.encode('utf-8')).hexdigest()
 
-def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult) -> PolicyEvaluationResult:
+def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnosis: DiagnosisResult) -> PolicyEvaluationResult:
     """
     Deterministic rule layer that gates the AI decision engine.
     Returns a PolicyEvaluationResult containing the PolicyApprovedDecision if allowed.
@@ -56,14 +56,12 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult) -> Poli
 
     # Rule 4: Block retries on hard declines
     if proposed_action == RecoveryActionType.RETRY_CHARGE and PolicyConfig.BLOCK_HARD_DECLINES:
-        payload = case.raw_signal_payload or {}
-        reason = payload.get("reason", "").lower()
-        if "hard_decline" in reason or "lost_card" in reason or "stolen" in reason:
+        if diagnosis.root_cause_category == RootCauseCategory.HARD_DECLINE:
             return reject("Action blocked: Policy forbids retrying hard declines.")
 
     # Rule 5: Max retries cap
     if proposed_action == RecoveryActionType.RETRY_CHARGE:
-        if case.retry_count >= PolicyConfig.MAX_RETRIES:
+        if case.retry_count > PolicyConfig.MAX_RETRIES:
             return reject(f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached.")
 
     return approve("Action allowed by policy.")

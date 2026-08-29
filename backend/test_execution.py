@@ -1,6 +1,7 @@
 from app.domain import (
     RecoveryCaseContext, DecisionResult, RecoveryActionType, 
-    PolicyApprovedDecision, ExecutionStatus, ExecutionResult
+    PolicyApprovedDecision, ExecutionStatus, ExecutionResult,
+    DiagnosisResult, RootCauseCategory
 )
 from app.models import CaseType, CaseStatus
 from app.execution.executor import DryRunExecutor
@@ -27,11 +28,19 @@ def get_valid_decision() -> DecisionResult:
         reasoning="Test"
     )
 
+def get_dummy_diagnosis() -> DiagnosisResult:
+    return DiagnosisResult(
+        root_cause_category=RootCauseCategory.SOFT_DECLINE,
+        specific_reason="test",
+        confidence_score=0.9,
+        reasoning="test"
+    )
+
 def test_approved_decision_can_reach_executor():
     case = get_base_case()
     decision = get_valid_decision()
     
-    policy_result = evaluate_policy(case, decision)
+    policy_result = evaluate_policy(case, decision, get_dummy_diagnosis())
     assert policy_result.allowed is True
     assert policy_result.approved_decision is not None
     assert policy_result.approved_decision.idempotency_key is not None
@@ -68,7 +77,7 @@ def test_policy_rejected_decision_has_no_approval_token():
         reasoning="Test"
     )
     
-    policy_result = evaluate_policy(case, decision)
+    policy_result = evaluate_policy(case, decision, get_dummy_diagnosis())
     assert policy_result.allowed is False
     assert policy_result.approved_decision is None
     # Because approved_decision is None, it is physically impossible to pass it to executor.execute()

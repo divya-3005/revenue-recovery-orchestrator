@@ -37,9 +37,9 @@ def run_decision_step(session: Session, case: RecoveryCaseContext, diagnosis: Di
     return decision
 
 
-def run_policy_step(session: Session, case: RecoveryCaseContext, decision: DecisionResult) -> PolicyEvaluationResult:
+def run_policy_step(session: Session, case: RecoveryCaseContext, decision: DecisionResult, diagnosis: DiagnosisResult) -> PolicyEvaluationResult:
     """Policy eval → checkpoint."""
-    policy_eval = evaluate_policy(case, decision)
+    policy_eval = evaluate_policy(case, decision, diagnosis)
     record_policy_checkpoint(session, case, policy_eval)
     return policy_eval
 
