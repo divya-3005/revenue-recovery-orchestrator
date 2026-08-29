@@ -1,7 +1,11 @@
 from app.database import SessionLocal
 from app import models
-from app.domain import RecoveryCaseContext, DiagnosisResult, RootCauseCategory
-from app.workflow import run_diagnosis_step
+from app.domain import (
+    RecoveryCaseContext, DiagnosisResult, RootCauseCategory,
+    DecisionResult, RecoveryActionType, PolicyApprovedDecision,
+    ExecutionStatus, ExecutionResult
+)
+from app.workflow import run_diagnosis_step, run_execution_step
 from app.ai.provider import AIProvider
 from typing import Type, Any
 from sqlalchemy import select
@@ -100,5 +104,82 @@ def test_workflow_diagnosis():
     finally:
         db.close()
 
+class FlakyExecutor:
+    def __init__(self, succeed: bool):
+        self.succeed = succeed
+
+    def execute(self, case: RecoveryCaseContext, approved_decision: PolicyApprovedDecision) -> ExecutionResult:
+        if not self.succeed:
+            raise Exception("Executor simulated crash during execution!")
+        
+        return ExecutionResult(
+            status=ExecutionStatus.SUCCESS,
+            action_taken=approved_decision.decision.recommended_action,
+            reason="Mock execution succeeded",
+            external_reference_id="mock_ref_123",
+            action_parameters_used=approved_decision.decision.action_parameters
+        )
+
+def test_workflow_execution_retry_idempotency():
+    db = SessionLocal()
+    
+    try:
+        db_case = get_db_case(db)
+        case_domain = RecoveryCaseContext.model_validate(db_case)
+        
+        approved_decision = PolicyApprovedDecision(
+            decision=DecisionResult(
+                recommended_action=RecoveryActionType.RETRY_CHARGE,
+                action_parameters={"delay_hours": 24},
+                confidence_score=0.9,
+                reasoning="Test"
+            ),
+            policy_reason="Policy passed",
+            idempotency_key="idem_exec_retry_123"
+        )
+        
+        # A. Crash during execution step
+        provider_fail = FlakyExecutor(succeed=False)
+        try:
+            run_execution_step(case_domain, approved_decision, provider_fail)
+            assert False, "Should have crashed"
+        except Exception as e:
+            assert "simulated crash" in str(e)
+            
+        # Verify no execution logs written
+        audit_logs_fail = db.execute(select(models.AuditLog).where(
+            models.AuditLog.case_id == case_domain.id,
+            models.AuditLog.action_type == "ACTION_EXECUTED"
+        )).scalars().all()
+        assert len(audit_logs_fail) == 0
+        
+        # B. Retry succeeds
+        provider_succeed = FlakyExecutor(succeed=True)
+        run_execution_step(case_domain, approved_decision, provider_succeed)
+        
+        audit_logs_success = db.execute(select(models.AuditLog).where(
+            models.AuditLog.case_id == case_domain.id,
+            models.AuditLog.action_type == "ACTION_EXECUTED"
+        )).scalars().all()
+        assert len(audit_logs_success) == 1
+        
+        # C. Idempotent replay: exact same logical checkpoint again
+        try:
+            run_execution_step(case_domain, approved_decision, provider_succeed)
+        except Exception as e:
+            assert False, f"Replay raised exception: {e}"
+            
+        # Verify no duplicate logs
+        audit_logs_replay = db.execute(select(models.AuditLog).where(
+            models.AuditLog.case_id == case_domain.id,
+            models.AuditLog.action_type == "ACTION_EXECUTED"
+        )).scalars().all()
+        assert len(audit_logs_replay) == 1
+
+        print("SUCCESS: Execution retry idempotency tests passed.")
+    finally:
+        db.close()
+
 if __name__ == "__main__":
     test_workflow_diagnosis()
+    test_workflow_execution_retry_idempotency()

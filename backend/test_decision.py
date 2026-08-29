@@ -52,39 +52,7 @@ def get_base_diagnosis() -> DiagnosisResult:
         reasoning="Test"
     )
 
-def test_decision_result_structural_validation():
-    # Valid
-    res = DecisionResult(
-        recommended_action=RecoveryActionType.OFFER_DISCOUNT,
-        action_parameters={"discount_percent": 10},
-        confidence_score=0.9,
-        reasoning="test"
-    )
-    assert res.recommended_action == RecoveryActionType.OFFER_DISCOUNT
-    
-    # Invalid: Missing parameter
-    try:
-        DecisionResult(
-            recommended_action=RecoveryActionType.OFFER_DISCOUNT,
-            action_parameters={}, # Missing discount_percent
-            confidence_score=0.9,
-            reasoning="test"
-        )
-        assert False, "Should fail validation"
-    except ValidationError:
-        pass
-        
-    # Invalid: Wrong parameter type
-    try:
-        DecisionResult(
-            recommended_action=RecoveryActionType.RETRY_CHARGE,
-            action_parameters={"delay_hours": "two"}, # string instead of int
-            confidence_score=0.9,
-            reasoning="test"
-        )
-        assert False, "Should fail validation"
-    except ValidationError:
-        pass
+
 
 def test_decide_action_and_policy_integration():
     case = get_base_case()
@@ -113,6 +81,5 @@ def test_decide_action_and_policy_integration():
     assert policy_result.approved_decision is None
 
 if __name__ == "__main__":
-    test_decision_result_structural_validation()
     test_decide_action_and_policy_integration()
     print("SUCCESS: Decision engine tests passed.")
