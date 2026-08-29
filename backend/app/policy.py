@@ -7,7 +7,7 @@ from app.domain import (
 import hashlib
 
 class PolicyConfig:
-    MAX_RETRIES: int = 1
+    MAX_RETRIES: int = 3
     MAX_DISCOUNT_PERCENT: int = 15
     # Value above which automatic financial actions are blocked (50,000 INR = 5000000 paise)
     REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE: int = 5000000 
@@ -61,7 +61,7 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
 
     # Rule 5: Max retries cap
     if proposed_action == RecoveryActionType.RETRY_CHARGE:
-        if case.retry_count > PolicyConfig.MAX_RETRIES:
+        if case.retry_count >= PolicyConfig.MAX_RETRIES:
             return reject(f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached.")
 
     return approve("Action allowed by policy.")

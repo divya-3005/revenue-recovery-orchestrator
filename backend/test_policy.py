@@ -113,13 +113,13 @@ def test_policy_webhook_hard_decline_blocked():
     assert result.allowed is True
 
 def test_policy_max_retries_capped():
-    # At limit (this is allowed because MAX_RETRIES = 1 means 1 retry is allowed)
-    case_allowed = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES)
+    # Under limit (allowed)
+    case_allowed = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES - 1)
     result = evaluate_policy(case_allowed, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}), create_mock_diagnosis())
     assert result.allowed is True
     
-    # Above limit
-    case_blocked = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES + 1)
+    # At limit (blocked because retry_count >= MAX_RETRIES)
+    case_blocked = create_mock_domain_case(amount_paise=100000, retry_count=PolicyConfig.MAX_RETRIES)
     result = evaluate_policy(case_blocked, create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24}), create_mock_diagnosis())
     assert result.allowed is False
     assert "Max retries" in result.reason
