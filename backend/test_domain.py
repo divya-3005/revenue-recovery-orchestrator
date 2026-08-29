@@ -14,6 +14,7 @@ def test_orm_to_domain_mapping():
         raw_signal_payload={"some": "data"},
         retry_count=2,
         cumulative_discount_paise=1000,
+        priority_score=0,
         active_diagnosis={
             "root_cause_category": "friction",
             "specific_reason": "high_cart_value",

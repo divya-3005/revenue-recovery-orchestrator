@@ -9,6 +9,7 @@ Endpoints:
   POST /api/v1/batch          — Generate & process 50+ synthetic cases
   GET  /api/v1/analytics      — Recovery analytics dashboard data
   GET  /api/v1/policy         — Current policy configuration
+  POST /api/v1/demo/confirm-payment/{id} — Local demo: mark paid (not production)
   GET  /health                — Health check
 """
 
@@ -18,10 +19,12 @@ import hmac
 import hashlib
 import os
 import json
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Header
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, desc, update
 from typing import List
 
 import inngest.fast_api
@@ -38,6 +41,22 @@ from app.workflows.case_workflow import process_case_workflow
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# #region agent log
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict):
+    try:
+        with open("/Users/divyasingh1/Desktop/razorpay/.cursor/debug-3f02a1.log", "a") as _df:
+            _df.write(json.dumps({
+                "sessionId": "3f02a1",
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+# #endregion
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -53,7 +72,51 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 inngest.fast_api.serve(app, inngest_client, [process_case_workflow])
+
+
+def _apply_payment_confirmed(db: Session, case_id: str, source: str) -> dict:
+    """Mark a case recovered only if it is still open. Never counts a payment-link create as recovered."""
+    existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+
+    stmt = update(models.RecoveryCase).where(
+        models.RecoveryCase.id == case_id,
+        models.RecoveryCase.status.notin_([CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED])
+    ).values(
+        status=CaseStatus.RECOVERED
+    ).returning(models.RecoveryCase.id)
+
+    result = db.execute(stmt)
+    updated_id = result.scalar()
+
+    if not updated_id:
+        # #region agent log
+        _debug_log("C", "main.py:_apply_payment_confirmed", "idempotent_skip", {"case_id": case_id, "status": existing.status.value, "source": source})
+        # #endregion
+        return {"status": "idempotent", "case_id": case_id}
+
+    audit_log = models.AuditLog(
+        case_id=case_id,
+        action_type="PAYMENT_CONFIRMED",
+        description=f"Payment confirmed via {source}",
+        reasoning="Recovered only after payment confirmation — creating a payment link does not count as recovered."
+    )
+    db.add(audit_log)
+    db.commit()
+    # #region agent log
+    _debug_log("C", "main.py:_apply_payment_confirmed", "marked_recovered", {"case_id": case_id, "source": source})
+    # #endregion
+    return {"status": "recovered", "case_id": case_id}
 
 
 # ── Health ───────────────────────────────────────────────────────────────
@@ -154,30 +217,8 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
             
         if not case_id:
             return {"status": "ignored", "reason": "missing_case_id"}
-            
-        # Atomic UPDATE using WHERE to avoid double processing, similar to the returning() idempotency pattern
-        stmt = update(models.RecoveryCase).where(
-            models.RecoveryCase.id == case_id,
-            models.RecoveryCase.status.notin_([CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED])
-        ).values(
-            status=CaseStatus.RECOVERED
-        ).returning(models.RecoveryCase.id)
-        
-        result = db.execute(stmt)
-        updated_id = result.scalar()
-        
-        if not updated_id:
-            return {"status": "idempotent", "case_id": case_id}
-            
-        audit_log = models.AuditLog(
-            case_id=case_id,
-            action_type="PAYMENT_CONFIRMED",
-            description=f"Payment confirmed via {event_type} webhook",
-            reasoning="Automated status update"
-        )
-        db.add(audit_log)
-        db.commit()
-        return {"status": "recovered", "case_id": case_id}
+
+        return _apply_payment_confirmed(db, case_id, event_type)
     
     # Map payload to case fields for payment.failed and subscription.pending
     if event_type == "payment.failed":
@@ -248,7 +289,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
 
 @app.get("/api/v1/cases", response_model=List[schemas.RecoveryCaseResponse])
 def list_cases(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    cases = db.query(models.RecoveryCase).offset(skip).limit(limit).all()
+    cases = db.query(models.RecoveryCase).order_by(models.RecoveryCase.priority_score.desc(), models.RecoveryCase.created_at.desc()).offset(skip).limit(limit).all()
     return cases
 
 
@@ -292,6 +333,7 @@ def run_batch(db: Session = Depends(get_db)):
             currency=case_data["currency"],
             customer_id=case_data["customer_id"],
             payment_rail=case_data.get("payment_rail"),
+            priority_score=case_data.get("priority_score", 0),
             raw_signal_payload=case_data["raw_signal_payload"],
         )
         audit_log = models.AuditLog(
@@ -323,35 +365,41 @@ def _generate_synthetic_cases():
     soft_reasons = ["insufficient_funds", "bank_network_timeout", "card_limit_exceeded",
                     "processing_error", "temporary_hold"]
     for i in range(15):
+        amount = random.choice([9900, 29900, 49900, 99900, 199900])
         cases.append({
             "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-            "amount_paise": random.choice([9900, 29900, 49900, 99900, 199900]),
+            "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{i:03d}",
             "payment_rail": random.choice(["card", "upi", "enach"]),
+            "priority_score": int(amount * 0.8),
             "raw_signal_payload": {"reason": random.choice(soft_reasons)}
         })
 
     # 8 subscription failures — hard declines (should NOT be retried)
     hard_reasons = ["lost_card_reported", "stolen_card", "account_closed", "fraud_suspected"]
     for i in range(8):
+        amount = random.choice([9900, 29900, 49900])
         cases.append({
             "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-            "amount_paise": random.choice([9900, 29900, 49900]),
+            "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{15 + i:03d}",
             "payment_rail": "card",
+            "priority_score": int(amount * 0.2), # hard declines have low priority (won't recover)
             "raw_signal_payload": {"reason": random.choice(hard_reasons)}
         })
 
     # 12 checkout abandoned — friction signals
     for i in range(12):
+        amount = random.choice([19900, 49900, 99900, 249900, 499900])
         cases.append({
             "case_type": CaseType.CHECKOUT_ABANDONED.value,
-            "amount_paise": random.choice([19900, 49900, 99900, 249900, 499900]),
+            "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{23 + i:03d}",
             "payment_rail": random.choice(["card", "upi"]),
+            "priority_score": int(amount * 0.5), # moderate probability
             "raw_signal_payload": {
                 "cart_items": random.randint(1, 5),
                 "time_on_page_sec": random.randint(30, 300)
@@ -360,12 +408,14 @@ def _generate_synthetic_cases():
 
     # 10 invoice overdue — missed payments
     for i in range(10):
+        amount = random.choice([100000, 250000, 500000, 1000000, 2500000])
         cases.append({
             "case_type": CaseType.INVOICE_OVERDUE.value,
-            "amount_paise": random.choice([100000, 250000, 500000, 1000000, 2500000]),
+            "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{35 + i:03d}",
             "payment_rail": None,
+            "priority_score": int(amount * 0.9), # B2B has high probability
             "raw_signal_payload": {
                 "days_overdue": random.randint(3, 30),
                 "invoice_number": f"INV-{1000 + i}"
@@ -374,12 +424,14 @@ def _generate_synthetic_cases():
 
     # 5 high-value cases (trigger human approval policy)
     for i in range(5):
+        amount = random.choice([5500000, 7000000, 10000000])
         cases.append({
             "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-            "amount_paise": random.choice([5500000, 7000000, 10000000]),
+            "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{45 + i:03d}",
             "payment_rail": "enach",
+            "priority_score": int(amount * 0.9),
             "raw_signal_payload": {"reason": "insufficient_funds"}
         })
 

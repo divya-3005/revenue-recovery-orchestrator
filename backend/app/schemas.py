@@ -17,6 +17,7 @@ class RecoveryCaseCreate(RecoveryCaseBase):
 class RecoveryCaseResponse(RecoveryCaseBase):
     id: str
     status: CaseStatus
+    priority_score: int
     created_at: datetime
     updated_at: datetime
 

@@ -44,6 +44,7 @@ class RecoveryCase(Base):
     currency = Column(String, nullable=False, default="INR")
     customer_id = Column(String, nullable=False, index=True)
     payment_rail = Column(String, nullable=True) # e.g., 'card', 'upi', 'enach'
+    priority_score = Column(Integer, nullable=False, default=0, index=True) # Expected Value = amount x probability
     
     raw_signal_payload = Column(JSONB, nullable=False) # Retain source data for auditability
 

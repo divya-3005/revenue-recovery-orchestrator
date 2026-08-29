@@ -158,6 +158,20 @@ class RazorpayExecutor(ActionExecutor):
                 action_parameters_used=params_used
             )
         except Exception as e:
+            # Check if this is a BadRequestError specifically for a duplicate reference_id
+            import razorpay.errors
+            if isinstance(e, razorpay.errors.BadRequestError):
+                error_msg = str(e).lower()
+                if "reference_id" in error_msg and "already exists" in error_msg:
+                    # Idempotency hit: the link was already created in a previous (crashed) attempt.
+                    return ExecutionResult(
+                        status=ExecutionStatus.SUCCESS,
+                        action_taken=action,
+                        reason="Razorpay payment link already exists (idempotency recovered).",
+                        external_reference_id="idempotent_recovery",
+                        action_parameters_used=approved_decision.decision.action_parameters.copy()
+                    )
+
             return ExecutionResult(
                 status=ExecutionStatus.FAILED,
                 action_taken=action,

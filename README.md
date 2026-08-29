@@ -24,18 +24,24 @@ The recovery pipeline follows a clear, durable workflow for each case:
 ## Setup Instructions
 
 1. Ensure Docker and Docker Compose are installed.
-2. Copy `.env.example` to `.env` inside the `backend` directory (or use `.env.example` as a reference to set environment variables). 
-   You must provide:
+2. Copy `backend/.env.example` to `backend/.env` and provide your API keys:
    - `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET`
    - `RAZORPAY_WEBHOOK_SECRET`
    - `GEMINI_API_KEY` / `GROQ_API_KEY`
-3. Run `docker-compose up -d --build`. This will automatically run database migrations (Alembic) and start the Postgres and API services.
-4. The dashboard is available at `http://localhost:8000/`.
+3. Run `docker-compose up -d --build`. This will start:
+   - PostgreSQL (Database)
+   - FastAPI Backend (Port 8000)
+   - Next.js Frontend Dashboard (Port 3000)
+4. Start the local Inngest dev server to run the workflows (in a new terminal):
+   ```bash
+   npx inngest-cli@latest dev
+   ```
+5. Open `http://localhost:3000` in your browser to view the Revenue Recovery Dashboard.
 
 ## Triggering Data
 
-You can trigger a batch run of synthetic cases spanning various failure reasons to see the AI agent and the pipeline in action:
+You can trigger a batch run of synthetic cases spanning various failure reasons by clicking the **"Run 50+ Batch"** button on the dashboard, or via terminal:
 ```bash
 curl -X POST http://localhost:8000/api/v1/batch
 ```
-After running this, refresh the dashboard to view the generated cases, watch them transition through states, and click "View Trail" to see the AI reasoning and execution outcome for each case.
+After running this, the cases will flow through the pipeline. You can watch them transition through states on the dashboard, and click **"View Trace"** to see the AI reasoning and execution outcome for each case.

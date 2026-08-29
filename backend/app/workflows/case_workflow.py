@@ -109,33 +109,21 @@ async def inner_process_case_workflow(ctx, step):
 
         # 2. Diagnose
         def _diagnose(case=case_domain):
-            db = SessionLocal()
-            try:
-                return run_diagnosis_step(db, case, _get_provider()).model_dump()
-            finally:
-                db.close()
+            return run_diagnosis_step(case, _get_provider()).model_dump()
 
         diagnosis_dict = await step.run(f"diagnose_{attempt}", _diagnose)
         diagnosis = DiagnosisResult.model_validate(diagnosis_dict)
 
         # 3. Decide
         def _decide(case=case_domain, diag=diagnosis):
-            db = SessionLocal()
-            try:
-                return run_decision_step(db, case, diag, _get_provider()).model_dump()
-            finally:
-                db.close()
+            return run_decision_step(case, diag, _get_provider()).model_dump()
 
         decision_dict = await step.run(f"decide_{attempt}", _decide)
         decision = DecisionResult.model_validate(decision_dict)
 
         # 4. Policy check
         def _policy(case=case_domain, dec=decision, diag=diagnosis):
-            db = SessionLocal()
-            try:
-                return run_policy_step(db, case, dec, diag).model_dump()
-            finally:
-                db.close()
+            return run_policy_step(case, dec, diag).model_dump()
 
         policy_dict = await step.run(f"policy_{attempt}", _policy)
         policy_eval = PolicyEvaluationResult.model_validate(policy_dict)
@@ -154,11 +142,7 @@ async def inner_process_case_workflow(ctx, step):
 
         # 6. Generate customer communication
         def _comms(case=case_domain, diag=diagnosis, att=attempt):
-            db = SessionLocal()
-            try:
-                return run_communication_step(db, case, diag, att + 1)
-            finally:
-                db.close()
+            return run_communication_step(case, diag, att + 1)
 
         await step.run(f"comms_{attempt}", _comms)
 
@@ -167,12 +151,8 @@ async def inner_process_case_workflow(ctx, step):
 
         def _execute(case=case_domain, appr=approved):
             from app.execution.executor import RazorpayExecutor
-            db = SessionLocal()
-            try:
-                executor = RazorpayExecutor()
-                return run_execution_step(db, case, appr, executor).model_dump()
-            finally:
-                db.close()
+            executor = RazorpayExecutor()
+            return run_execution_step(case, appr, executor).model_dump()
 
         exec_dict = await step.run(f"execute_{attempt}", _execute)
         exec_result = ExecutionResult.model_validate(exec_dict)

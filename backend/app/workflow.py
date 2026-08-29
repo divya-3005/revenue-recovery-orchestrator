@@ -7,13 +7,13 @@ Each wrapper follows the same pattern:
   3. Return the result
 """
 
-from sqlalchemy.orm import Session
 from app.domain import RecoveryCaseContext, DiagnosisResult, DecisionResult, PolicyEvaluationResult
 from app.ai.provider import AIProvider
 from app.ai.diagnosis import diagnose_case
 from app.ai.decision import decide_action
 from app.policy import evaluate_policy
 from app.comms import generate_message
+from app.database import SessionLocal
 from app.db.audit_repository import (
     record_diagnosis_checkpoint,
     record_decision_checkpoint,
@@ -23,36 +23,56 @@ from app.db.audit_repository import (
 )
 
 
-def run_diagnosis_step(session: Session, case: RecoveryCaseContext, provider: AIProvider) -> DiagnosisResult:
+def run_diagnosis_step(case: RecoveryCaseContext, provider: AIProvider) -> DiagnosisResult:
     """Diagnose → checkpoint."""
     diagnosis = diagnose_case(case, provider)
-    record_diagnosis_checkpoint(session, case, diagnosis)
+    db = SessionLocal()
+    try:
+        record_diagnosis_checkpoint(db, case, diagnosis)
+    finally:
+        db.close()
     return diagnosis
 
 
-def run_decision_step(session: Session, case: RecoveryCaseContext, diagnosis: DiagnosisResult, provider: AIProvider) -> DecisionResult:
+def run_decision_step(case: RecoveryCaseContext, diagnosis: DiagnosisResult, provider: AIProvider) -> DecisionResult:
     """Decide → checkpoint."""
     decision = decide_action(case, diagnosis, provider)
-    record_decision_checkpoint(session, case, decision)
+    db = SessionLocal()
+    try:
+        record_decision_checkpoint(db, case, decision)
+    finally:
+        db.close()
     return decision
 
 
-def run_policy_step(session: Session, case: RecoveryCaseContext, decision: DecisionResult, diagnosis: DiagnosisResult) -> PolicyEvaluationResult:
+def run_policy_step(case: RecoveryCaseContext, decision: DecisionResult, diagnosis: DiagnosisResult) -> PolicyEvaluationResult:
     """Policy eval → checkpoint."""
     policy_eval = evaluate_policy(case, decision, diagnosis)
-    record_policy_checkpoint(session, case, policy_eval)
+    db = SessionLocal()
+    try:
+        record_policy_checkpoint(db, case, policy_eval)
+    finally:
+        db.close()
     return policy_eval
 
 
-def run_communication_step(session: Session, case: RecoveryCaseContext, diagnosis: DiagnosisResult, attempt_number: int) -> str:
+def run_communication_step(case: RecoveryCaseContext, diagnosis: DiagnosisResult, attempt_number: int) -> str:
     """Generate customer message → checkpoint."""
     message = generate_message(case, diagnosis, attempt_number)
-    record_communication_checkpoint(session, case, message)
+    db = SessionLocal()
+    try:
+        record_communication_checkpoint(db, case, message)
+    finally:
+        db.close()
     return message
 
 
-def run_execution_step(session: Session, case: RecoveryCaseContext, approved_decision, executor):
+def run_execution_step(case: RecoveryCaseContext, approved_decision, executor):
     """Execute action → checkpoint."""
     exec_result = executor.execute(case, approved_decision)
-    record_execution_checkpoint(session, case, exec_result)
+    db = SessionLocal()
+    try:
+        record_execution_checkpoint(db, case, exec_result)
+    finally:
+        db.close()
     return exec_result

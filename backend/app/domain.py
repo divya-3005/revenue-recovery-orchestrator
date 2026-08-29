@@ -29,6 +29,7 @@ class RecoveryCaseContext(BaseModel):
     currency: str
     customer_id: str
     payment_rail: str | None = None
+    priority_score: int = 0
     raw_signal_payload: Dict[str, Any]
     
     # Execution State

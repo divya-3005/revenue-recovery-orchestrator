@@ -53,7 +53,7 @@ def test_workflow_diagnosis():
         db.commit() 
         assert db.in_transaction() is False
         
-        diagnosis = run_diagnosis_step(db, case_domain, provider)
+        diagnosis = run_diagnosis_step(case_domain, provider)
         
         # Verify AI call didn't happen inside a transaction lock
         # run_diagnosis_step handles the transaction internally ONLY for the checkpoint.
@@ -67,7 +67,7 @@ def test_workflow_diagnosis():
         # B. Replay: execute the exact same logical checkpoint twice
         # No exception should be raised, and length should still be 1.
         try:
-            run_diagnosis_step(db, case_domain, provider)
+            run_diagnosis_step(case_domain, provider)
         except Exception as e:
             assert False, f"Replay raised exception: {e}"
             
@@ -77,7 +77,7 @@ def test_workflow_diagnosis():
         # D. Logical attempt isolation
         # Simulate an intentional retry by advancing the retry_count (logical_attempt)
         case_domain.retry_count = 1
-        run_diagnosis_step(db, case_domain, provider)
+        run_diagnosis_step(case_domain, provider)
         
         audit_logs_after_new_attempt = db.execute(select(models.AuditLog).where(models.AuditLog.case_id == case_domain.id)).scalars().all()
         assert len(audit_logs_after_new_attempt) == 2 # Distinct checkpoint identity created!
@@ -88,7 +88,7 @@ def test_workflow_diagnosis():
         
         provider_fail = FlakyAIProvider(succeed=False)
         try:
-            run_diagnosis_step(db, case_domain_2, provider_fail)
+            run_diagnosis_step(case_domain_2, provider_fail)
             assert False, "Should have crashed"
         except Exception as e:
             assert "simulated crash" in str(e)
