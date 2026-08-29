@@ -1,4 +1,4 @@
-from app.ai.provider import AIProvider, FallbackProvider, GeminiProvider, GroqProvider
+from app.ai.provider import AIProvider, FallbackProvider, GeminiProvider, GroqProvider, AnthropicProvider
 from app.ai.diagnosis import diagnose_case
 from app.domain import DiagnosisResult, RootCauseCategory, RecoveryCaseContext
 from app.models import CaseType, CaseStatus
@@ -119,11 +119,18 @@ def test_sdk_imports():
         except ValueError:
             pass
 
+        try:
+            AnthropicProvider()
+            assert False, "AnthropicProvider should require ANTHROPIC_API_KEY"
+        except ValueError:
+            pass
+
     # 2. With API keys set, providers should instantiate successfully
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "test_key", "GROQ_API_KEY": "test_key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "GROQ_API_KEY": "test", "ANTHROPIC_API_KEY": "test"}):
         try:
             GeminiProvider()
             GroqProvider()
+            AnthropicProvider()
         except Exception as e:
             assert False, f"SDK initialization failed with keys set: {e}"
 

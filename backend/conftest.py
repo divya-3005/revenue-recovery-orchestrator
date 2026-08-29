@@ -14,3 +14,4 @@ def set_test_env_vars(monkeypatch):
     """Ensure provider constructors don't fail due to missing API keys in tests."""
     monkeypatch.setenv("GEMINI_API_KEY", "test_dummy_key")
     monkeypatch.setenv("GROQ_API_KEY", "test_dummy_key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test_dummy_key")

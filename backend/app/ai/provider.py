@@ -59,6 +59,44 @@ class GroqProvider(AIProvider):
         # Assuming the prompt enforces the schema correctly
         return response_schema.model_validate_json(chat_completion.choices[0].message.content)
 
+class AnthropicProvider(AIProvider):
+    def __init__(self):
+        from anthropic import Anthropic
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY environment variable is required. "
+                "Set it to use the Anthropic provider, or use a mock in tests."
+            )
+        self.client = Anthropic(api_key=api_key)
+        self.model_id = os.getenv("ANTHROPIC_MODEL_ID", "claude-3-5-sonnet-latest")
+        
+    def ask_structured(self, prompt: str, response_schema: Type[T]) -> T:
+        full_prompt = (
+            f"{prompt}\n\n"
+            f"You MUST respond with ONLY a valid JSON object matching this schema. "
+            f"Do not include markdown formatting like ```json or ANY other text.\n"
+            f"Schema: {response_schema.model_json_schema()}"
+        )
+        
+        message = self.client.messages.create(
+            max_tokens=1024,
+            messages=[
+                {"role": "user", "content": full_prompt}
+            ],
+            model=self.model_id,
+        )
+        
+        response_text = message.content[0].text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+            
+        return response_schema.model_validate_json(response_text.strip())
+
 class FallbackProvider(AIProvider):
     def __init__(self, primary: AIProvider, fallback: AIProvider):
         self.primary = primary
@@ -82,6 +120,18 @@ class FallbackProvider(AIProvider):
             import google.genai.errors as genai_errors
             recoverable.extend([
                 genai_errors.APIError
+            ])
+        except ImportError:
+            pass
+            
+        try:
+            import anthropic
+            recoverable.extend([
+                anthropic.APIConnectionError,
+                anthropic.APITimeoutError,
+                anthropic.RateLimitError,
+                anthropic.InternalServerError,
+                anthropic.APIStatusError
             ])
         except ImportError:
             pass

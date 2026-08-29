@@ -20,6 +20,7 @@ completed steps are skipped automatically.
 
 from inngest import Context, TriggerEvent
 from sqlalchemy import select
+import os
 
 from app.inngest_client import inngest_client
 from app.database import SessionLocal
@@ -35,7 +36,7 @@ from app.workflow import (
     run_policy_step, run_communication_step, run_execution_step,
 )
 from app.policy import PolicyConfig
-from app.ai.provider import FallbackProvider, GeminiProvider, GroqProvider
+from app.ai.provider import FallbackProvider, GeminiProvider, GroqProvider, AnthropicProvider
 from app.db.audit_repository import update_case_status
 
 
@@ -75,8 +76,24 @@ async def inner_process_case_workflow(ctx, step):
         finally:
             db.close()
 
+    def _get_provider_instance(name: str):
+        if name == "gemini":
+            return GeminiProvider()
+        elif name == "groq":
+            return GroqProvider()
+        elif name == "anthropic":
+            return AnthropicProvider()
+        else:
+            raise ValueError(f"Unknown AI provider: {name}")
+
     def _get_provider():
-        return FallbackProvider(GeminiProvider(), GroqProvider())
+        primary_name = os.getenv("AI_PRIMARY_PROVIDER", "gemini").lower()
+        fallback_name = os.getenv("AI_FALLBACK_PROVIDER", "groq").lower()
+        
+        primary = _get_provider_instance(primary_name)
+        fallback = _get_provider_instance(fallback_name)
+        
+        return FallbackProvider(primary, fallback)
 
     # ── Mark case as in progress ─────────────────────────────────────
 
