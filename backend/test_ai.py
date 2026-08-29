@@ -101,13 +101,31 @@ def test_diagnose_no_fallback_on_validation_error():
     assert provider.fallback.calls == 0
 
 def test_sdk_imports():
-    # Verify that the provider classes can be instantiated without crashing 
-    # (i.e. google-genai and groq are actually installed)
-    try:
-        GeminiProvider()
-        GroqProvider()
-    except Exception as e:
-        assert False, f"SDK Initialization failed: {e}"
+    """Verify SDKs are installed and providers enforce API key requirements."""
+    import os
+    from unittest.mock import patch
+
+    # 1. Without API keys, providers should raise ValueError
+    with patch.dict(os.environ, {}, clear=True):
+        try:
+            GeminiProvider()
+            assert False, "GeminiProvider should require GEMINI_API_KEY"
+        except ValueError:
+            pass
+
+        try:
+            GroqProvider()
+            assert False, "GroqProvider should require GROQ_API_KEY"
+        except ValueError:
+            pass
+
+    # 2. With API keys set, providers should instantiate successfully
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "test_key", "GROQ_API_KEY": "test_key"}):
+        try:
+            GeminiProvider()
+            GroqProvider()
+        except Exception as e:
+            assert False, f"SDK initialization failed with keys set: {e}"
 
 if __name__ == "__main__":
     test_diagnose_success()

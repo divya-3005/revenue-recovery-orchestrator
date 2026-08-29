@@ -16,20 +16,18 @@ class AIProvider(ABC):
 class GeminiProvider(AIProvider):
     def __init__(self):
         from google import genai
-        # Lazy import configuration. Fails gracefully in tests if unconfigured
-        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY", "dummy_key"))
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "GEMINI_API_KEY environment variable is required. "
+                "Set it to use the Gemini provider, or use a mock in tests."
+            )
+        self.client = genai.Client(api_key=api_key)
+        self.model_id = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
         
     def ask_structured(self, prompt: str, response_schema: Type[T]) -> T:
-        if os.getenv("GEMINI_API_KEY", "dummy_key") == "dummy_key":
-            logger.warning("GOOGLE_API_KEY not set. Using MockAIProvider.")
-            if response_schema.__name__ == "DiagnosisResult":
-                return response_schema.model_validate({"root_cause_category": "friction", "specific_reason": "mocked", "confidence_score": 0.9, "reasoning": "mocked"})
-            elif response_schema.__name__ == "DecisionResult":
-                return response_schema.model_validate({"recommended_action": "retry_charge", "action_parameters": {"delay_hours": 24}, "confidence_score": 0.9, "reasoning": "mocked"})
-            return response_schema.model_validate({})
-            
         response = self.client.models.generate_content(
-            model='gemini-2.5-flash',
+            model=self.model_id,
             contents=prompt,
             config={
                 'response_mime_type': 'application/json',
@@ -41,14 +39,21 @@ class GeminiProvider(AIProvider):
 class GroqProvider(AIProvider):
     def __init__(self):
         from groq import Groq
-        self.client = Groq(api_key=os.getenv("GROQ_API_KEY", "dummy_key"))
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "GROQ_API_KEY environment variable is required. "
+                "Set it to use the Groq provider, or use a mock in tests."
+            )
+        self.client = Groq(api_key=api_key)
+        self.model_id = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
         
     def ask_structured(self, prompt: str, response_schema: Type[T]) -> T:
         chat_completion = self.client.chat.completions.create(
             messages=[
                 {"role": "user", "content": prompt}
             ],
-            model="llama-3.1-8b-instant",
+            model=self.model_id,
             response_format={"type": "json_object"},
         )
         # Assuming the prompt enforces the schema correctly
