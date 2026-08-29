@@ -147,7 +147,7 @@ if __name__ == "__main__":
     test_policy_stop_always_allowed()
     test_policy_high_value_blocks_financial_actions()
     test_policy_discount_caps()
-    test_policy_hard_declines_blocked()
+    test_policy_webhook_hard_decline_blocked()
     test_policy_max_retries_capped()
     test_get_policy_endpoint()
     print("SUCCESS: All policy tests passed!")

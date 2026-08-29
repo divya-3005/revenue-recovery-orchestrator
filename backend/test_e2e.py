@@ -6,6 +6,7 @@ Uses MockStep to simulate Inngest's step.run (calls functions synchronously).
 """
 
 import asyncio
+import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 from app.main import app
@@ -41,7 +42,8 @@ class MockContext:
 
 # ── Test 1: Full happy path (soft decline → retry → awaiting payment) ────────────
 
-async def run_e2e_happy_path():
+@pytest.mark.asyncio
+async def test_e2e_happy_path():
     db = SessionLocal()
     try:
         # 1. Submit case via API
@@ -117,14 +119,14 @@ async def run_e2e_happy_path():
         ).first()
         assert updated_case.status == CaseStatus.AWAITING_PAYMENT
 
-        print("PASS: E2E happy path")
     finally:
         db.close()
 
 
 # ── Test 2: Unsafe AI decision blocked by policy ────────────────────────
 
-async def run_e2e_policy_rejection():
+@pytest.mark.asyncio
+async def test_e2e_policy_rejection():
     db = SessionLocal()
     try:
         with patch('app.main.inngest_client.send_sync'):
@@ -173,14 +175,14 @@ async def run_e2e_policy_rejection():
         case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
         assert case.status == CaseStatus.FAILED
 
-        print("PASS: E2E policy rejection")
     finally:
         db.close()
 
 
 # ── Test 3: Razorpay failure is handled safely ──────────────────────────
 
-async def run_e2e_razorpay_failure():
+@pytest.mark.asyncio
+async def test_e2e_razorpay_failure():
     db = SessionLocal()
     try:
         with patch('app.main.inngest_client.send_sync'):
@@ -233,7 +235,6 @@ async def run_e2e_razorpay_failure():
             assert len(exec_logs) > 0
             assert "Razorpay API failure" in exec_logs[0].reasoning
 
-        print("PASS: E2E Razorpay failure")
     finally:
         db.close()
 
@@ -270,7 +271,8 @@ def test_create_case_inngest_failure_still_commits():
 
 # ── Test 5: Communication generation in workflow ────────────────────────
 
-async def run_e2e_communication():
+@pytest.mark.asyncio
+async def test_e2e_communication():
     db = SessionLocal()
     try:
         with patch('app.main.inngest_client.send_sync'):
@@ -321,7 +323,6 @@ async def run_e2e_communication():
         assert len(comms_logs) == 1
         assert "insufficient funds" in comms_logs[0].reasoning  # the generated message
 
-        print("PASS: E2E communication generation")
     finally:
         db.close()
 
@@ -387,15 +388,15 @@ def test_webhook_confirms_payment():
             models.AuditLog.case_id == case.id
         )).scalars().all()
         assert any(l.action_type == "PAYMENT_CONFIRMED" for l in logs)
-        
-        print("PASS: Webhook confirms payment")
+
     finally:
         db.close()
 
 
 # ── Test 6: Escalation for high-value cases ─────────────────────────────
 
-async def run_e2e_escalation():
+@pytest.mark.asyncio
+async def test_e2e_escalation():
     db = SessionLocal()
     try:
         with patch('app.main.inngest_client.send_sync'):
@@ -445,7 +446,6 @@ async def run_e2e_escalation():
         esc_ids = [c["id"] for c in esc_response.json()]
         assert case_id in esc_ids
 
-        print("PASS: E2E escalation")
     finally:
         db.close()
 
@@ -473,8 +473,6 @@ def test_audit_trail_endpoint():
     bad_resp = client.get("/api/v1/cases/fake-id/audit")
     assert bad_resp.status_code == 404
 
-    print("PASS: Audit trail endpoint")
-
 
 # ── Test 8: Analytics endpoint ──────────────────────────────────────────
 
@@ -487,7 +485,6 @@ def test_analytics_endpoint():
     assert "breakdown_by_case_type" in data
     assert "breakdown_by_status" in data
     assert "exceptions" in data
-    print("PASS: Analytics endpoint")
 
 
 # ── Test 9: Batch endpoint (Feature 11) ─────────────────────────────────
@@ -503,20 +500,3 @@ def test_batch_endpoint():
     # Verify analytics reflects the batch
     analytics = client.get("/api/v1/analytics").json()
     assert analytics["total_cases"] >= 50
-    print("PASS: Batch endpoint")
-
-
-# ── Runner ──────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    asyncio.run(run_e2e_happy_path())
-    asyncio.run(run_e2e_policy_rejection())
-    asyncio.run(run_e2e_razorpay_failure())
-    test_create_case_inngest_failure_still_commits()
-    asyncio.run(run_e2e_communication())
-    test_webhook_confirms_payment()
-    asyncio.run(run_e2e_escalation())
-    test_audit_trail_endpoint()
-    test_analytics_endpoint()
-    test_batch_endpoint()
-    print("\nSUCCESS: All e2e tests passed!")

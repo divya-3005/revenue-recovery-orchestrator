@@ -11,3 +11,4 @@ google-genai==0.2.1
 groq==0.11.0
 inngest==0.3.2
 razorpay
+pytest-asyncio
