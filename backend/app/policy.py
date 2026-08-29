@@ -46,13 +46,17 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
         if proposed_action != RecoveryActionType.SEND_REMINDER: 
             return reject(f"Action blocked: Case value ({case.amount_paise} paise) exceeds automatic threshold. Human approval required.")
 
-    # Rule 3: Cap discount percentage
+    # Rule 3: Cap discount percentage cumulatively
     if proposed_action == RecoveryActionType.OFFER_DISCOUNT:
         discount_pct = proposed_parameters.get("discount_percent", 0)
-        if discount_pct > PolicyConfig.MAX_DISCOUNT_PERCENT:
-            return reject(f"Action blocked: Proposed discount ({discount_pct}%) exceeds policy maximum ({PolicyConfig.MAX_DISCOUNT_PERCENT}%).")
         if discount_pct <= 0:
             return reject("Action blocked: Discount percentage must be greater than zero.")
+            
+        proposed_discount_paise = case.amount_paise * (discount_pct / 100)
+        max_discount_paise = case.amount_paise * (PolicyConfig.MAX_DISCOUNT_PERCENT / 100)
+        
+        if case.cumulative_discount_paise + proposed_discount_paise > max_discount_paise:
+            return reject(f"Action blocked: Cumulative discount exceeds policy maximum ({PolicyConfig.MAX_DISCOUNT_PERCENT}%).")
 
     # Rule 4: Block retries on hard declines
     if proposed_action == RecoveryActionType.RETRY_CHARGE and PolicyConfig.BLOCK_HARD_DECLINES:

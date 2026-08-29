@@ -71,6 +71,14 @@ def test_policy_discount_caps():
     assert result.allowed is False
     assert "exceeds policy maximum" in result.reason
     
+    # Cumulative above cap
+    # 10% discount on 100000 paise = 10000 paise. 10000 existing + 10000 proposed = 20000. 
+    # Max is 15% of 100000 = 15000. This should be blocked.
+    case_with_discount = create_mock_domain_case(amount_paise=100000, cumulative_discount=10000)
+    result = evaluate_policy(case_with_discount, create_mock_decision(RecoveryActionType.OFFER_DISCOUNT, {"discount_percent": 10}), create_mock_diagnosis())
+    assert result.allowed is False
+    assert "Cumulative discount exceeds policy maximum" in result.reason
+    
     # Zero or negative
     try:
         bad_decision = create_mock_decision(RecoveryActionType.OFFER_DISCOUNT, {"discount_percent": 0})
@@ -78,7 +86,7 @@ def test_policy_discount_caps():
         assert result.allowed is False
         assert "greater than zero" in result.reason
     except ValueError:
-        pass 
+        pass
 
 def test_policy_webhook_hard_decline_blocked():
     """
