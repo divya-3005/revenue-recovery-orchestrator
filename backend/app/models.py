@@ -51,7 +51,6 @@ class RecoveryCase(Base):
     # Execution State
     retry_count = Column(Integer, nullable=False, default=0)
     cumulative_discount_paise = Column(Integer, nullable=False, default=0)
-    active_diagnosis = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

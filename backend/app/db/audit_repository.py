@@ -32,10 +32,10 @@ def record_diagnosis_checkpoint(session: Session, case: RecoveryCaseContext, dia
         action_type="DIAGNOSIS_COMPLETED",
         description=f"Diagnosis completed with category: {diagnosis.root_cause_category.value}",
         reasoning=diagnosis.reasoning
-    ).on_conflict_do_nothing()
+    ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
     session.commit()
-    return result.rowcount > 0
+    return result.scalar() is not None
 
 
 def record_decision_checkpoint(session: Session, case: RecoveryCaseContext, decision) -> bool:
@@ -46,10 +46,10 @@ def record_decision_checkpoint(session: Session, case: RecoveryCaseContext, deci
         action_type="DECISION_PROPOSED",
         description=f"AI proposed action: {decision.recommended_action.value}",
         reasoning=decision.reasoning
-    ).on_conflict_do_nothing()
+    ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
     session.commit()
-    return result.rowcount > 0
+    return result.scalar() is not None
 
 
 def record_policy_checkpoint(session: Session, case: RecoveryCaseContext, policy_eval) -> bool:
@@ -60,10 +60,10 @@ def record_policy_checkpoint(session: Session, case: RecoveryCaseContext, policy
         action_type="POLICY_EVALUATED",
         description=f"Policy {'APPROVED' if policy_eval.allowed else 'REJECTED'}: {policy_eval.reason}",
         reasoning=None
-    ).on_conflict_do_nothing()
+    ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
     session.commit()
-    return result.rowcount > 0
+    return result.scalar() is not None
 
 
 def record_communication_checkpoint(session: Session, case: RecoveryCaseContext, message: str) -> bool:
@@ -74,10 +74,10 @@ def record_communication_checkpoint(session: Session, case: RecoveryCaseContext,
         action_type="COMMUNICATION_SENT",
         description=f"Recovery message generated (attempt {case.retry_count + 1})",
         reasoning=message
-    ).on_conflict_do_nothing()
+    ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
     session.commit()
-    return result.rowcount > 0
+    return result.scalar() is not None
 
 
 def record_execution_checkpoint(session: Session, case: RecoveryCaseContext, exec_result) -> bool:
@@ -88,11 +88,13 @@ def record_execution_checkpoint(session: Session, case: RecoveryCaseContext, exe
         action_type="ACTION_EXECUTED",
         description=f"Execution {exec_result.status.value}: {exec_result.action_taken.value}",
         reasoning=exec_result.reason
-    ).on_conflict_do_nothing()
+    ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
+    inserted_id = result.scalar()
     
-    # Update cumulative discount if applicable
-    if exec_result.status == ExecutionStatus.SUCCESS and exec_result.action_taken == RecoveryActionType.OFFER_DISCOUNT:
+    # Update cumulative discount if applicable, only if the execution log was actually inserted.
+    # This prevents double-counting if Inngest replays an already-completed step.
+    if inserted_id is not None and exec_result.status == ExecutionStatus.SUCCESS and exec_result.action_taken == RecoveryActionType.OFFER_DISCOUNT:
         discount_applied = exec_result.action_parameters_used.get("discount_applied_paise", 0)
         if discount_applied > 0:
             db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case.id).first()
@@ -100,7 +102,7 @@ def record_execution_checkpoint(session: Session, case: RecoveryCaseContext, exe
                 db_case.cumulative_discount_paise += discount_applied
 
     session.commit()
-    return result.rowcount > 0
+    return inserted_id is not None
 
 
 # ── Case status helpers ──────────────────────────────────────────────────

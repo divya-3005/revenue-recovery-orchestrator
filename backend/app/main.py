@@ -41,22 +41,6 @@ from app.workflows.case_workflow import process_case_workflow
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# #region agent log
-def _debug_log(hypothesis_id: str, location: str, message: str, data: dict):
-    try:
-        with open("/Users/divyasingh1/Desktop/razorpay/.cursor/debug-3f02a1.log", "a") as _df:
-            _df.write(json.dumps({
-                "sessionId": "3f02a1",
-                "hypothesisId": hypothesis_id,
-                "location": location,
-                "message": message,
-                "data": data,
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-# #endregion
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -83,6 +67,23 @@ app.add_middleware(
 inngest.fast_api.serve(app, inngest_client, [process_case_workflow])
 
 
+def compute_priority_score(case_type: CaseType, amount_paise: int, payload: dict) -> int:
+    """Compute Expected Value heuristic for the UI priority column."""
+    if case_type == CaseType.SUBSCRIPTION_FAILED:
+        reason = payload.get("reason", "")
+        # Hard declines have low expected recovery
+        if reason in ["lost_card_reported", "stolen_card", "account_closed", "fraud_suspected"]:
+            return int(amount_paise * 0.2)
+        # Soft declines have high expected recovery
+        return int(amount_paise * 0.8)
+    elif case_type == CaseType.CHECKOUT_ABANDONED:
+        return int(amount_paise * 0.5)
+    elif case_type == CaseType.INVOICE_OVERDUE:
+        # B2B invoice generally high expected recovery
+        return int(amount_paise * 0.9)
+    return int(amount_paise * 0.5)
+
+
 def _apply_payment_confirmed(db: Session, case_id: str, source: str) -> dict:
     """Mark a case recovered only if it is still open. Never counts a payment-link create as recovered."""
     existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
@@ -100,9 +101,6 @@ def _apply_payment_confirmed(db: Session, case_id: str, source: str) -> dict:
     updated_id = result.scalar()
 
     if not updated_id:
-        # #region agent log
-        _debug_log("C", "main.py:_apply_payment_confirmed", "idempotent_skip", {"case_id": case_id, "status": existing.status.value, "source": source})
-        # #endregion
         return {"status": "idempotent", "case_id": case_id}
 
     audit_log = models.AuditLog(
@@ -113,9 +111,6 @@ def _apply_payment_confirmed(db: Session, case_id: str, source: str) -> dict:
     )
     db.add(audit_log)
     db.commit()
-    # #region agent log
-    _debug_log("C", "main.py:_apply_payment_confirmed", "marked_recovered", {"case_id": case_id, "source": source})
-    # #endregion
     return {"status": "recovered", "case_id": case_id}
 
 
@@ -125,14 +120,13 @@ def _apply_payment_confirmed(db: Session, case_id: str, source: str) -> dict:
 def health_check():
     return {"status": "healthy"}
 
-@app.get("/")
-def serve_dashboard():
-    from fastapi.responses import FileResponse
-    import os
-    index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    return {"status": "Dashboard not found"}
+
+# ── Demo ─────────────────────────────────────────────────────────────────
+
+@app.post("/api/v1/demo/confirm-payment/{case_id}")
+def demo_confirm_payment(case_id: str, db: Session = Depends(get_db)):
+    """Local demo only: mark a case as paid to test the AWAITING_PAYMENT -> RECOVERED transition."""
+    return _apply_payment_confirmed(db, case_id, "demo_endpoint")
 
 
 # ── Case CRUD ────────────────────────────────────────────────────────────
@@ -140,12 +134,15 @@ def serve_dashboard():
 @app.post("/api/v1/cases", response_model=schemas.RecoveryCaseResponse, status_code=status.HTTP_201_CREATED)
 def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_db)):
     """Ingest a new risk signal and normalize it into a Recovery Case."""
+    priority_score = compute_priority_score(case_in.case_type, case_in.amount_paise, case_in.raw_signal_payload)
+    
     db_case = models.RecoveryCase(
         case_type=case_in.case_type,
         amount_paise=case_in.amount_paise,
         currency=case_in.currency,
         customer_id=case_in.customer_id,
         payment_rail=case_in.payment_rail,
+        priority_score=priority_score,
         raw_signal_payload=case_in.raw_signal_payload,
     )
 
@@ -159,9 +156,6 @@ def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_d
     db.add(db_case)
 
     # IMPORTANT: Commit the case FIRST, then fire the Inngest event.
-    # If commit fails → no event fires (safe).
-    # If commit succeeds but event fails → case exists but no workflow
-    #   (detectable, retryable — far safer than a phantom workflow for a missing case).
     db.commit()
     db.refresh(db_case)
 
@@ -207,7 +201,6 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
     event_id = payload.get("id", "unknown_event_id")
     
     from sqlalchemy.dialects.postgresql import insert
-    from sqlalchemy import update
     
     if event_type in ("payment_link.paid", "payment.captured"):
         if event_type == "payment_link.paid":
@@ -220,6 +213,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
 
         return _apply_payment_confirmed(db, case_id, event_type)
     
+    priority_score = 0
     # Map payload to case fields for payment.failed and subscription.pending
     if event_type == "payment.failed":
         case_type = CaseType.SUBSCRIPTION_FAILED
@@ -228,6 +222,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         currency = payment.get("currency", "INR")
         customer_id = payment.get("customer_id") or payment.get("email") or "unknown"
         payment_rail = payment.get("method")
+        priority_score = compute_priority_score(case_type, amount_paise, payload)
     elif event_type == "subscription.pending":
         case_type = CaseType.SUBSCRIPTION_FAILED
         sub = payload.get("payload", {}).get("subscription", {}).get("entity", {})
@@ -235,6 +230,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         currency = "INR"
         customer_id = sub.get("customer_id") or "unknown"
         payment_rail = None
+        priority_score = compute_priority_score(case_type, amount_paise, payload)
         
     # Atomic INSERT ON CONFLICT DO NOTHING
     stmt = insert(models.RecoveryCase).values(
@@ -244,6 +240,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         currency=currency,
         customer_id=customer_id,
         payment_rail=payment_rail,
+        priority_score=priority_score,
         raw_signal_payload=payload,
         razorpay_event_id=event_id
     ).on_conflict_do_nothing(

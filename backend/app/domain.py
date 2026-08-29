@@ -35,7 +35,6 @@ class RecoveryCaseContext(BaseModel):
     # Execution State
     retry_count: int
     cumulative_discount_paise: int
-    active_diagnosis: Optional[DiagnosisResult] = None
     
     # We allow ORM mapping so we can easily convert from SQLAlchemy models
     model_config = ConfigDict(from_attributes=True)
@@ -92,6 +91,7 @@ class PolicyEvaluationResult(BaseModel):
     allowed: bool
     reason: str
     approved_decision: Optional[PolicyApprovedDecision] = None
+    requires_human_approval: bool = False
 
 class PipelineResult(BaseModel):
     diagnosis: DiagnosisResult

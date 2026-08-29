@@ -129,8 +129,8 @@ def test_workflow_execution_retry_idempotency():
         
         approved_decision = PolicyApprovedDecision(
             decision=DecisionResult(
-                recommended_action=RecoveryActionType.RETRY_CHARGE,
-                action_parameters={"delay_hours": 24},
+                recommended_action=RecoveryActionType.OFFER_DISCOUNT,
+                action_parameters={"discount_percent": 10, "discount_applied_paise": 10000},
                 confidence_score=0.9,
                 reasoning="Test"
             ),
@@ -163,6 +163,11 @@ def test_workflow_execution_retry_idempotency():
         )).scalars().all()
         assert len(audit_logs_success) == 1
         
+        # Refresh case and check discount applied
+        db.commit()
+        db.refresh(db_case)
+        assert db_case.cumulative_discount_paise == 10000
+        
         # C. Idempotent replay: exact same logical checkpoint again
         try:
             run_execution_step(case_domain, approved_decision, provider_succeed)
@@ -175,6 +180,11 @@ def test_workflow_execution_retry_idempotency():
             models.AuditLog.action_type == "ACTION_EXECUTED"
         )).scalars().all()
         assert len(audit_logs_replay) == 1
+
+        # Check discount not double counted!
+        db.commit()
+        db.refresh(db_case)
+        assert db_case.cumulative_discount_paise == 10000
 
         print("SUCCESS: Execution retry idempotency tests passed.")
     finally:

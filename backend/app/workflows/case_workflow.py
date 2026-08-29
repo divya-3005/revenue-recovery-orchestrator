@@ -131,7 +131,7 @@ async def inner_process_case_workflow(ctx, step):
         # 5. Handle policy rejection
         if not policy_eval.allowed or not policy_eval.approved_decision:
             # High-value cases needing human sign-off → escalate
-            if "Human approval" in policy_eval.reason:
+            if policy_eval.requires_human_approval:
                 await step.run(f"escalate_{attempt}",
                                lambda: _set_status(CaseStatus.ESCALATED))
                 return {"status": "escalated", "reason": policy_eval.reason}

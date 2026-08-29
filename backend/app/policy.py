@@ -26,8 +26,8 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
     proposed_action = decision.recommended_action
     proposed_parameters = decision.action_parameters
 
-    def reject(reason: str) -> PolicyEvaluationResult:
-        return PolicyEvaluationResult(allowed=False, reason=reason, approved_decision=None)
+    def reject(reason: str, requires_human_approval: bool = False) -> PolicyEvaluationResult:
+        return PolicyEvaluationResult(allowed=False, reason=reason, approved_decision=None, requires_human_approval=requires_human_approval)
 
     def approve(reason: str) -> PolicyEvaluationResult:
         approved = PolicyApprovedDecision(
@@ -35,7 +35,7 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
             policy_reason=reason,
             idempotency_key=_generate_idempotency_key(case, decision)
         )
-        return PolicyEvaluationResult(allowed=True, reason=reason, approved_decision=approved)
+        return PolicyEvaluationResult(allowed=True, reason=reason, approved_decision=approved, requires_human_approval=False)
 
     # Rule 1: Escalation and stopping are always allowed
     if proposed_action in [RecoveryActionType.ESCALATE_TO_HUMAN, RecoveryActionType.STOP]:
@@ -44,7 +44,7 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
     # Rule 2: High value cases require human approval for financial actions
     if case.amount_paise > PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE:
         if proposed_action != RecoveryActionType.SEND_REMINDER: 
-            return reject(f"Action blocked: Case value ({case.amount_paise} paise) exceeds automatic threshold. Human approval required.")
+            return reject(f"Action blocked: Case value ({case.amount_paise} paise) exceeds automatic threshold. Human approval required.", requires_human_approval=True)
 
     # Rule 3: Cap discount percentage cumulatively
     if proposed_action == RecoveryActionType.OFFER_DISCOUNT:
