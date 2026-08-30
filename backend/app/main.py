@@ -168,6 +168,71 @@ def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_d
     logger.info(f"Created RecoveryCase {db_case.id} for customer {db_case.customer_id}")
     return db_case
 
+@app.post("/api/v1/cases/beacon")
+def receive_checkout_beacon(body: schemas.CheckoutBeaconRequest, db: Session = Depends(get_db)):
+    """
+    Ingests CHECKOUT_ABANDONED signals from the frontend.
+    Enforces a 15-minute idle threshold before accepting the beacon and uses session_id for idempotency.
+    """
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    # Enforce 15-minute idle threshold
+    now = datetime.now(timezone.utc)
+    # Ensure last_interaction_at is timezone-aware for comparison
+    last_interaction = body.last_interaction_at
+    if last_interaction.tzinfo is None:
+        last_interaction = last_interaction.replace(tzinfo=timezone.utc)
+        
+    idle_time = now - last_interaction
+    if idle_time < timedelta(minutes=15):
+        return {"status": "ignored", "reason": "idle_threshold_not_met", "idle_minutes": idle_time.total_seconds() / 60}
+
+    priority_score = compute_priority_score(
+        CaseType.CHECKOUT_ABANDONED, 
+        body.amount_paise, 
+        {"cart_items": body.cart_items}
+    )
+
+    stmt = pg_insert(models.RecoveryCase).values(
+        case_type=CaseType.CHECKOUT_ABANDONED,
+        amount_paise=body.amount_paise,
+        currency=body.currency,
+        customer_id=body.customer_id,
+        session_id=body.session_id,
+        priority_score=priority_score,
+        raw_signal_payload={
+            "cart_items": body.cart_items,
+            "last_interaction_at": body.last_interaction_at.isoformat()
+        }
+    ).on_conflict_do_nothing(index_elements=['session_id'])
+    
+    result = db.execute(stmt)
+    inserted_id = result.scalar()
+    db.commit()
+
+    if inserted_id:
+        case_id = inserted_id
+        
+        audit_log = models.AuditLog(
+            case_id=case_id,
+            action_type="SIGNAL_RECEIVED",
+            description="Checkout abandoned beacon received",
+            reasoning="Automated ingestion via client-side beacon"
+        )
+        db.add(audit_log)
+        db.commit()
+
+        try:
+            inngest_client.send_sync(Event(name="case.received", data={"case_id": case_id}))
+        except Exception as e:
+            logger.warning(f"Inngest event dispatch failed for beacon case {case_id}: {e}.")
+
+        return {"status": "created", "case_id": case_id}
+    else:
+        existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.session_id == body.session_id).first()
+        return {"status": "idempotent", "case_id": existing.id if existing else None}
+
 @app.post("/webhooks/razorpay")
 async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(None), db: Session = Depends(get_db)):
     raw_body = await request.body()
@@ -501,11 +566,53 @@ def get_analytics(db: Session = Depends(get_db)):
         s = c.status.value
         by_status[s] = by_status.get(s, 0) + 1
 
+    # Breakdown by channel
+    by_channel = {}
+    
+    # Get latest EXECUTION audit log for each case to determine channel
+    from sqlalchemy import desc
+    execution_logs = db.query(models.AuditLog).filter(
+        models.AuditLog.action_type == "ACTION_EXECUTED"
+    ).order_by(models.AuditLog.created_at.desc()).all()
+    
+    # We only care about the latest execution per case
+    latest_exec_per_case = {}
+    for log in execution_logs:
+        if log.case_id not in latest_exec_per_case:
+            latest_exec_per_case[log.case_id] = log
+
+    for c in cases:
+        channel = "unknown"
+        if c.id in latest_exec_per_case:
+            # The channel might be in the reasoning or we fallback to payment_rail
+            # reasoning format: "Razorpay payment link created... Parameters: {'channel': 'sms'...}"
+            # This is a bit fragile to parse from the string reasoning, but we can check if it contains 'sms' or 'whatsapp' or 'email'
+            reasoning = latest_exec_per_case[c.id].reasoning or ""
+            if "'channel': 'whatsapp'" in reasoning:
+                channel = "whatsapp"
+            elif "'channel': 'sms'" in reasoning:
+                channel = "sms"
+            elif "'channel': 'email'" in reasoning:
+                channel = "email"
+            elif c.payment_rail:
+                channel = c.payment_rail
+        elif c.payment_rail:
+            channel = c.payment_rail
+
+        if channel not in by_channel:
+            by_channel[channel] = {"total": 0, "recovered": 0, "at_risk_paise": 0, "recovered_paise": 0}
+        
+        by_channel[channel]["total"] += 1
+        by_channel[channel]["at_risk_paise"] += c.amount_paise
+        if c.status == CaseStatus.RECOVERED:
+            by_channel[channel]["recovered"] += 1
+            by_channel[channel]["recovered_paise"] += c.amount_paise
+
     # Exception list — cases that couldn't be recovered
     exceptions = [
         {"case_id": c.id, "status": c.status.value,
          "case_type": c.case_type.value, "amount_paise": c.amount_paise}
-        for c in cases if c.status in [CaseStatus.FAILED, CaseStatus.ESCALATED]
+        for c in cases if c.status in [CaseStatus.FAILED, CaseStatus.ESCALATED, CaseStatus.CLOSED]
     ]
 
     return {
@@ -518,6 +625,7 @@ def get_analytics(db: Session = Depends(get_db)):
         "net_recovery_rate_percent": round(net_recovered_paise / total_at_risk * 100, 2) if total_at_risk > 0 else 0.0,
         "breakdown_by_case_type": by_type,
         "breakdown_by_status": by_status,
+        "breakdown_by_channel": by_channel,
         "exceptions": exceptions,
     }
 
@@ -538,29 +646,121 @@ def get_policy():
 
 @app.post("/api/v1/cases/{case_id}/approve")
 def approve_escalated_case(case_id: str, db: Session = Depends(get_db)):
-    """Human approval: re-queue an escalated case for processing."""
-    existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
-    if not existing:
-        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-    if existing.status != CaseStatus.ESCALATED:
-        raise HTTPException(status_code=400, detail=f"Case is not in ESCALATED status (current: {existing.status.value})")
+    """Human approval: execute pending action synchronously."""
+    # Atomic claim
+    stmt = (
+        update(models.RecoveryCase)
+        .where(models.RecoveryCase.id == case_id)
+        .where(models.RecoveryCase.status == CaseStatus.ESCALATED)
+        .values(status=CaseStatus.IN_PROGRESS)
+        .returning(models.RecoveryCase)
+    )
+    result = db.execute(stmt)
+    case_orm = result.scalar()
+    
+    if not case_orm:
+        raise HTTPException(status_code=400, detail=f"Case {case_id} not found or not in ESCALATED status")
+    
+    # Require pending decision (Path A)
+    if not case_orm.pending_decision_json:
+        # Revert atomic claim
+        db.execute(update(models.RecoveryCase).where(models.RecoveryCase.id == case_id).values(status=CaseStatus.ESCALATED))
+        db.commit()
+        raise HTTPException(status_code=400, detail="Cannot approve case without a pending decision (use /close instead)")
 
-    existing.status = CaseStatus.OPEN
+    # Execute synchronously
+    from app.domain import DecisionResult, PolicyApprovedDecision, RecoveryCaseContext, ExecutionStatus
+    from app.execution.executor import RazorpayExecutor
+    
+    try:
+        decision = DecisionResult.model_validate(case_orm.pending_decision_json)
+        approved_decision = PolicyApprovedDecision(
+            decision=decision,
+            policy_reason="Manually approved by human reviewer, bypassing policy constraints.",
+            idempotency_key=f"manual_approve_{case_id}_{decision.recommended_action.value}"
+        )
+        
+        context = RecoveryCaseContext(
+            id=case_orm.id,
+            case_type=case_orm.case_type,
+            amount_paise=case_orm.amount_paise,
+            currency=case_orm.currency,
+            customer_id=case_orm.customer_id,
+            payment_rail=case_orm.payment_rail,
+            status=case_orm.status,
+            priority_score=case_orm.priority_score,
+            raw_signal_payload=case_orm.raw_signal_payload,
+            retry_count=case_orm.retry_count,
+            cumulative_discount_paise=case_orm.cumulative_discount_paise
+        )
+
+        executor = RazorpayExecutor()
+        exec_result = executor.execute(context, approved_decision)
+
+        new_status = CaseStatus.FAILED
+        if exec_result.status in [ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN]:
+            new_status = CaseStatus.AWAITING_PAYMENT
+            
+        case_orm.status = new_status
+        case_orm.pending_decision_json = None
+        case_orm.pending_diagnosis_json = None
+        
+        # Log execution
+        audit_log = models.AuditLog(
+            case_id=case_id,
+            action_type="ACTION_EXECUTED",
+            description=f"Executed manual approval: {decision.recommended_action.value}",
+            reasoning=f"Execution result: {exec_result.reason}. Parameters: {exec_result.action_parameters_used}"
+        )
+        db.add(audit_log)
+        db.commit()
+
+        if new_status == CaseStatus.AWAITING_PAYMENT:
+            inngest_client.send_sync(Event(name="case.monitor_payment", data={"case_id": case_id}))
+
+        return {"status": "approved", "execution_result": exec_result.model_dump(), "case_id": case_id}
+
+    except Exception as e:
+        logger.error(f"Execution failed during approve for case {case_id}: {e}")
+        # Revert status
+        db.execute(update(models.RecoveryCase).where(models.RecoveryCase.id == case_id).values(status=CaseStatus.ESCALATED))
+        audit_log = models.AuditLog(
+            case_id=case_id,
+            action_type="MANUAL_EXECUTION_FAILED",
+            description="Manual approval execution failed",
+            reasoning=f"Error: {str(e)}"
+        )
+        db.add(audit_log)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Execution failed: {e}")
+
+@app.post("/api/v1/cases/{case_id}/close")
+def close_escalated_case(case_id: str, db: Session = Depends(get_db)):
+    """Human closure of Path B escalation."""
+    # Atomic claim
+    stmt = (
+        update(models.RecoveryCase)
+        .where(models.RecoveryCase.id == case_id)
+        .where(models.RecoveryCase.status == CaseStatus.ESCALATED)
+        .values(status=CaseStatus.CLOSED)
+        .returning(models.RecoveryCase)
+    )
+    result = db.execute(stmt)
+    case_orm = result.scalar()
+    
+    if not case_orm:
+        raise HTTPException(status_code=400, detail=f"Case {case_id} not found or not in ESCALATED status")
+        
     audit_log = models.AuditLog(
         case_id=case_id,
-        action_type="HUMAN_APPROVED",
-        description="Case manually approved by human reviewer for re-processing",
-        reasoning="Human override: policy-escalated case approved. Returned to OPEN for next workflow cycle."
+        action_type="MANUAL_CLOSE",
+        description="Manual case closure by human reviewer",
+        reasoning="Reviewer determined no further action can be taken."
     )
     db.add(audit_log)
     db.commit()
 
-    try:
-        inngest_client.send_sync(Event(name="case.received", data={"case_id": case_id}))
-    except Exception as e:
-        logger.warning(f"Inngest dispatch failed for approved case {case_id}: {e}")
-
-    return {"status": "approved", "case_id": case_id}
+    return {"status": "closed", "case_id": case_id}
 
 
 # ── Promise-to-Pay Capture (Feature 14) ─────────────────────────────────

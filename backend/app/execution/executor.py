@@ -144,10 +144,14 @@ class RazorpayExecutor(ActionExecutor):
             }
 
             # Set Razorpay notify field for actual channel dispatch
+            channel = approved_decision.decision.action_parameters.get("channel", "email")
             if action == RecoveryActionType.SEND_REMINDER:
-                channel = approved_decision.decision.action_parameters.get("channel", "email")
                 if channel == "sms":
                     link_data["notify"] = {"sms": 1, "email": 0}
+                elif channel == "whatsapp":
+                    # Razorpay Payment Links API does not support native WhatsApp notify.
+                    # We simulate it here, skipping the 'notify' dictionary.
+                    pass
                 else:  # email (default)
                     link_data["notify"] = {"email": 1, "sms": 0}
             elif action == RecoveryActionType.OFFER_DISCOUNT:
@@ -160,6 +164,10 @@ class RazorpayExecutor(ActionExecutor):
             # Important: make a copy of parameters to avoid mutating the original decision
             params_used = approved_decision.decision.action_parameters.copy()
             params_used["amount_charged_paise"] = amount_to_charge
+            
+            if action == RecoveryActionType.SEND_REMINDER and channel == "whatsapp":
+                params_used["simulated_whatsapp"] = True
+                params_used["simulation_reason"] = "WhatsApp is simulated — link generated, dispatch would go through WhatsApp Business API in production."
             
             return ExecutionResult(
                 status=ExecutionStatus.SUCCESS,

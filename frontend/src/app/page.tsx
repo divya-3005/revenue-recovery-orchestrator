@@ -26,6 +26,8 @@ interface RecoveryCase {
   retry_count: number;
   cumulative_discount_paise: number;
   promise_to_pay_date: string | null;
+  pending_decision_json: any | null;
+  pending_diagnosis_json: any | null;
   created_at: string;
 }
 
@@ -163,8 +165,21 @@ export default function Dashboard() {
     try {
       await fetch(`${API_BASE}/cases/${caseId}/approve`, { method: "POST" });
       await loadData();
-    } catch (err) {
-      console.error("Failed to approve case:", err);
+    } catch {
+      alert("Failed to approve case");
+    } finally {
+      setApprovingId(null);
+    }
+  };
+
+  const closeCase = async (caseId: string) => {
+    setApprovingId(caseId);
+    try {
+      const res = await fetch(`${API_BASE}/cases/${caseId}/close`, { method: "POST" });
+      if (!res.ok) throw new Error();
+      await loadData();
+    } catch {
+      alert("Failed to close case");
     } finally {
       setApprovingId(null);
     }
@@ -305,7 +320,7 @@ export default function Dashboard() {
                 <Table>
                   <TableHeader>
                     <TableRow className="hover:bg-transparent border-white/5 bg-black/20">
-                      {["Case ID", "Customer", "Type", "Amount", "Exp. Recovery", "Status", "Attempts", "Discount", "Audit"].map((h) => (
+                      {["Case ID", "Customer", "Type", "Diagnosis", "Amount", "Exp. Recovery", "Status", "Attempts", "Discount", "Actions"].map((h) => (
                         <TableHead key={h} className="text-slate-400 font-semibold tracking-wider text-xs">{h}</TableHead>
                       ))}
                     </TableRow>
@@ -326,6 +341,9 @@ export default function Dashboard() {
                         <TableCell className="font-mono text-xs text-slate-500 group-hover:text-slate-300">{c.id.split("-")[0]}</TableCell>
                         <TableCell className="font-medium text-slate-200">{c.customer_id}</TableCell>
                         <TableCell className="text-slate-400 text-sm">{CASE_TYPE_LABELS[c.case_type] ?? c.case_type}</TableCell>
+                        <TableCell className="text-slate-400 text-xs truncate max-w-[150px]" title={c.pending_diagnosis_json ? c.pending_diagnosis_json.reasoning : "Diagnosis runs on workflow execution"}>
+                          {c.pending_diagnosis_json ? c.pending_diagnosis_json.category.replace(/_/g, " ") : "—"}
+                        </TableCell>
                         <TableCell className="text-right font-medium text-slate-200">{formatINR(c.amount_paise)}</TableCell>
                         <TableCell className="text-right text-indigo-400 font-medium">{formatINR(c.priority_score)}</TableCell>
                         <TableCell>
@@ -418,17 +436,37 @@ export default function Dashboard() {
                         className="text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg text-xs">
                         <Search className="w-3.5 h-3.5 mr-1.5" />View Audit
                       </Button>
-                      <Button size="sm"
-                        onClick={() => approveCase(c.id)}
-                        disabled={approvingId === c.id}
-                        className="bg-emerald-600/80 hover:bg-emerald-500 text-white border border-emerald-500/50 shadow-md shadow-emerald-600/20 rounded-lg text-xs">
-                        {approvingId === c.id ? (
-                          <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" />
-                        ) : (
-                          <CheckCircle2 className="w-3.5 h-3.5 mr-1.5" />
-                        )}
-                        {approvingId === c.id ? "Approving…" : "Approve & Re-queue"}
-                      </Button>
+                      
+                      {c.pending_decision_json ? (
+                        <div className="flex flex-col items-end gap-1">
+                          <Button size="sm"
+                            onClick={() => approveCase(c.id)}
+                            disabled={approvingId === c.id}
+                            className="bg-emerald-600/80 hover:bg-emerald-500 text-white border border-emerald-500/50 shadow-md shadow-emerald-600/20 rounded-lg text-xs">
+                            {approvingId === c.id ? (
+                              <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+                            ) : (
+                              <CheckCircle2 className="w-3.5 h-3.5 mr-1.5" />
+                            )}
+                            {approvingId === c.id ? "Approving…" : "Approve & Execute"}
+                          </Button>
+                          <span className="text-[10px] text-slate-500 max-w-[150px] text-right truncate">
+                            Pending: {c.pending_decision_json.recommended_action.replace(/_/g, " ")}
+                          </span>
+                        </div>
+                      ) : (
+                        <Button size="sm" variant="outline"
+                          onClick={() => closeCase(c.id)}
+                          disabled={approvingId === c.id}
+                          className="border-amber-500/30 text-amber-400 hover:bg-amber-500/10 rounded-lg text-xs">
+                          {approvingId === c.id ? (
+                            <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+                          ) : (
+                            <Search className="w-3.5 h-3.5 mr-1.5" />
+                          )}
+                          {approvingId === c.id ? "Closing…" : "Close Case"}
+                        </Button>
+                      )}
                     </div>
                   </div>
                 ))}

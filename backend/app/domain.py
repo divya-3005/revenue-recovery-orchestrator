@@ -29,11 +29,14 @@ class RecoveryCaseContext(BaseModel):
     amount_paise: int
     currency: str
     customer_id: str
-    payment_rail: str | None = None
+    payment_rail: Optional[str] = None
     priority_score: int = 0
     raw_signal_payload: Dict[str, Any]
     created_at: Optional[datetime] = None
     promise_to_pay_date: Optional[date] = None
+    pending_decision_json: Optional[Dict[str, Any]] = None
+    pending_diagnosis_json: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
 
     # Execution State
     retry_count: int
@@ -70,8 +73,8 @@ class DecisionResult(BaseModel):
         elif self.recommended_action == RecoveryActionType.SEND_REMINDER:
             if "channel" not in self.action_parameters:
                 raise ValueError("SEND_REMINDER requires 'channel' parameter")
-            if self.action_parameters["channel"] not in ["email", "sms"]:
-                raise ValueError("'channel' must be 'email' or 'sms'")
+            if self.action_parameters["channel"] not in ["email", "sms", "whatsapp"]:
+                raise ValueError("'channel' must be 'email', 'sms', or 'whatsapp'")
         return self
 class ExecutionStatus(str, enum.Enum):
     DRY_RUN = "dry_run"

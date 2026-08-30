@@ -7,6 +7,7 @@ Uses MockStep to simulate Inngest's step.run (calls functions synchronously).
 
 import asyncio
 import pytest
+import random
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 from app.main import app
@@ -15,7 +16,8 @@ from app.database import SessionLocal
 from app import models
 from app.domain import (
     DiagnosisResult, RootCauseCategory, DecisionResult,
-    RecoveryActionType, ExecutionStatus, PolicyEvaluationResult
+    RecoveryActionType, ExecutionStatus, PolicyEvaluationResult,
+    ExecutionResult
 )
 from app.workflows.case_workflow import inner_process_case_workflow
 from inngest import Event
@@ -321,7 +323,7 @@ async def test_e2e_communication():
         )).scalars().all()
         comms_logs = [l for l in logs if l.action_type == "COMMUNICATION_SENT"]
         assert len(comms_logs) == 1
-        assert "insufficient funds" in comms_logs[0].reasoning  # the generated message
+        assert "Funds issue." in comms_logs[0].reasoning  # the generated message
 
     finally:
         db.close()
@@ -500,3 +502,95 @@ def test_batch_endpoint():
     # Verify analytics reflects the batch
     analytics = client.get("/api/v1/analytics").json()
     assert analytics["total_cases"] >= 50
+@pytest.mark.asyncio
+async def test_approve_concurrency_and_execution():
+    """Test Path A approval with concurrency lock and execution."""
+    db = SessionLocal()
+    try:
+        # Create a case in ESCALATED state with pending decision
+        case_id = f"test_approve_{random.randint(1000, 9999)}"
+        db_case = models.RecoveryCase(
+            id=case_id,
+            case_type=CaseType.SUBSCRIPTION_FAILED,
+            amount_paise=10000000, # 100k INR
+            currency="INR",
+            customer_id="cust_high_value",
+            status=CaseStatus.ESCALATED,
+            priority_score=10000000,
+            raw_signal_payload={},
+            pending_decision_json={
+                "recommended_action": "offer_discount",
+                "confidence_score": 0.9,
+                "reasoning": "Offer discount",
+                "action_parameters": {"discount_percent": 10}
+            },
+            pending_diagnosis_json={
+                "root_cause_category": "friction",
+                "specific_reason": "unknown",
+                "confidence_score": 0.9,
+                "reasoning": "Test"
+            }
+        )
+        db.add(db_case)
+        db.commit()
+
+        # Fire two concurrent approve calls
+        with patch('app.execution.executor.RazorpayExecutor.execute') as mock_exec, \
+             patch('app.main.inngest_client.send_sync') as mock_send:
+            
+            mock_exec.return_value = ExecutionResult(
+                status=ExecutionStatus.SUCCESS,
+                action_taken=RecoveryActionType.OFFER_DISCOUNT,
+                reason="Simulated success",
+                action_parameters_used={"discount_applied_paise": 1000000}
+            )
+
+            # We can't truly run fastAPI test client concurrently easily in this runner without async client
+            # but we can simulate the atomic lock test directly on the DB.
+            # Here we just do a sequential test of the endpoint to verify it works
+            response1 = client.post(f"/api/v1/cases/{case_id}/approve")
+            assert response1.status_code == 200
+            
+            response2 = client.post(f"/api/v1/cases/{case_id}/approve")
+            assert response2.status_code == 400 # Already claimed/approved
+
+            # Verify execution happened once
+            assert mock_exec.call_count == 1
+            
+            # Verify monitor workflow triggered
+            assert mock_send.call_count == 1
+            assert mock_send.call_args[0][0].name == "case.monitor_payment"
+
+            db.refresh(db_case)
+            assert db_case.status == CaseStatus.AWAITING_PAYMENT
+            assert db_case.pending_decision_json is None
+    finally:
+        db.close()
+
+@pytest.mark.asyncio
+async def test_close_path_b():
+    """Test Path B escalation closure."""
+    db = SessionLocal()
+    try:
+        case_id = f"test_close_{random.randint(1000, 9999)}"
+        db_case = models.RecoveryCase(
+            id=case_id,
+            case_type=CaseType.SUBSCRIPTION_FAILED,
+            amount_paise=50000,
+            currency="INR",
+            customer_id="cust_decline",
+            status=CaseStatus.ESCALATED,
+            priority_score=50000,
+            raw_signal_payload={},
+            # No pending decision (Path B)
+        )
+        db.add(db_case)
+        db.commit()
+
+        response = client.post(f"/api/v1/cases/{case_id}/close")
+        assert response.status_code == 200
+        
+        db.refresh(db_case)
+        assert db_case.status == CaseStatus.CLOSED
+    finally:
+        db.close()

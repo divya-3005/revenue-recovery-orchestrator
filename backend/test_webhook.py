@@ -231,7 +231,8 @@ def test_payment_link_expired_creates_invoice_overdue_case(client, mock_webhook_
     from app.models import CaseType
     from app.database import SessionLocal
 
-    event_id = "evt_link_expired_001"
+    import random
+    event_id = f"evt_link_expired_{random.randint(1000, 9999)}"
     payload = {
         "event": "payment_link.expired",
         "id": event_id,

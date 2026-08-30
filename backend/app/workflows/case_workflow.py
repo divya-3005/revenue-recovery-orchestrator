@@ -210,6 +210,20 @@ async def inner_process_case_workflow(ctx, step):
         if not policy_eval.allowed or not policy_eval.approved_decision:
             # High-value cases needing human sign-off → escalate
             if policy_eval.requires_human_approval:
+                def _persist_pending(c_id=case_id, dec=decision, diag=diagnosis):
+                    db_sess = SessionLocal()
+                    try:
+                        from app.models import RecoveryCase
+                        db_sess.query(RecoveryCase).filter(RecoveryCase.id == c_id).update({
+                            "pending_decision_json": dec.model_dump(mode='json'),
+                            "pending_diagnosis_json": diag.model_dump(mode='json')
+                        })
+                        db_sess.commit()
+                    finally:
+                        db_sess.close()
+                
+                await step.run(f"persist_pending_{attempt}", _persist_pending)
+                
                 updated = await step.run(f"escalate_{attempt}",
                                          lambda: _set_status(CaseStatus.ESCALATED))
                 if not updated:
@@ -281,12 +295,107 @@ async def inner_process_case_workflow(ctx, step):
             continue  # loop back to diagnose with updated state
 
         # 10. All attempts exhausted
-        updated = await step.run("mark_failed", lambda: _set_status(CaseStatus.FAILED))
-        if not updated:
-            return {"status": "skipped", "reason": "Case already in terminal state before marking failed"}
-        return {"status": "failed",
-                "reason": "All recovery attempts exhausted",
-                "execution": exec_dict}
+        updated = await step.run("finalize_failed", lambda: _set_status(CaseStatus.FAILED))
+    if not updated:
+        return {"status": "skipped", "reason": "Case already in terminal state"}
+    return {"status": "failed", "reason": "All recovery attempts exhausted"}
+
+
+@inngest_client.create_function(
+    fn_id="monitor-awaiting-payment",
+    name="Monitor Awaiting Payment",
+    trigger=TriggerEvent(event="case.monitor_payment"),
+)
+async def monitor_awaiting_payment(ctx: Context, step: Context.step_api) -> dict:
+    """
+    Monitors a case that was placed into AWAITING_PAYMENT by a manual approval.
+    Unlike the standard loop, if payment is not received after the delay, this
+    workflow fails the case permanently without auto-retrying with new AI decisions.
+    """
+    case_id = ctx.event.data["case_id"]
+
+    def _load_case():
+        db = SessionLocal()
+        try:
+            from app.models import RecoveryCase
+            case_orm = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+            if not case_orm:
+                raise ValueError(f"Case {case_id} not found")
+            return {
+                "id": case_orm.id,
+                "customer_id": case_orm.customer_id,
+                "case_type": case_orm.case_type,
+                "status": case_orm.status,
+                "amount_paise": case_orm.amount_paise,
+                "currency": case_orm.currency,
+                "payment_rail": case_orm.payment_rail,
+                "priority_score": case_orm.priority_score,
+                "raw_signal_payload": case_orm.raw_signal_payload,
+                "retry_count": case_orm.retry_count,
+                "cumulative_discount_paise": case_orm.cumulative_discount_paise,
+                "created_at": case_orm.created_at.isoformat() if case_orm.created_at else None,
+                "promise_to_pay_date": case_orm.promise_to_pay_date.isoformat() if case_orm.promise_to_pay_date else None,
+                "session_id": case_orm.session_id,
+            }
+        finally:
+            db.close()
+
+    def _set_status(new_status: CaseStatus):
+        return update_case_status(case_id, new_status, ["awaiting_payment", "in_progress"])
+        
+    def _write_audit():
+        db = SessionLocal()
+        try:
+            from app.models import AuditLog
+            from app.db.audit_repository import _generate_audit_id
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+            
+            # Using -1 for retry_count to ensure uniqueness from main loop
+            audit_id = _generate_audit_id(case_id, "MANUAL_MONITOR_WAIT", -1)
+            stmt = pg_insert(AuditLog).values(
+                id=audit_id, case_id=case_id, action_type="MANUAL_MONITOR_WAIT",
+                description="Waiting for payment after manual approval",
+                reasoning="Sleeping for 24h to allow customer time to pay."
+            ).on_conflict_do_nothing()
+            db.execute(stmt)
+            db.commit()
+        finally:
+            db.close()
+
+    # Sleep
+    await step.run("audit_monitor_wait", _write_audit)
+    delay = "24h" # Default delay, we could pass this in event.data
+    await step.sleep("monitor_wait", delay)
+
+    # Re-check
+    case_dict = await step.run("reload_case", _load_case)
+    if case_dict["status"] in [CaseStatus.RECOVERED.value, CaseStatus.CLOSED.value, CaseStatus.FAILED.value]:
+        return {"status": case_dict["status"], "reason": "Resolved during monitoring window"}
+
+    # Fail
+    updated = await step.run("fail_monitored_case", lambda: _set_status(CaseStatus.FAILED))
+    if updated:
+        def _write_fail_audit():
+            db = SessionLocal()
+            try:
+                from app.models import AuditLog
+                from app.db.audit_repository import _generate_audit_id
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
+                
+                audit_id = _generate_audit_id(case_id, "MANUAL_MONITOR_FAILED", -1)
+                stmt = pg_insert(AuditLog).values(
+                    id=audit_id, case_id=case_id, action_type="MANUAL_MONITOR_FAILED",
+                    description="Case failed after single manual attempt",
+                    reasoning="Manually-approved action not paid within window — case failed after single attempt (does not re-enter AI decision loop)"
+                ).on_conflict_do_nothing()
+                db.execute(stmt)
+                db.commit()
+            finally:
+                db.close()
+        await step.run("audit_monitor_fail", _write_fail_audit)
+        return {"status": "failed", "reason": "Unpaid after manual approval window"}
+    
+    return {"status": "skipped", "reason": "Already in terminal state"}
 
 
 process_case_workflow = _get_inngest_function()

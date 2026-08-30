@@ -34,6 +34,12 @@ class RecoveryCase(Base):
             unique=True, 
             postgresql_where=text("razorpay_event_id IS NOT NULL")
         ),
+        Index(
+            "ix_recovery_cases_session_id", 
+            "session_id", 
+            unique=True, 
+            postgresql_where=text("session_id IS NOT NULL")
+        ),
     )
 
     id = Column(String, primary_key=True, default=generate_uuid)
@@ -47,6 +53,13 @@ class RecoveryCase(Base):
     priority_score = Column(Integer, nullable=False, default=0, index=True) # Expected Value = amount x probability
     
     raw_signal_payload = Column(JSONB, nullable=False) # Retain source data for auditability
+
+    # Pending AI State (Feature 15)
+    pending_decision_json = Column(JSONB, nullable=True)
+    pending_diagnosis_json = Column(JSONB, nullable=True)
+
+    # Idempotency for Checkouts (Feature 1)
+    session_id = Column(String(255), nullable=True)
 
     # Execution State
     retry_count = Column(Integer, nullable=False, default=0)

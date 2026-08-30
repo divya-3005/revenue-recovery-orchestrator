@@ -26,7 +26,7 @@ def decide_action(case: RecoveryCaseContext, diagnosis: DiagnosisResult, provide
     Propose the single best recovery action from the following list:
     1. retry_charge: Use if the diagnosis is a temporary 'soft_decline'. Provide parameter: {{"delay_hours": <int>}}. Do NOT use if max retries reached.
     2. offer_discount: Use for 'friction' or pricing-related drop-offs. Provide parameter: {{"discount_percent": <int>}}. Do NOT exceed {PolicyConfig.MAX_DISCOUNT_PERCENT}%.
-    3. send_reminder: Use for 'missed_payment' or if the user simply needs a nudge. Provide parameter: {{"channel": "email" | "sms"}}.
+    3. send_reminder: Use for 'missed_payment' or if the user simply needs a nudge. Provide parameter: {{"channel": "email" | "sms" | "whatsapp"}}.
     4. escalate_to_human: Use for 'dispute', 'hard_decline', high-value cases over {int(PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE / 100):,} INR, or if the diagnosis is 'unknown'/'low confidence'.
     5. stop: Use if the case is unrecoverable and should be closed (e.g., fraud confirmed).
     

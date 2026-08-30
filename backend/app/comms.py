@@ -8,26 +8,31 @@ Generates personalized customer-facing recovery messages based on:
 This is template-based for the MVP. No actual SMS/email sending.
 """
 
-from app.domain import DiagnosisResult, RecoveryCaseContext, RootCauseCategory
+from app.domain import RecoveryCaseContext, DiagnosisResult
+from app.domain import RootCauseCategory
 
-
-def generate_message(case: RecoveryCaseContext, diagnosis: DiagnosisResult, attempt_number: int) -> str:
+def generate_message(case: RecoveryCaseContext, diagnosis: DiagnosisResult, attempt: int, channel: str = "email") -> str:
     """
     Generate a customer-facing recovery message.
 
     Args:
         case: The recovery case context
         diagnosis: The AI-produced diagnosis
-        attempt_number: Which attempt this is (1-indexed). Controls tone:
+        attempt: Which attempt this is (1-indexed). Controls tone:
             1 → gentle, 2 → firm, 3+ → final
     """
     amount_inr = case.amount_paise / 100
-    reason = diagnosis.specific_reason.replace("_", " ")
+    reason = diagnosis.reasoning.replace("_", " ")
+
+    if channel in ["sms", "whatsapp"]:
+        length_instruction = "Keep it extremely short and concise, suitable for an SMS or WhatsApp message (under 160 characters)."
+    else:
+        length_instruction = "Keep it concise and professional, suitable for an email."
 
     # Pick tone based on attempt number
-    if attempt_number <= 1:
+    if attempt <= 1:
         tone = "gentle"
-    elif attempt_number == 2:
+    elif attempt == 2:
         tone = "firm"
     else:
         tone = "final"

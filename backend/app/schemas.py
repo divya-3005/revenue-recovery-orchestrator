@@ -21,6 +21,9 @@ class RecoveryCaseResponse(RecoveryCaseBase):
     retry_count: int
     cumulative_discount_paise: int
     promise_to_pay_date: Optional[date] = None
+    pending_decision_json: Optional[Dict[str, Any]] = None
+    pending_diagnosis_json: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -30,6 +33,14 @@ class RecoveryCaseResponse(RecoveryCaseBase):
 class PromiseToPayRequest(BaseModel):
     date: date
     note: Optional[str] = None
+
+class CheckoutBeaconRequest(BaseModel):
+    session_id: str
+    last_interaction_at: datetime
+    amount_paise: int
+    currency: str = "INR"
+    customer_id: str
+    cart_items: int = 1
 
 class AuditLogResponse(BaseModel):
     id: str
