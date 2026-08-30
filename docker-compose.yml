@@ -22,23 +22,12 @@ services:
       context: ./backend
     ports:
       - "8000:8000"
+    env_file:
+      - ./backend/.env
     environment:
       - DATABASE_URL=postgresql+psycopg://postgres:postgres@db:5432/revenue_recovery
       - INNGEST_API_BASE_URL=http://host.docker.internal:8288
       - INNGEST_EVENT_API_BASE_URL=http://host.docker.internal:8288
-      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID}
-      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET}
-      - RAZORPAY_WEBHOOK_SECRET=${RAZORPAY_WEBHOOK_SECRET}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - AI_PRIMARY_PROVIDER=${AI_PRIMARY_PROVIDER}
-      - AI_FALLBACK_PROVIDER=${AI_FALLBACK_PROVIDER}
-      - GEMINI_MODEL_ID=${GEMINI_MODEL_ID}
-      - GROQ_MODEL_ID=${GROQ_MODEL_ID}
-      - ANTHROPIC_MODEL_ID=${ANTHROPIC_MODEL_ID}
-      - INNGEST_EVENT_KEY=${INNGEST_EVENT_KEY}
-      - INNGEST_SIGNING_KEY=${INNGEST_SIGNING_KEY}
     depends_on:
       db:
         condition: service_healthy

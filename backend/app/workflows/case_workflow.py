@@ -134,12 +134,16 @@ async def inner_process_case_workflow(ctx, step):
         if not policy_eval.allowed or not policy_eval.approved_decision:
             # High-value cases needing human sign-off → escalate
             if policy_eval.requires_human_approval:
-                await step.run(f"escalate_{attempt}",
-                               lambda: _set_status(CaseStatus.ESCALATED))
+                updated = await step.run(f"escalate_{attempt}",
+                                         lambda: _set_status(CaseStatus.ESCALATED))
+                if not updated:
+                    return {"status": "skipped", "reason": "Case already in terminal state before escalating"}
                 return {"status": "escalated", "reason": policy_eval.reason}
             # Everything else (hard decline, max retries, etc.) → fail
-            await step.run(f"reject_{attempt}",
-                           lambda: _set_status(CaseStatus.FAILED))
+            updated = await step.run(f"reject_{attempt}",
+                                     lambda: _set_status(CaseStatus.FAILED))
+            if not updated:
+                return {"status": "skipped", "reason": "Case already in terminal state before rejecting"}
             return {"status": "policy_rejected", "reason": policy_eval.reason}
 
         # 6. Generate customer communication
@@ -164,10 +168,14 @@ async def inner_process_case_workflow(ctx, step):
 
         if exec_result.status in [ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN]:
             if action == RecoveryActionType.ESCALATE_TO_HUMAN:
-                await step.run(f"finalize_{attempt}", lambda: _set_status(CaseStatus.ESCALATED))
+                updated = await step.run(f"finalize_{attempt}", lambda: _set_status(CaseStatus.ESCALATED))
+                if not updated:
+                    return {"status": "skipped", "reason": "Case already in terminal state before escalating"}
                 return {"status": CaseStatus.ESCALATED.value, "execution": exec_dict}
             elif action == RecoveryActionType.STOP:
-                await step.run(f"finalize_{attempt}", lambda: _set_status(CaseStatus.CLOSED))
+                updated = await step.run(f"finalize_{attempt}", lambda: _set_status(CaseStatus.CLOSED))
+                if not updated:
+                    return {"status": "skipped", "reason": "Case already in terminal state before closing"}
                 return {"status": CaseStatus.CLOSED.value, "execution": exec_dict}
             else:
                 # Wait for payment confirmation via webhook
