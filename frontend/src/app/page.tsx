@@ -42,11 +42,12 @@ interface RecoveryCase {
   cumulative_comms_cost_paise: number;
   latest_diagnosis_category: string | null;
   latest_diagnosis_reasoning: string | null;
-  latest_action_recommended: string | null;
-  latest_comms_preview: string | null;
   promise_to_pay_date: string | null;
   pending_decision_json: PendingDecision | null;
   pending_diagnosis_json: PendingDiagnosis | null;
+  pending_decision_id?: string | null;
+  pending_decision_hash?: string | null;
+  approved_decision_id?: string | null;
   approved_decision_hash: string | null;
   created_at: string;
 }
@@ -188,13 +189,32 @@ export default function Dashboard() {
     }
   };
 
-  const approveCase = async (caseId: string, decisionHash: string) => {
+  const [demoLoading, setDemoLoading] = useState(false);
+
+  const seedDemo = async () => {
+    setDemoLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/demo/seed`, { method: "POST" });
+      if (!res.ok) throw new Error();
+      await loadData();
+    } catch (err) {
+      console.error("Failed to seed demo:", err);
+    } finally {
+      setDemoLoading(false);
+    }
+  };
+
+  const approveCase = async (caseId: string, decisionHash: string, decisionId?: string) => {
     setApprovingId(caseId);
     try {
       const res = await fetch(`${API_BASE}/cases/${caseId}/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision_hash: decisionHash }),
+        body: JSON.stringify({
+          decision_hash: decisionHash,
+          decision_id: decisionId || "dec_human_01",
+          reviewer_id: "reviewer_admin_01"
+        }),
       });
       if (!res.ok) throw new Error(await res.text());
       await loadData();
@@ -283,6 +303,11 @@ export default function Dashboard() {
             <Button variant="outline" onClick={loadData} disabled={loading}
               className="bg-white/5 border-white/10 text-slate-300 hover:bg-white/10 hover:text-white">
               <RefreshCw className={`w-4 h-4 mr-2 ${loading ? "animate-spin" : ""}`} />Refresh
+            </Button>
+            <Button variant="outline" onClick={seedDemo} disabled={demoLoading}
+              className="bg-purple-600/20 border-purple-500/30 text-purple-200 hover:bg-purple-600/30 hover:text-white">
+              <Play className={`w-4 h-4 mr-2 ${demoLoading ? "animate-pulse" : ""}`} />
+              {demoLoading ? "Seeding…" : "Seed 5 Demo Scenarios"}
             </Button>
             <Button onClick={runBatch} disabled={batchLoading}
               className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 border border-indigo-500/50">
@@ -484,7 +509,7 @@ export default function Dashboard() {
                       {c.pending_decision_json ? (
                         <div className="flex flex-col items-end gap-1">
                           <Button size="sm"
-                            onClick={() => approveCase(c.id, c.approved_decision_hash!)}
+                            onClick={() => approveCase(c.id, c.pending_decision_hash || c.approved_decision_hash!, c.pending_decision_id || c.approved_decision_id || "dec_human_01")}
                             disabled={approvingId === c.id}
                             className="bg-emerald-600/80 hover:bg-emerald-500 text-white border border-emerald-500/50 shadow-md shadow-emerald-600/20 rounded-lg text-xs">
                             {approvingId === c.id ? (
@@ -864,12 +889,17 @@ export default function Dashboard() {
       <Dialog open={commsModalOpen} onOpenChange={setCommsModalOpen}>
         <DialogContent className="max-w-md bg-[#0F1523] border-white/10 shadow-2xl shadow-black p-6">
           <DialogHeader className="pb-4 border-b border-white/5">
-            <DialogTitle className="flex items-center text-lg text-white font-medium">
-              <Inbox className="w-5 h-5 mr-3 text-indigo-400" />
-              Communication Preview
+            <DialogTitle className="flex items-center justify-between text-lg text-white font-medium">
+              <div className="flex items-center">
+                <Inbox className="w-5 h-5 mr-3 text-indigo-400" />
+                Customer Communication
+              </div>
+              <Badge variant="outline" className="bg-amber-500/10 text-amber-300 border-amber-500/20 text-[11px] font-normal">
+                Simulated Delivery
+              </Badge>
             </DialogTitle>
           </DialogHeader>
-          <div className="pt-4 text-slate-300 whitespace-pre-wrap text-sm leading-relaxed">
+          <div className="pt-4 text-slate-300 whitespace-pre-wrap text-sm leading-relaxed font-sans">
             {commsMsg}
           </div>
         </DialogContent>

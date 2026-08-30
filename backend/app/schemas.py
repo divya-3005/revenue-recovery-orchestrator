@@ -34,6 +34,8 @@ class RecoveryCaseResponse(RecoveryCaseBase):
     opted_out: bool = False
     pending_decision_json: Optional[Dict[str, Any]] = None
     pending_diagnosis_json: Optional[Dict[str, Any]] = None
+    pending_decision_id: Optional[str] = None
+    pending_decision_hash: Optional[str] = None
     approval_status: Optional[str] = None
     approved_decision_id: Optional[str] = None
     approved_decision_hash: Optional[str] = None

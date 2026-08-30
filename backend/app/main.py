@@ -1133,3 +1133,138 @@ def record_customer_opt_out(case_id: str, body: schemas.OptOutRequest = schemas.
 
     return {"status": "opted_out", "case_id": case_id, "case_status": case.status.value}
 
+
+# ── Simulation & Demo Endpoints ────────────────────────────────────────
+
+@app.post("/api/v1/cases/{case_id}/simulate-payment")
+def simulate_case_payment(case_id: str, db: Session = Depends(get_db)):
+    """Simulate customer completing payment for a case via unified payment confirmation path."""
+    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+    
+    pay_id = f"pay_sim_{case_id.replace('-', '')[:14]}"
+    return process_payment_confirmation(db, pay_id, case_id, case.amount_paise, source="manual_simulation")
+
+
+@app.post("/api/v1/demo/seed")
+def seed_demo_scenarios(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """
+    Seeds the 5 canonical demo scenarios:
+      1. Recoverable soft decline (₹4,999 insufficient funds)
+      2. Hard decline (₹2,999 card permanently blocked)
+      3. Checkout abandonment (₹2,999 cart, repeat visitor)
+      4. High-value case (₹75,000 requiring human approval)
+      5. Overdue invoice (₹15,000, 7 days overdue)
+    """
+    scenarios = [
+        {
+            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
+            "amount_paise": 499900,
+            "currency": "INR",
+            "customer_id": "cust_demo_soft_01",
+            "customer_email": "rahul.sharma@example.com",
+            "customer_phone": "+919876500001",
+            "payment_rail": "card",
+            "raw_signal_payload": {
+                "reason": "insufficient_funds",
+                "customer_name": "Rahul Sharma",
+                "email": "rahul.sharma@example.com",
+                "contact": "+919876500001"
+            }
+        },
+        {
+            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
+            "amount_paise": 299900,
+            "currency": "INR",
+            "customer_id": "cust_demo_hard_02",
+            "customer_email": "priya.verma@example.com",
+            "customer_phone": "+919876500002",
+            "payment_rail": "card",
+            "raw_signal_payload": {
+                "reason": "lost_card_reported",
+                "customer_name": "Priya Verma",
+                "email": "priya.verma@example.com",
+                "contact": "+919876500002"
+            }
+        },
+        {
+            "case_type": CaseType.CHECKOUT_ABANDONED.value,
+            "amount_paise": 299900,
+            "currency": "INR",
+            "customer_id": "cust_demo_cart_03",
+            "customer_email": "amit.patel@example.com",
+            "customer_phone": "+919876500003",
+            "payment_rail": "upi",
+            "raw_signal_payload": {
+                "cart_items": 2,
+                "is_repeat_customer": True,
+                "time_on_page_sec": 180,
+                "customer_name": "Amit Patel",
+                "email": "amit.patel@example.com",
+                "contact": "+919876500003"
+            }
+        },
+        {
+            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
+            "amount_paise": 7500000,
+            "currency": "INR",
+            "customer_id": "cust_demo_highval_04",
+            "customer_email": "enterprise.corp@example.com",
+            "customer_phone": "+919876500004",
+            "payment_rail": "enach",
+            "raw_signal_payload": {
+                "reason": "insufficient_funds",
+                "customer_name": "Enterprise Corp",
+                "email": "enterprise.corp@example.com",
+                "contact": "+919876500004"
+            }
+        },
+        {
+            "case_type": CaseType.INVOICE_OVERDUE.value,
+            "amount_paise": 1500000,
+            "currency": "INR",
+            "customer_id": "cust_demo_invoice_05",
+            "customer_email": "vikram.singh@example.com",
+            "customer_phone": "+919876500005",
+            "payment_rail": "upi",
+            "raw_signal_payload": {
+                "days_overdue": 7,
+                "invoice_number": "INV-2026-005",
+                "customer_name": "Vikram Singh",
+                "email": "vikram.singh@example.com",
+                "contact": "+919876500005"
+            }
+        }
+    ]
+    created_ids = []
+    for s in scenarios:
+        case = models.RecoveryCase(
+            case_type=s["case_type"],
+            amount_paise=s["amount_paise"],
+            currency=s["currency"],
+            customer_id=s["customer_id"],
+            customer_email=s["customer_email"],
+            customer_phone=s["customer_phone"],
+            payment_rail=s["payment_rail"],
+            priority_score=compute_priority_score(s["case_type"], s["amount_paise"], s["raw_signal_payload"]),
+            raw_signal_payload=s["raw_signal_payload"]
+        )
+        audit_log = models.AuditLog(
+            action_type="SIGNAL_RECEIVED",
+            description=f"Demo scenario case created: {s['case_type']}",
+            reasoning="Seed demo scenario"
+        )
+        case.audit_logs.append(audit_log)
+        db.add(case)
+        db.commit()
+        db.refresh(case)
+        
+        try:
+            inngest_client.send_sync(Event(name="case.received", data={"case_id": case.id}))
+        except Exception as e:
+            logger.warning(f"Inngest dispatch for demo case {case.id}: {e}")
+        created_ids.append(case.id)
+        
+    return {"status": "seeded", "count": len(created_ids), "case_ids": created_ids}
+
