@@ -569,7 +569,7 @@ async def test_approve_concurrency_and_execution():
             assert response1.status_code == 200
             
             response2 = client.post(f"/api/v1/cases/{case_id}/approve", json={"decision_hash": valid_hash})
-            assert response2.status_code == 400 # Already claimed/approved
+            assert response2.status_code == 409 # Already claimed/approved and no longer valid
 
             # Verify execute event triggered
             assert mock_send.call_count == 1

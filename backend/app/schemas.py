@@ -40,6 +40,8 @@ class PromiseToPayRequest(BaseModel):
     note: Optional[str] = None
 
 class DecisionApprovalRequest(BaseModel):
+    decision_id: Optional[str] = None
+    reviewer_id: Optional[str] = None
     decision_hash: str
 
 

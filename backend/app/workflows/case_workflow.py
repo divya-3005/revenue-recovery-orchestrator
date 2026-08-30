@@ -242,6 +242,7 @@ async def inner_process_case_workflow(ctx, step):
                             "pending_decision_json": json.loads(decision_json),
                             "pending_diagnosis_json": diag.model_dump(mode='json'),
                             "approval_status": ApprovalStatus.PENDING.value,
+                            "approved_decision_id": dec.decision_id,
                             "approved_decision_hash": decision_hash,
                             "status": CaseStatus.AWAITING_APPROVAL.value
                         })

@@ -65,6 +65,9 @@ class DecisionResult(BaseModel):
     action_parameters: Dict[str, Any] = Field(default_factory=dict)
     confidence_score: float = Field(..., ge=0.0, le=1.0)
     reasoning: str
+    requires_human_approval: bool = False
+    decision_id: str = ""
+    decision_hash: str = ""
 
     @model_validator(mode='after')
     def validate_parameters(self) -> 'DecisionResult':
@@ -86,17 +89,35 @@ class DecisionResult(BaseModel):
                 raise ValueError("SEND_REMINDER requires 'channel' parameter")
             if self.action_parameters["channel"] not in ["email", "sms", "whatsapp"]:
                 raise ValueError("'channel' must be 'email', 'sms', or 'whatsapp'")
+
+        if not self.decision_id:
+            self.decision_id = self._derive_decision_id()
+        if not self.decision_hash:
+            self.decision_hash = self.canonical_hash()
         return self
 
+    def canonical_payload(self) -> Dict[str, Any]:
+        return {
+            "recommended_action": self.recommended_action.value,
+            "action_parameters": self.action_parameters,
+            "reasoning": self.reasoning,
+            "requires_human_approval": self.requires_human_approval,
+        }
+
     def canonical_json(self) -> str:
-        """Returns a deterministic JSON representation for cryptographic signing."""
+        """Returns a deterministic compact JSON representation for approval binding."""
         import json
-        return json.dumps(self.model_dump(mode='json'), sort_keys=True)
+        return json.dumps(self.canonical_payload(), sort_keys=True, separators=(",", ":"))
 
     def canonical_hash(self) -> str:
-        """Returns the SHA-256 hash of the canonical JSON."""
+        """Returns the SHA-256 hash of the canonical decision payload."""
         import hashlib
         return hashlib.sha256(self.canonical_json().encode('utf-8')).hexdigest()
+
+    def _derive_decision_id(self) -> str:
+        import hashlib
+        payload = self.canonical_json()
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:32]
 
 class ExecutionStatus(str, enum.Enum):
     DRY_RUN = "dry_run"

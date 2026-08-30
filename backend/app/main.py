@@ -809,8 +809,10 @@ def approve_escalated_case(case_id: str, payload: schemas.DecisionApprovalReques
         .where(models.RecoveryCase.approved_decision_hash == payload.decision_hash)
         .values(
             approval_status=models.ApprovalStatus.APPROVED,
+            approved_decision_id=models.RecoveryCase.approved_decision_id,
+            approved_decision_hash=models.RecoveryCase.approved_decision_hash,
             approved_at=func.now(),
-            approved_by="human_reviewer"
+            approved_by=(payload.reviewer_id or payload.decision_id or "human_reviewer")
         )
         .returning(models.RecoveryCase.id)
     )
@@ -818,7 +820,7 @@ def approve_escalated_case(case_id: str, payload: schemas.DecisionApprovalReques
     updated_id = result.scalar()
     
     if not updated_id:
-        raise HTTPException(status_code=400, detail="Cannot approve case: not awaiting approval, already approved, or hash mismatch.")
+        raise HTTPException(status_code=409, detail="APPROVAL_NO_LONGER_VALID")
         
     db.commit()
 

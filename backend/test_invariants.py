@@ -140,6 +140,7 @@ def test_invariant_approval_hash_verification(mocked_executor):
 
     # 2. Approved, but hash mismatch
     case_ctx.approval_status = ApprovalStatus.APPROVED.value
+    case_ctx.approved_decision_id = decision.decision_id
     case_ctx.approved_decision_hash = "wrong_hash"
     res_bad_hash = mocked_executor.execute(case_ctx, approved)
     assert res_bad_hash.status.value == "failed"
@@ -148,7 +149,51 @@ def test_invariant_approval_hash_verification(mocked_executor):
     # 3. Approved and hash matches
     valid_hash = decision.canonical_hash()
     case_ctx.approved_decision_hash = valid_hash
-    case_ctx.approved_decision_id = decision.recommended_action.value
+    case_ctx.approved_decision_id = decision.decision_id
     
     res_good = mocked_executor.execute(case_ctx, approved)
     assert res_good.status.value == "success"
+
+
+def test_invariant_approved_decision_id_must_match_exact_decision(mocked_executor):
+    """Invariant: Executor must reject execution when the approved decision identity does not match the one being executed."""
+    case_ctx = RecoveryCaseContext(
+        id="case_decision_mismatch",
+        case_type=CaseType.SUBSCRIPTION_FAILED,
+        amount_paise=2000000,
+        currency="INR",
+        customer_id="cust_1",
+        status=CaseStatus.IN_PROGRESS,
+        priority_score=100,
+        raw_signal_payload={"email": "test@test.com"},
+        retry_count=0,
+        cumulative_discount_paise=0,
+        approval_status=ApprovalStatus.APPROVED.value,
+    )
+
+    decision_a = DecisionResult(
+        recommended_action=RecoveryActionType.SEND_REMINDER,
+        action_parameters={"channel": "email"},
+        confidence_score=0.9,
+        reasoning="approve A",
+    )
+    decision_b = DecisionResult(
+        recommended_action=RecoveryActionType.SEND_REMINDER,
+        action_parameters={"channel": "sms"},
+        confidence_score=0.9,
+        reasoning="approve B",
+    )
+
+    case_ctx.approved_decision_id = decision_a.decision_id
+    case_ctx.approved_decision_hash = decision_a.canonical_hash()
+
+    approved_b = PolicyApprovedDecision(
+        decision=decision_b,
+        policy_reason="approval mismatch test",
+        idempotency_key="key_b",
+        requires_human_approval=True,
+    )
+
+    result = mocked_executor.execute(case_ctx, approved_b)
+    assert result.status == ExecutionStatus.FAILED
+    assert "decision id" in result.reason.lower() or "hash" in result.reason.lower()

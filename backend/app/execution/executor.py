@@ -63,10 +63,13 @@ class RazorpayExecutor(ActionExecutor):
             raise TypeError("RazorpayExecutor requires a PolicyApprovedDecision. Unapproved decisions cannot be executed.")
 
         action = approved_decision.decision.recommended_action
-        
-        # Human Approval Gate Enforcement (P0 Fix)
-        if approved_decision.requires_human_approval:
-            from app.models import ApprovalStatus
+
+        decision_id = approved_decision.decision.decision_id
+        decision_hash = approved_decision.decision.decision_hash or approved_decision.decision.canonical_hash()
+
+        # Human Approval Gate Enforcement: exact approved decision identity must match.
+        from app.models import ApprovalStatus
+        if approved_decision.requires_human_approval or case.approval_status == ApprovalStatus.APPROVED.value:
             if case.approval_status != ApprovalStatus.APPROVED.value:
                 return ExecutionResult(
                     status=ExecutionStatus.FAILED,
@@ -74,13 +77,24 @@ class RazorpayExecutor(ActionExecutor):
                     reason=f"Execution blocked: Requires human approval which has not been granted (status: {case.approval_status}).",
                     action_parameters_used=approved_decision.decision.action_parameters
                 )
-            if case.approved_decision_id != approved_decision.decision.recommended_action.value: # Fallback if ID is action string
-                # We expect approved_decision_id to match decision id, but DecisionResult doesn't have an ID
-                # We will store the action as the ID or pass a unique ID. Let's assume approved_decision_id matches action
-                pass
 
-            decision_hash = approved_decision.decision.canonical_hash()
-            if case.approved_decision_hash and case.approved_decision_hash != decision_hash:
+            if not case.approved_decision_id or not case.approved_decision_hash:
+                return ExecutionResult(
+                    status=ExecutionStatus.FAILED,
+                    action_taken=action,
+                    reason="Execution blocked: Approved decision identity is missing.",
+                    action_parameters_used=approved_decision.decision.action_parameters
+                )
+
+            if case.approved_decision_id != decision_id:
+                return ExecutionResult(
+                    status=ExecutionStatus.FAILED,
+                    action_taken=action,
+                    reason="Execution blocked: Approved decision ID mismatch.",
+                    action_parameters_used=approved_decision.decision.action_parameters
+                )
+
+            if case.approved_decision_hash != decision_hash:
                 return ExecutionResult(
                     status=ExecutionStatus.FAILED,
                     action_taken=action,
