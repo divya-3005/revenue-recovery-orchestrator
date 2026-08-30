@@ -136,13 +136,16 @@ def record_execution_checkpoint(session: Session, case: RecoveryCaseContext, exe
 
 def update_case_status(session: Session, case_id: str, new_status, increment_retry: bool = False) -> bool:
     """Update the case status in the database. Optionally increment retry_count. Returns True if updated."""
+    if new_status in (CaseStatus.RECOVERED, CaseStatus.PARTIALLY_RECOVERED):
+        raise ValueError(f"{new_status.value} may only be reached by payment confirmation")
+
     values = {"status": new_status}
     if increment_retry:
         values["retry_count"] = RecoveryCase.retry_count + 1
         
     stmt = update(RecoveryCase).where(
         RecoveryCase.id == case_id,
-        RecoveryCase.status.notin_([CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED])
+        RecoveryCase.status.notin_([CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED, CaseStatus.ESCALATED])
     ).values(**values).returning(RecoveryCase.id)
     
     result = session.execute(stmt)

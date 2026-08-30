@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import update
+from sqlalchemy import update, func
 from typing import List
 
 import inngest.fast_api
@@ -85,37 +85,76 @@ def compute_priority_score(case_type: CaseType, amount_paise: int, payload: dict
 
 def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amount_paise: int, source: str = "webhook") -> dict:
     """Atomic, idempotent payment confirmation."""
-    # 1. Enforce Idempotency
-    existing_conf = db.query(models.PaymentConfirmation).filter(models.PaymentConfirmation.payment_id == payment_id).first()
-    if existing_conf:
-        return {"status": "idempotent", "reason": "payment_already_processed"}
+    from datetime import datetime, timezone
+    from fastapi import HTTPException
+    
+    if amount_paise <= 0:
+        raise HTTPException(status_code=400, detail="INVALID_PAYMENT_AMOUNT")
 
-    # 2. Case retrieval
+    # 1. Atomic Upsert for Idempotency
+    # For SQLite tests we use a simpler strategy but for Postgres this is the production mechanism
+    if db.bind.dialect.name == "sqlite":
+        # SQLite fallback for tests
+        existing_conf = db.query(models.PaymentConfirmation).filter(models.PaymentConfirmation.payment_id == payment_id).first()
+        if existing_conf:
+            if existing_conf.case_id != case_id:
+                raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
+            return {"status": "idempotent", "reason": "payment_already_processed"}
+    else:
+        # Postgres Production Path
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        now = datetime.now(timezone.utc)
+        stmt = pg_insert(models.PaymentConfirmation).values(
+            payment_id=payment_id,
+            case_id=case_id,
+            amount_paise=amount_paise,
+            source=source,
+            confirmed_at=now
+        ).on_conflict_do_nothing(index_elements=['payment_id']).returning(models.PaymentConfirmation.payment_id)
+        
+        result = db.execute(stmt)
+        inserted_row = result.fetchone()
+        
+        if not inserted_row:
+            existing = (
+                db.query(models.PaymentConfirmation)
+                .filter(models.PaymentConfirmation.payment_id == payment_id)
+                .one()
+            )
+            if existing.case_id != case_id:
+                raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
+            return {"status": "idempotent", "reason": "payment_already_processed"}
+
+    # 2. Case retrieval & State Validation
     case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
     if not case:
+        # If we reached here on Postgres, we inserted a payment for a missing case.
+        # This shouldn't happen due to FK constraints, but handle defensively.
+        db.rollback()
         raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
 
-    if amount_paise <= 0:
-        return {"status": "ignored", "reason": "amount_zero_or_negative"}
+    if case.status not in (CaseStatus.PAYMENT_PENDING, CaseStatus.PARTIALLY_RECOVERED):
+        db.rollback()
+        raise HTTPException(status_code=409, detail="CASE_NOT_AWAITING_PAYMENT")
 
     outstanding = case.amount_paise - case.recovered_amount_paise
     if amount_paise > outstanding:
-        # P0 rule: reject/quarantine for review
+        # Overpayment quarantine
         case.status = CaseStatus.ESCALATED
         db.commit()
         return {"status": "escalated", "reason": "overpayment"}
 
-    # 3. Create PaymentConfirmation
-    from datetime import datetime, timezone
+    # 3. SQLite explicit insert (since Postgres uses pg_insert above)
     now = datetime.now(timezone.utc)
-    conf = models.PaymentConfirmation(
-        payment_id=payment_id,
-        case_id=case_id,
-        amount_paise=amount_paise,
-        source=source,
-        confirmed_at=now
-    )
-    db.add(conf)
+    if db.bind.dialect.name == "sqlite":
+        conf = models.PaymentConfirmation(
+            payment_id=payment_id,
+            case_id=case_id,
+            amount_paise=amount_paise,
+            source=source,
+            confirmed_at=now
+        )
+        db.add(conf)
 
     # 4. Update Case
     case.recovered_amount_paise += amount_paise
@@ -127,13 +166,19 @@ def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amo
         case.status = CaseStatus.PARTIALLY_RECOVERED
 
     # 5. Write Audit Log
+    import hashlib
+    audit_id = hashlib.sha256(f"{case_id}-PAYMENT_CONFIRMED-{payment_id}".encode('utf-8')).hexdigest()
+    
     audit_log = models.AuditLog(
+        id=audit_id,
         case_id=case_id,
         action_type="PAYMENT_CONFIRMED",
         description=f"Payment {payment_id} confirmed via {source} for {amount_paise} paise",
         reasoning=f"New status: {case.status.value}"
     )
     db.add(audit_log)
+    
+    # Commit everything together
     db.commit()
 
     return {"status": case.status.value, "case_id": case_id, "recovered": case.recovered_amount_paise}
@@ -451,7 +496,7 @@ def get_case_audit_trail(case_id: str, db: Session = Depends(get_db)):
 def list_escalated_cases(db: Session = Depends(get_db)):
     """Cases needing human review — full context attached."""
     cases = db.query(models.RecoveryCase).filter(
-        models.RecoveryCase.status == CaseStatus.ESCALATED
+        models.RecoveryCase.status.in_([CaseStatus.ESCALATED, CaseStatus.AWAITING_APPROVAL])
     ).all()
     return cases
 
@@ -780,6 +825,26 @@ def approve_escalated_case(case_id: str, payload: schemas.DecisionApprovalReques
     # Trigger execution workflow
     inngest_client.send_sync(Event(name="case.execute_approved", data={"case_id": case_id}))
     return {"status": "approved", "case_id": case_id}
+
+
+@app.post("/api/v1/cases/{case_id}/close")
+def close_escalated_case(case_id: str, db: Session = Depends(get_db)):
+    """Human closure: Mark an escalated case as closed."""
+    stmt = (
+        update(models.RecoveryCase)
+        .where(models.RecoveryCase.id == case_id)
+        .where(models.RecoveryCase.status == CaseStatus.ESCALATED)
+        .values(status=CaseStatus.CLOSED)
+        .returning(models.RecoveryCase.id)
+    )
+    result = db.execute(stmt)
+    updated_id = result.scalar()
+    
+    if not updated_id:
+        raise HTTPException(status_code=400, detail="Cannot close case: not found or not in ESCALATED status.")
+        
+    db.commit()
+    return {"status": "closed", "case_id": case_id}
 
 
 @app.post("/api/v1/cases/{case_id}/reject")

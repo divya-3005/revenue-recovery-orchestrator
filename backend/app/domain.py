@@ -87,6 +87,17 @@ class DecisionResult(BaseModel):
             if self.action_parameters["channel"] not in ["email", "sms", "whatsapp"]:
                 raise ValueError("'channel' must be 'email', 'sms', or 'whatsapp'")
         return self
+
+    def canonical_json(self) -> str:
+        """Returns a deterministic JSON representation for cryptographic signing."""
+        import json
+        return json.dumps(self.model_dump(mode='json'), sort_keys=True)
+
+    def canonical_hash(self) -> str:
+        """Returns the SHA-256 hash of the canonical JSON."""
+        import hashlib
+        return hashlib.sha256(self.canonical_json().encode('utf-8')).hexdigest()
+
 class ExecutionStatus(str, enum.Enum):
     DRY_RUN = "dry_run"
     SUCCESS = "success"

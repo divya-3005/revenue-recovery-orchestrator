@@ -10,7 +10,7 @@ Flow per case:
      c. Policy check (deterministic)
      d. Generate communication message
      e. Execute action (Razorpay or internal)
-     f. If success → mark RECOVERED/ESCALATED/CLOSED, done
+     f. If success → mark PAYMENT_PENDING/ESCALATED/CLOSED
      g. If failed → increment retry, loop back
   4. If all attempts exhausted → mark FAILED
 
@@ -28,7 +28,7 @@ from app import models
 from app.models import CaseStatus
 from app.domain import (
     RecoveryCaseContext, DiagnosisResult, DecisionResult,
-    PolicyEvaluationResult, ExecutionResult, ExecutionStatus,
+    PolicyApprovedDecision, PolicyEvaluationResult, ExecutionResult, ExecutionStatus,
     RecoveryActionType,
 )
 from app.workflow import (
@@ -235,15 +235,14 @@ async def inner_process_case_workflow(ctx, step):
                         from app.db.audit_repository import _generate_audit_id
                         from sqlalchemy.dialects.postgresql import insert as pg_insert
                         import json
-                        import hashlib
-                        
-                        decision_json = dec.model_dump_json()
-                        decision_hash = hashlib.sha256(decision_json.encode('utf-8')).hexdigest()
+                        decision_json = dec.canonical_json()
+                        decision_hash = dec.canonical_hash()
                         
                         db_sess.query(RecoveryCase).filter(RecoveryCase.id == c_id).update({
                             "pending_decision_json": json.loads(decision_json),
                             "pending_diagnosis_json": diag.model_dump(mode='json'),
                             "approval_status": ApprovalStatus.PENDING.value,
+                            "approved_decision_hash": decision_hash,
                             "status": CaseStatus.AWAITING_APPROVAL.value
                         })
                         
@@ -314,8 +313,8 @@ async def inner_process_case_workflow(ctx, step):
                 woken_case_dict = await step.run(f"load_woken_case_{attempt}", _load_case)
                 woken_case = RecoveryCaseContext.model_validate(woken_case_dict)
                 
-                if woken_case.status in [CaseStatus.RECOVERED.value, CaseStatus.PARTIALLY_RECOVERED.value, CaseStatus.FAILED.value, CaseStatus.CLOSED.value]:
-                    return {"status": woken_case.status, "execution": exec_dict}
+                if woken_case.status in [CaseStatus.RECOVERED, CaseStatus.PARTIALLY_RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED]:
+                    return {"status": woken_case.status.value, "execution": exec_dict}
                 
                 # Fall through to retry block if payment wasn't confirmed
 
@@ -327,8 +326,8 @@ async def inner_process_case_workflow(ctx, step):
                 return {"status": "skipped", "reason": "Case already in terminal state before retry"}
             continue  # loop back to diagnose with updated state
 
-        # 10. All attempts exhausted
-        updated = await step.run("finalize_failed", lambda: _set_status(CaseStatus.FAILED))
+    # 10. All attempts exhausted
+    updated = await step.run("finalize_failed", lambda: _set_status(CaseStatus.FAILED))
     if not updated:
         return {"status": "skipped", "reason": "Case already in terminal state"}
     return {"status": "failed", "reason": "All recovery attempts exhausted"}
@@ -364,12 +363,6 @@ async def execute_approved_action(ctx: Context, step: Step) -> dict:
         return {"status": "error", "reason": "No pending decision found"}
 
     decision = DecisionResult.model_validate(case_domain.pending_decision_json)
-    
-    # Policy Approved Decision wrapper
-    import hashlib
-    import json
-    decision_json = decision.model_dump_json()
-    decision_hash = hashlib.sha256(decision_json.encode('utf-8')).hexdigest()
     
     approved_decision = PolicyApprovedDecision(
         decision=decision,

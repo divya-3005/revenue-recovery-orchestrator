@@ -74,10 +74,7 @@ class RazorpayExecutor(ActionExecutor):
                 # We will store the action as the ID or pass a unique ID. Let's assume approved_decision_id matches action
                 pass
 
-            import json
-            import hashlib
-            decision_json = approved_decision.decision.model_dump_json()
-            decision_hash = hashlib.sha256(decision_json.encode('utf-8')).hexdigest()
+            decision_hash = approved_decision.decision.canonical_hash()
             if case.approved_decision_hash and case.approved_decision_hash != decision_hash:
                 return ExecutionResult(
                     status=ExecutionStatus.FAILED,

@@ -78,7 +78,7 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
         rules.append({"name": "block_hard_declines", "passed": True})
 
     # Rule 5: Max retries cap
-    if proposed_action == RecoveryActionType.RETRY_CHARGE:
+    if proposed_action in (RecoveryActionType.RETRY_CHARGE, RecoveryActionType.CREATE_PAYMENT_LINK):
         if case.retry_count >= PolicyConfig.MAX_RETRIES:
             rules.append({"name": "max_retries", "passed": False, "observed": case.retry_count, "limit": PolicyConfig.MAX_RETRIES})
             return reject(f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached.")

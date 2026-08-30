@@ -202,7 +202,7 @@ def test_race_condition_guarding():
         assert updated is True
         
         # Now set it to a terminal state
-        updated = update_case_status(db, db_case.id, CaseStatus.RECOVERED)
+        updated = update_case_status(db, db_case.id, CaseStatus.ESCALATED)
         assert updated is True
         
         # Now try to update it back to IN_PROGRESS (race condition)
@@ -210,7 +210,7 @@ def test_race_condition_guarding():
         assert updated is False
         
         db.refresh(db_case)
-        assert db_case.status == CaseStatus.RECOVERED
+        assert db_case.status == CaseStatus.ESCALATED
     finally:
         db.close()
 

@@ -56,7 +56,7 @@ async def test_e2e_happy_path():
                 "currency": "INR",
                 "customer_id": "cust_e2e_happy",
                 "payment_rail": "upi",
-                "raw_signal_payload": {"merchant_id": "m_123"}
+                "raw_signal_payload": {"merchant_id": "m_123", "email": "test@example.com"}
             })
             assert response.status_code == 201
             case_id = response.json()["id"]
@@ -78,7 +78,7 @@ async def test_e2e_happy_path():
             reasoning="Customer lacks funds."
         )
         mock_decision = DecisionResult(
-            recommended_action=RecoveryActionType.RETRY_CHARGE,
+            recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
             action_parameters={"delay_hours": 24},
             confidence_score=0.9,
             reasoning="Retrying is best."
@@ -114,12 +114,12 @@ async def test_e2e_happy_path():
         assert "COMMUNICATION_SENT" in action_types
         assert "ACTION_EXECUTED" in action_types
 
-        # 4. Verify case status updated to AWAITING_PAYMENT
+        # 4. Verify case status updated to PAYMENT_PENDING
         db.expire_all()
         updated_case = db.query(models.RecoveryCase).filter(
             models.RecoveryCase.id == case_id
         ).first()
-        assert updated_case.status == CaseStatus.AWAITING_PAYMENT
+        assert updated_case.status == CaseStatus.PAYMENT_PENDING
 
     finally:
         db.close()
@@ -137,8 +137,8 @@ async def test_e2e_policy_rejection():
                 "amount_paise": 1500000,
                 "currency": "INR",
                 "customer_id": "cust_e2e_unsafe",
-                "payment_rail": "upi",
-                "raw_signal_payload": {}
+                "payment_rail": "enach",
+                "raw_signal_payload": {"email": "test@example.com"}
             })
             case_id = response.json()["id"]
 
@@ -194,7 +194,7 @@ async def test_e2e_razorpay_failure():
                 "currency": "INR",
                 "customer_id": "cust_e2e_fail",
                 "payment_rail": "upi",
-                "raw_signal_payload": {}
+                "raw_signal_payload": {"email": "test@example.com"}
             })
             case_id = response.json()["id"]
 
@@ -208,7 +208,7 @@ async def test_e2e_razorpay_failure():
             reasoning="Test."
         )
         mock_decision = DecisionResult(
-            recommended_action=RecoveryActionType.RETRY_CHARGE,
+            recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
             action_parameters={"delay_hours": 24},
             confidence_score=0.9,
             reasoning="Retry"
@@ -284,7 +284,7 @@ async def test_e2e_communication():
                 "currency": "INR",
                 "customer_id": "cust_e2e_comms",
                 "payment_rail": "card",
-                "raw_signal_payload": {"reason": "insufficient_funds"}
+                "raw_signal_payload": {"reason": "insufficient_funds", "email": "test@example.com"}
             })
             case_id = response.json()["id"]
 
@@ -298,7 +298,7 @@ async def test_e2e_communication():
             reasoning="Funds issue."
         )
         mock_decision = DecisionResult(
-            recommended_action=RecoveryActionType.RETRY_CHARGE,
+            recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
             action_parameters={"delay_hours": 24},
             confidence_score=0.9,
             reasoning="Retry"
@@ -333,10 +333,10 @@ async def test_e2e_communication():
 def test_webhook_confirms_payment():
     db = SessionLocal()
     try:
-        # Create a case in AWAITING_PAYMENT state
+        # Create a case in PAYMENT_PENDING state
         case = models.RecoveryCase(
             case_type=CaseType.SUBSCRIPTION_FAILED,
-            status=CaseStatus.AWAITING_PAYMENT,
+            status=CaseStatus.PAYMENT_PENDING,
             amount_paise=50000,
             currency="INR",
             customer_id="cust_webhook_test",
@@ -352,12 +352,15 @@ def test_webhook_confirms_payment():
         import hmac
         import hashlib
         import json
-        
+        import random
+        unique_id = f"plink_webhook_{random.randint(10000, 99999)}"
         payload = {
             "event": "payment_link.paid",
             "payload": {
                 "payment_link": {
                     "entity": {
+                        "id": unique_id,
+                        "amount_paid": 50000,
                         "notes": {
                             "case_id": case.id
                         }
@@ -433,15 +436,15 @@ async def test_e2e_escalation():
                     side_effect=[mock_diagnosis, mock_decision]):
             result = await inner_process_case_workflow(ctx, step)
 
-            assert result["status"] == "escalated"
+            assert result["status"] == "awaiting_approval"
             assert "Human approval" in result["reason"]
 
-        # Verify case status is ESCALATED
+        # Verify case status is AWAITING_APPROVAL
         db.expire_all()
         case = db.query(models.RecoveryCase).filter(
             models.RecoveryCase.id == case_id
         ).first()
-        assert case.status == CaseStatus.ESCALATED
+        assert case.status == CaseStatus.AWAITING_APPROVAL
 
         # Verify it shows in escalation endpoint
         esc_response = client.get("/api/v1/cases/escalated")
@@ -515,7 +518,8 @@ async def test_approve_concurrency_and_execution():
             amount_paise=10000000, # 100k INR
             currency="INR",
             customer_id="cust_high_value",
-            status=CaseStatus.ESCALATED,
+            status=CaseStatus.AWAITING_APPROVAL,
+            approval_status=models.ApprovalStatus.PENDING,
             priority_score=10000000,
             raw_signal_payload={},
             pending_decision_json={
@@ -545,25 +549,34 @@ async def test_approve_concurrency_and_execution():
                 action_parameters_used={"discount_applied_paise": 1000000}
             )
 
-            # We can't truly run fastAPI test client concurrently easily in this runner without async client
-            # but we can simulate the atomic lock test directly on the DB.
-            # Here we just do a sequential test of the endpoint to verify it works
-            response1 = client.post(f"/api/v1/cases/{case_id}/approve")
+            import json
+            import hashlib
+            from app.domain import DecisionResult
+            dec = DecisionResult(
+                recommended_action="offer_discount",
+                confidence_score=0.9,
+                reasoning="Offer discount",
+                action_parameters={"discount_percent": 10}
+            )
+            valid_hash = dec.canonical_hash()
+
+            # Update the mock DB case with the canonical hash
+            db_case.approved_decision_hash = valid_hash
+            db.commit()
+
+            response1 = client.post(f"/api/v1/cases/{case_id}/approve", json={"decision_hash": valid_hash})
             assert response1.status_code == 200
             
-            response2 = client.post(f"/api/v1/cases/{case_id}/approve")
+            response2 = client.post(f"/api/v1/cases/{case_id}/approve", json={"decision_hash": valid_hash})
             assert response2.status_code == 400 # Already claimed/approved
 
-            # Verify execution happened once
-            assert mock_exec.call_count == 1
-            
-            # Verify monitor workflow triggered
+            # Verify execute event triggered
             assert mock_send.call_count == 1
-            assert mock_send.call_args[0][0].name == "case.monitor_payment"
+            assert mock_send.call_args[0][0].name == "case.execute_approved"
 
             db.refresh(db_case)
-            assert db_case.status == CaseStatus.AWAITING_PAYMENT
-            assert db_case.pending_decision_json is None
+            assert db_case.approval_status == models.ApprovalStatus.APPROVED
+            # The execution task will transition to PAYMENT_PENDING
     finally:
         db.close()
 

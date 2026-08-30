@@ -26,7 +26,7 @@ def _make_case(**overrides):
         amount_paise=100000,
         currency="INR",
         customer_id="cust_123",
-        raw_signal_payload={},
+        raw_signal_payload={"email": "test@example.com"},
         retry_count=0,
         status=CaseStatus.OPEN,
         cumulative_discount_paise=0,
@@ -51,7 +51,7 @@ def _make_approved(action, params):
 
 def test_razorpay_executor_success():
     case = _make_case()
-    approved = _make_approved(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 0})
+    approved = _make_approved(RecoveryActionType.CREATE_PAYMENT_LINK, {"delay_hours": 0})
 
     executor = RazorpayExecutor()
     with patch.object(executor.client.payment_link, 'create') as mock_create:
@@ -60,7 +60,7 @@ def test_razorpay_executor_success():
         result = executor.execute(case, approved)
 
         assert result.status == ExecutionStatus.SUCCESS
-        assert result.action_taken == RecoveryActionType.RETRY_CHARGE
+        assert result.action_taken == RecoveryActionType.CREATE_PAYMENT_LINK
         assert result.external_reference_id == "plink_test_123"
 
         mock_create.assert_called_once()
@@ -98,7 +98,7 @@ def test_razorpay_executor_offer_discount():
 
 def test_razorpay_executor_api_failure():
     case = _make_case()
-    approved = _make_approved(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 0})
+    approved = _make_approved(RecoveryActionType.CREATE_PAYMENT_LINK, {"delay_hours": 0})
 
     executor = RazorpayExecutor()
     with patch.object(executor.client.payment_link, 'create', side_effect=Exception("Network timeout")):

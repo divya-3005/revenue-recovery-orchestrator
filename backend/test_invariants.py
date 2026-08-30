@@ -78,7 +78,7 @@ def test_invariant_only_verified_payment_confirmation_recovers_funds(db):
     """Invariant: Only verified payment confirmation can produce RECOVERED status."""
     case = RecoveryCase(
         id="case_789", case_type=CaseType.SUBSCRIPTION_FAILED, amount_paise=1000,
-        currency="INR", customer_id="cust_1", status=CaseStatus.IN_PROGRESS, raw_signal_payload={}
+        currency="INR", customer_id="cust_1", status=CaseStatus.PAYMENT_PENDING, raw_signal_payload={}
     )
     db.add(case)
     db.commit()
@@ -95,11 +95,11 @@ def test_invariant_payment_confirmation_idempotency_and_uniqueness(db):
     """Invariant: Payment confirmation is idempotent and cross-case unique based on payment_id."""
     case_a = RecoveryCase(
         id="case_A", case_type=CaseType.SUBSCRIPTION_FAILED, amount_paise=1000,
-        currency="INR", customer_id="cust_1", status=CaseStatus.IN_PROGRESS, raw_signal_payload={}
+        currency="INR", customer_id="cust_1", status=CaseStatus.PAYMENT_PENDING, raw_signal_payload={}
     )
     case_b = RecoveryCase(
         id="case_B", case_type=CaseType.SUBSCRIPTION_FAILED, amount_paise=1000,
-        currency="INR", customer_id="cust_1", status=CaseStatus.IN_PROGRESS, raw_signal_payload={}
+        currency="INR", customer_id="cust_1", status=CaseStatus.PAYMENT_PENDING, raw_signal_payload={}
     )
     db.add_all([case_a, case_b])
     db.commit()
@@ -108,10 +108,15 @@ def test_invariant_payment_confirmation_idempotency_and_uniqueness(db):
     res1 = process_payment_confirmation(db, "pay_123", case_a.id, 1000, "webhook")
     assert res1["status"] == "recovered"
 
+    from fastapi import HTTPException
+    
     # Attempt to apply pay_123 to case B
-    res2 = process_payment_confirmation(db, "pay_123", case_b.id, 1000, "webhook")
-    # Must be rejected due to global payment idempotency
-    assert res2["status"] == "idempotent"
+    with pytest.raises(HTTPException) as excinfo:
+        process_payment_confirmation(db, "pay_123", case_b.id, 1000, "webhook")
+    
+    # Must be rejected due to global payment idempotency cross-case conflict
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.detail == "PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE"
 
     db.refresh(case_b)
     assert case_b.status != CaseStatus.RECOVERED
@@ -141,9 +146,7 @@ def test_invariant_approval_hash_verification(mocked_executor):
     assert "hash mismatch" in res_bad_hash.reason
 
     # 3. Approved and hash matches
-    import hashlib
-    decision_json = decision.model_dump_json()
-    valid_hash = hashlib.sha256(decision_json.encode('utf-8')).hexdigest()
+    valid_hash = decision.canonical_hash()
     case_ctx.approved_decision_hash = valid_hash
     case_ctx.approved_decision_id = decision.recommended_action.value
     
