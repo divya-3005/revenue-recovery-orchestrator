@@ -828,10 +828,10 @@ export default function Dashboard() {
                                   <span className="font-semibold text-slate-300">Policy Evaluation: {parsed.allowed ? "Passed" : "Failed"}</span>
                                 </div>
                                 <ul className="space-y-1 ml-6">
-                                  {parsed.rules.map((r: { passed: boolean; rule_name: string }, i: number) => (
+                                  {parsed.rules.map((r: { passed: boolean; rule_name?: string; name?: string }, i: number) => (
                                     <li key={i} className="text-slate-400 text-xs flex items-center gap-2">
                                       {r.passed ? <CheckCircle2 className="w-3 h-3 text-emerald-500" /> : <AlertCircle className="w-3 h-3 text-rose-500" />}
-                                      <span>{r.rule_name}</span>
+                                      <span className="font-mono">{r.rule_name || r.name}</span>
                                     </li>
                                   ))}
                                 </ul>
@@ -884,6 +884,7 @@ function PolicyConfigCard() {
     max_discount_percent: number;
     require_human_approval_above_paise: number;
     block_hard_declines: boolean;
+    min_enach_delay_hours?: number;
     pre_debit_notice_hours?: number;
     max_days_pursued?: number;
   } | null>(null);
@@ -895,7 +896,7 @@ function PolicyConfigCard() {
   if (!policy) return null;
 
   const pursuitDays = policy.max_days_pursued ?? 14;
-  const noticeHours = policy.pre_debit_notice_hours ?? 24;
+  const enachNoticeHours = policy.min_enach_delay_hours ?? 72;
 
   return (
     <Card className="bg-white/[0.02] border-white/5 rounded-2xl">
@@ -912,7 +913,7 @@ function PolicyConfigCard() {
             { label: "Max Discount", value: `${policy.max_discount_percent}%` },
             { label: "Human Approval Above", value: formatINR(policy.require_human_approval_above_paise) },
             { label: "Block Hard Declines", value: policy.block_hard_declines ? "Yes" : "No" },
-            { label: "Pre-Debit Notice", value: `${noticeHours}h` },
+            { label: "RBI eNACH Notice", value: `${enachNoticeHours}h` },
             { label: "Pursuit Window", value: `${pursuitDays} Days` },
           ].map((item) => (
             <div key={item.label} className="bg-white/[0.03] rounded-xl p-4 border border-white/5">
@@ -922,7 +923,7 @@ function PolicyConfigCard() {
           ))}
         </div>
         <p className="text-xs text-slate-500 mt-4">
-          + RBI e-mandate/eNACH {noticeHours}h pre-debit notice · Max {pursuitDays}-day pursuit window · Customer opt-out stops recovery
+          + RBI eNACH/NACH {enachNoticeHours}h pre-debit notice · Max {pursuitDays}-day pursuit window · Customer opt-out stops recovery
         </p>
       </CardContent>
     </Card>

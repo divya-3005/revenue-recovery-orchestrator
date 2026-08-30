@@ -50,8 +50,10 @@ class RazorpayExecutor(ActionExecutor):
         key_id = os.getenv("RAZORPAY_KEY_ID", "dummy_key_id")
         key_secret = os.getenv("RAZORPAY_KEY_SECRET", "dummy_key_secret")
 
+        # Bug 11 Fix: Explicit runtime exception instead of bare assert (which is stripped with -O)
         if key_id != "dummy_key_id" and not key_id.startswith("test_"):
-            assert key_id.startswith("rzp_test_"), "CRITICAL: Razorpay Key ID must be in test mode (starts with 'rzp_test_')"
+            if not key_id.startswith("rzp_test_"):
+                raise RuntimeError(f"CRITICAL: Razorpay Key ID '{key_id}' must be in test mode (starts with 'rzp_test_')")
 
         try:
             # Import lazily so the app remains usable in local/test environments without the SDK installed.
@@ -153,20 +155,18 @@ class RazorpayExecutor(ActionExecutor):
         )
 
     def _create_payment_link(self, case: RecoveryCaseContext, approved_decision: PolicyApprovedDecision, amount_override: int | None = None) -> ExecutionResult:
-        """Create a Razorpay Payment Link for retry, reminder, discount, or rail-switching actions."""
         action = approved_decision.decision.recommended_action
-
         try:
-            # Deterministic reference_id for idempotency.
-            # Razorpay enforces uniqueness on reference_id — returns 400 on duplicate.
-            # Max 40 characters allowed by Razorpay API.
-            reference_id = self._make_reference_id(case, action.value)
+            # Idempotency: Use approved_decision.idempotency_key as the payment link reference_id
+            reference_id = approved_decision.idempotency_key[:40]
 
             if action == RecoveryActionType.OFFER_DISCOUNT:
-                description = f"Discounted payment for case {case.id}"
+                discount_pct = approved_decision.decision.action_parameters.get("discount_percent", 0)
+                amount_override = int(case.amount_paise * (1 - discount_pct / 100))
+                description = f"Discounted recovery payment for case {case.id} ({discount_pct}% off applied)"
             elif action == RecoveryActionType.SWITCH_RAIL:
                 target_rail = approved_decision.decision.action_parameters.get("target_rail", "upi")
-                description = f"Alternative payment via {target_rail.upper()} for case {case.id}"
+                description = f"Payment for case {case.id} via preferred rail: {target_rail.upper()}"
             else:
                 description = (
                     f"Retry payment for case {case.id}"
@@ -177,17 +177,26 @@ class RazorpayExecutor(ActionExecutor):
             amount_to_charge = amount_override if amount_override is not None else case.amount_paise
 
             def _extract_customer_info():
+                email = case.customer_email
+                contact = case.customer_phone
+                
+                # Check raw_signal_payload fallback
                 payload = case.raw_signal_payload or {}
-                # Try razorpay webhook format
                 payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
-                email = payment.get("email") or payload.get("email")
-                contact = payment.get("contact") or payload.get("contact")
+                email = email or payment.get("email") or payload.get("email") or payload.get("customer_email")
+                contact = contact or payment.get("contact") or payload.get("contact") or payload.get("customer_phone")
                 
                 contact_str = str(contact) if contact else None
                 email_str = str(email) if email else None
                 
+                # If neither is present, fallback to customer_id if it can be an email or construct default
                 if not contact_str and not email_str:
-                    raise ValueError("Customer contact information unavailable")
+                    if "@" in str(case.customer_id):
+                        email_str = str(case.customer_id)
+                    elif str(case.customer_id):
+                        email_str = f"{case.customer_id}@example.com"
+                    else:
+                        raise ValueError("Customer contact information unavailable")
                 
                 return {
                     "contact": contact_str,

@@ -222,6 +222,8 @@ def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_d
         amount_paise=case_in.amount_paise,
         currency=case_in.currency,
         customer_id=case_in.customer_id,
+        customer_email=case_in.customer_email or (case_in.raw_signal_payload or {}).get("email") or f"{case_in.customer_id}@example.com",
+        customer_phone=case_in.customer_phone or (case_in.raw_signal_payload or {}).get("contact"),
         payment_rail=case_in.payment_rail,
         priority_score=priority_score,
         raw_signal_payload=case_in.raw_signal_payload,
@@ -285,11 +287,15 @@ def receive_checkout_beacon(body: schemas.CheckoutBeaconRequest, db: Session = D
         amount_paise=body.amount_paise,
         currency=body.currency,
         customer_id=body.customer_id,
+        customer_email=body.customer_email or f"{body.customer_id}@example.com",
+        customer_phone=body.customer_phone,
         session_id=body.session_id,
         priority_score=priority_score,
         raw_signal_payload={
             "cart_items": body.cart_items,
-            "last_interaction_at": body.last_interaction_at.isoformat()
+            "last_interaction_at": body.last_interaction_at.isoformat(),
+            "customer_email": body.customer_email or f"{body.customer_id}@example.com",
+            "customer_phone": body.customer_phone
         }
     ).on_conflict_do_nothing(index_elements=['session_id'])
     
@@ -330,17 +336,23 @@ def receive_invoice_overdue_signal(body: schemas.InvoiceOverdueSignalRequest, db
         {"days_overdue": body.days_overdue, "invoice_number": body.invoice_number}
     )
 
+    customer_email = body.customer_email or f"{body.customer_id}@example.com"
+
     db_case = models.RecoveryCase(
         case_type=CaseType.INVOICE_OVERDUE,
         amount_paise=body.amount_paise,
         currency=body.currency,
         customer_id=body.customer_id,
+        customer_email=customer_email,
+        customer_phone=body.customer_phone,
         priority_score=priority_score,
         raw_signal_payload={
             "invoice_id": body.invoice_id,
             "days_overdue": body.days_overdue,
             "due_date": body.due_date,
-            "invoice_number": body.invoice_number or body.invoice_id
+            "invoice_number": body.invoice_number or body.invoice_id,
+            "customer_email": customer_email,
+            "customer_phone": body.customer_phone
         }
     )
 
@@ -566,6 +578,8 @@ def run_batch(background_tasks: BackgroundTasks, simulate: bool = False, db: Ses
             amount_paise=case_data["amount_paise"],
             currency=case_data["currency"],
             customer_id=case_data["customer_id"],
+            customer_email=case_data.get("customer_email") or f"{case_data['customer_id']}@example.com",
+            customer_phone=case_data.get("customer_phone"),
             payment_rail=case_data.get("payment_rail"),
             priority_score=case_data.get("priority_score", 0),
             raw_signal_payload=case_data["raw_signal_payload"],
@@ -670,7 +684,7 @@ def _simulate_batch_pipeline(case_ids: List[str]):
         db.close()
 
 def _generate_synthetic_cases():
-    """Generate 50 synthetic cases with realistic distribution."""
+    """Generate 50 synthetic cases with realistic distribution and customer contact details."""
     cases = []
 
     # 15 subscription failures — soft declines (retryable)
@@ -678,12 +692,19 @@ def _generate_synthetic_cases():
                     "processing_error", "temporary_hold"]
     for i in range(15):
         amount = random.choice([9900, 29900, 49900, 99900, 199900])
-        payload = {"reason": random.choice(soft_reasons)}
+        cust_id = f"cust_batch_{i:03d}"
+        payload = {
+            "reason": random.choice(soft_reasons),
+            "email": f"{cust_id}@example.com",
+            "contact": f"+9198765{i:05d}"
+        }
         cases.append({
             "case_type": CaseType.SUBSCRIPTION_FAILED.value,
             "amount_paise": amount,
             "currency": "INR",
-            "customer_id": f"cust_batch_{i:03d}",
+            "customer_id": cust_id,
+            "customer_email": f"{cust_id}@example.com",
+            "customer_phone": f"+9198765{i:05d}",
             "payment_rail": random.choice(["card", "upi", "enach"]),
             "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
             "raw_signal_payload": payload
@@ -693,12 +714,19 @@ def _generate_synthetic_cases():
     hard_reasons = ["lost_card_reported", "stolen_card", "account_closed", "fraud_suspected"]
     for i in range(8):
         amount = random.choice([9900, 29900, 49900])
-        payload = {"reason": random.choice(hard_reasons)}
+        cust_id = f"cust_batch_{15 + i:03d}"
+        payload = {
+            "reason": random.choice(hard_reasons),
+            "email": f"{cust_id}@example.com",
+            "contact": f"+9198765{15 + i:05d}"
+        }
         cases.append({
             "case_type": CaseType.SUBSCRIPTION_FAILED.value,
             "amount_paise": amount,
             "currency": "INR",
-            "customer_id": f"cust_batch_{15 + i:03d}",
+            "customer_id": cust_id,
+            "customer_email": f"{cust_id}@example.com",
+            "customer_phone": f"+9198765{15 + i:05d}",
             "payment_rail": "card",
             "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
             "raw_signal_payload": payload
@@ -708,35 +736,54 @@ def _generate_synthetic_cases():
     for i in range(12):
         amount = random.choice([19900, 49900, 99900, 249900, 499900])
         abandoned_hour = random.randint(0, 23)
+        cust_id = f"cust_batch_{23 + i:03d}"
         payload = {
             "cart_items": random.randint(1, 5),
             "time_on_page_sec": random.randint(30, 300),
             "is_repeat_customer": random.choice([True, False]),
             "abandoned_hour": abandoned_hour,
-            "time_of_day": "night" if abandoned_hour in [22, 23, 0, 1, 2, 3, 4, 5] else "day"
+            "time_of_day": "night" if abandoned_hour in [22, 23, 0, 1, 2, 3, 4, 5] else "day",
+            "email": f"{cust_id}@example.com",
+            "contact": f"+9198765{23 + i:05d}"
         }
         cases.append({
             "case_type": CaseType.CHECKOUT_ABANDONED.value,
             "amount_paise": amount,
             "currency": "INR",
-            "customer_id": f"cust_batch_{23 + i:03d}",
+            "customer_id": cust_id,
+            "customer_email": f"{cust_id}@example.com",
+            "customer_phone": f"+9198765{23 + i:05d}",
             "payment_rail": random.choice(["card", "upi"]),
             "priority_score": compute_priority_score(CaseType.CHECKOUT_ABANDONED, amount, payload),
             "raw_signal_payload": payload
         })
 
-    # 10 invoice overdue — missed payments
+    # 10 invoice overdue — missed payments & cash-flow delay / disputes
     for i in range(10):
         amount = random.choice([100000, 250000, 500000, 1000000, 2500000])
+        cust_id = f"cust_batch_{35 + i:03d}"
+        # Synthetic payment history: half are good past payers with cash-flow delay
+        has_good_history = (i % 2 == 0)
+        payment_history = {
+            "past_invoices_count": 8,
+            "on_time_ratio": 0.88 if has_good_history else 0.40,
+            "average_delay_days": 2 if has_good_history else 18,
+            "history_classification": "cash_flow_delay" if has_good_history else "simply_missed"
+        }
         payload = {
             "days_overdue": random.randint(3, 30),
-            "invoice_number": f"INV-{1000 + i}"
+            "invoice_number": f"INV-{1000 + i}",
+            "payment_history": payment_history,
+            "email": f"{cust_id}@example.com",
+            "contact": f"+9198765{35 + i:05d}"
         }
         cases.append({
             "case_type": CaseType.INVOICE_OVERDUE.value,
             "amount_paise": amount,
             "currency": "INR",
-            "customer_id": f"cust_batch_{35 + i:03d}",
+            "customer_id": cust_id,
+            "customer_email": f"{cust_id}@example.com",
+            "customer_phone": f"+9198765{35 + i:05d}",
             "payment_rail": None,
             "priority_score": compute_priority_score(CaseType.INVOICE_OVERDUE, amount, payload),
             "raw_signal_payload": payload
@@ -745,12 +792,19 @@ def _generate_synthetic_cases():
     # 5 high-value cases (trigger human approval policy)
     for i in range(5):
         amount = random.choice([5500000, 7000000, 10000000])
-        payload = {"reason": "insufficient_funds"}
+        cust_id = f"cust_batch_{45 + i:03d}"
+        payload = {
+            "reason": "insufficient_funds",
+            "email": f"{cust_id}@example.com",
+            "contact": f"+9198765{45 + i:05d}"
+        }
         cases.append({
             "case_type": CaseType.SUBSCRIPTION_FAILED.value,
             "amount_paise": amount,
             "currency": "INR",
-            "customer_id": f"cust_batch_{45 + i:03d}",
+            "customer_id": cust_id,
+            "customer_email": f"{cust_id}@example.com",
+            "customer_phone": f"+9198765{45 + i:05d}",
             "payment_rail": "enach",
             "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
             "raw_signal_payload": payload
@@ -763,24 +817,29 @@ def _generate_synthetic_cases():
 
 @app.get("/api/v1/analytics")
 def get_analytics(db: Session = Depends(get_db)):
-    """Aggregate recovery metrics across all cases."""
+    """
+    Computes recovery analytics over all processed cases.
+    """
     cases = db.query(models.RecoveryCase).all()
-    if not cases:
-        return {
-            "total_cases": 0,
-            "total_at_risk_paise": 0,
-            "total_recovered_paise": 0,
-            "recovery_rate_percent": 0.0,
-            "breakdown_by_case_type": {},
-            "breakdown_by_status": {},
-            "exceptions": []
-        }
 
-    total_at_risk = sum(c.amount_paise for c in cases)
-    recovered_amount = sum(c.recovered_amount_paise for c in cases)
-    total_discount_cost = sum(c.cumulative_discount_paise for c in cases)
-    total_comms_cost = sum(c.cumulative_comms_cost_paise for c in cases)
-    net_recovered_paise = max(0, recovered_amount - total_discount_cost - total_comms_cost)
+    total_cases = len(cases)
+    total_at_risk_paise = sum(c.amount_paise for c in cases)
+    recovered_cases = sum(1 for c in cases if c.status == CaseStatus.RECOVERED)
+    total_recovered_paise = sum(c.recovered_amount_paise for c in cases)
+    total_discounts_paise = sum(c.cumulative_discount_paise for c in cases)
+    total_comms_cost_paise = sum(c.cumulative_comms_cost_paise for c in cases)
+
+    recovery_rate_pct = (
+        round((recovered_cases / total_cases) * 100, 1)
+        if total_cases > 0 else 0.0
+    )
+    revenue_recovery_rate_pct = (
+        round((total_recovered_paise / total_at_risk_paise) * 100, 1)
+        if total_at_risk_paise > 0 else 0.0
+    )
+
+    # Net Recovery Economics (Feature 17): Recovered Revenue minus discounts and communications cost
+    net_recovered_paise = total_recovered_paise - total_discounts_paise - total_comms_cost_paise
 
     # Breakdown by case type
     by_type = {}
@@ -814,23 +873,19 @@ def get_analytics(db: Session = Depends(get_db)):
         if log.case_id not in latest_exec_per_case:
             latest_exec_per_case[log.case_id] = log
 
+    import json
     for c in cases:
-        channel = "unknown"
-        if c.id in latest_exec_per_case:
-            # The channel might be in the reasoning or we fallback to payment_rail
-            # reasoning format: "Razorpay payment link created... Parameters: {'channel': 'sms'...}"
-            # This is a bit fragile to parse from the string reasoning, but we can check if it contains 'sms' or 'whatsapp' or 'email'
-            reasoning = latest_exec_per_case[c.id].reasoning or ""
-            if "'channel': 'whatsapp'" in reasoning or "whatsapp" in reasoning.lower():
-                channel = "whatsapp"
-            elif "'channel': 'sms'" in reasoning or "sms" in reasoning.lower():
-                channel = "sms"
-            elif "'channel': 'email'" in reasoning or "email" in reasoning.lower():
-                channel = "email"
-            elif c.payment_rail:
-                channel = c.payment_rail
-        elif c.payment_rail:
-            channel = c.payment_rail
+        channel = c.latest_channel
+        if not channel and c.id in latest_exec_per_case:
+            try:
+                data = json.loads(latest_exec_per_case[c.id].reasoning or "{}")
+                if isinstance(data, dict):
+                    channel = data.get("action_parameters_used", {}).get("channel")
+            except Exception:
+                pass
+        
+        if not channel:
+            channel = c.payment_rail or "email"
 
         if channel not in by_channel:
             by_channel[channel] = {"total": 0, "recovered": 0, "at_risk_paise": 0, "recovered_paise": 0}
@@ -849,14 +904,14 @@ def get_analytics(db: Session = Depends(get_db)):
     ]
 
     return {
-        "total_cases": len(cases),
-        "total_at_risk_paise": total_at_risk,
-        "total_recovered_paise": recovered_amount,
-        "total_discount_cost_paise": total_discount_cost,
-        "total_comms_cost_paise": total_comms_cost,
+        "total_cases": total_cases,
+        "total_at_risk_paise": total_at_risk_paise,
+        "total_recovered_paise": total_recovered_paise,
+        "total_discount_cost_paise": total_discounts_paise,
+        "total_comms_cost_paise": total_comms_cost_paise,
         "net_recovered_paise": net_recovered_paise,
-        "recovery_rate_percent": round(recovered_amount / total_at_risk * 100, 2) if total_at_risk > 0 else 0.0,
-        "net_recovery_rate_percent": round(net_recovered_paise / total_at_risk * 100, 2) if total_at_risk > 0 else 0.0,
+        "recovery_rate_percent": round(recovered_cases / total_cases * 100, 2) if total_cases > 0 else 0.0,
+        "net_recovery_rate_percent": round(net_recovered_paise / total_at_risk_paise * 100, 2) if total_at_risk_paise > 0 else 0.0,
         "breakdown_by_case_type": by_type,
         "breakdown_by_status": by_status,
         "breakdown_by_channel": by_channel,

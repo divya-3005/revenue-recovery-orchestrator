@@ -29,6 +29,8 @@ class RecoveryCaseContext(BaseModel):
     amount_paise: int
     currency: str
     customer_id: str
+    customer_email: Optional[str] = None
+    customer_phone: Optional[str] = None
     payment_rail: Optional[str] = None
     priority_score: int = 0
     raw_signal_payload: Dict[str, Any]
@@ -44,6 +46,14 @@ class RecoveryCaseContext(BaseModel):
     approved_decision_id: Optional[str] = None
     approved_decision_hash: Optional[str] = None
 
+    # UI Visibility Cache & Trace
+    latest_diagnosis_category: Optional[str] = None
+    latest_diagnosis_confidence: Optional[float] = None
+    latest_diagnosis_reasoning: Optional[str] = None
+    latest_action_recommended: Optional[str] = None
+    latest_channel: Optional[str] = None
+    latest_comms_preview: Optional[str] = None
+    customer_payment_history: Optional[Dict[str, Any]] = None
 
     # Execution State
     retry_count: int
@@ -95,6 +105,9 @@ class DecisionResult(BaseModel):
         elif self.recommended_action == RecoveryActionType.SWITCH_RAIL:
             if "target_rail" not in self.action_parameters:
                 self.action_parameters["target_rail"] = "upi"
+            valid_rails = ["upi", "card", "netbanking", "enach", "emandate", "nach"]
+            if self.action_parameters["target_rail"].lower() not in valid_rails:
+                raise ValueError(f"'target_rail' must be one of {valid_rails}")
             if "channel" not in self.action_parameters:
                 self.action_parameters["channel"] = "email"
 

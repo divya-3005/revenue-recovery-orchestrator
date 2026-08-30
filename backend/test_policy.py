@@ -193,37 +193,53 @@ def test_policy_create_payment_link_hard_decline_blocked():
     assert "forbids retrying hard declines" in result.reason
 
 def test_policy_emandate_pre_debit_notice_rule():
-    # 1. emandate with delay < 24h is BLOCKED
+    # 1. emandate/eNACH with delay < 72h is BLOCKED
     case_emandate = create_mock_domain_case(amount_paise=10000)
     case_emandate.payment_rail = "emandate"
     result_blocked = evaluate_policy(
         case_emandate, 
-        create_mock_decision(RecoveryActionType.CREATE_PAYMENT_LINK, {"delay_hours": 12}), 
+        create_mock_decision(RecoveryActionType.CREATE_PAYMENT_LINK, {"delay_hours": 24}), 
         create_mock_diagnosis()
     )
     assert result_blocked.allowed is False
-    assert "RBI mandate regulations require a minimum 24h pre-debit notification" in result_blocked.reason
+    assert "RBI mandate regulations require a minimum 72h pre-debit notification" in result_blocked.reason
 
-    # 2. emandate with delay >= 24h is ALLOWED
+    # 2. emandate/eNACH with delay >= 72h is ALLOWED
     result_allowed = evaluate_policy(
         case_emandate, 
-        create_mock_decision(RecoveryActionType.CREATE_PAYMENT_LINK, {"delay_hours": 24}), 
+        create_mock_decision(RecoveryActionType.CREATE_PAYMENT_LINK, {"delay_hours": 72}), 
         create_mock_diagnosis()
     )
     assert result_allowed.allowed is True
 
-    # 3. enach and nach also enforce 24h pre-debit notice
-    case_enach = create_mock_domain_case(amount_paise=10000)
-    case_enach.payment_rail = "enach"
-    result_enach_blocked = evaluate_policy(
-        case_enach, 
-        create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 0}), 
+    # 3. Bug 3 Fix: switch_rail checks target_rail being switched TO
+    # A case that failed on card switching TO enach with delay < 72h is BLOCKED
+    case_card = create_mock_domain_case(amount_paise=10000)
+    case_card.payment_rail = "card"
+    result_switch_to_enach_blocked = evaluate_policy(
+        case_card,
+        create_mock_decision(RecoveryActionType.SWITCH_RAIL, {"target_rail": "enach", "delay_hours": 0}),
         create_mock_diagnosis()
     )
-    assert result_enach_blocked.allowed is False
-    assert "RBI mandate regulations" in result_enach_blocked.reason
+    assert result_switch_to_enach_blocked.allowed is False
+    assert "RBI mandate regulations" in result_switch_to_enach_blocked.reason
 
-    # 4. Non-mandate rail (e.g. upi, card) is NOT blocked by Rule 7 for 0h delay
+    # A case that failed on enach switching AWAY to upi with delay 0h is ALLOWED
+    case_enach = create_mock_domain_case(amount_paise=10000)
+    case_enach.payment_rail = "enach"
+    result_switch_to_upi_allowed = evaluate_policy(
+        case_enach,
+        create_mock_decision(RecoveryActionType.SWITCH_RAIL, {"target_rail": "upi", "delay_hours": 0}),
+        create_mock_diagnosis()
+    )
+    assert result_switch_to_upi_allowed.allowed is True
+
+    # 4. Bug 4 Fix: All rules must include 'rule_name' key for UI trace
+    for r in result_switch_to_upi_allowed.rules:
+        assert "rule_name" in r
+        assert "name" in r
+
+    # 5. Non-mandate rail (e.g. upi, card) is NOT blocked for 0h delay
     case_upi = create_mock_domain_case(amount_paise=10000)
     case_upi.payment_rail = "upi"
     result_upi_allowed = evaluate_policy(
@@ -234,6 +250,8 @@ def test_policy_emandate_pre_debit_notice_rule():
     assert result_upi_allowed.allowed is True
 
 def test_get_policy_endpoint():
+    from fastapi.testclient import TestClient
+    from app.main import app
     client = TestClient(app)
     response = client.get("/api/v1/policy")
     assert response.status_code == 200
@@ -242,8 +260,8 @@ def test_get_policy_endpoint():
     assert data["max_discount_percent"] == PolicyConfig.MAX_DISCOUNT_PERCENT
     assert data["require_human_approval_above_paise"] == PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE
     assert data["block_hard_declines"] == PolicyConfig.BLOCK_HARD_DECLINES
-    assert data["pre_debit_notice_hours"] == PolicyConfig.PRE_DEBIT_NOTICE_HOURS
-    assert data["max_days_pursued"] == PolicyConfig.MAX_DAYS_PURSUED
+    assert data["min_enach_delay_hours"] == 72
+    assert data["max_days_pursued"] == 14
 
 if __name__ == "__main__":
     test_policy_escalation_always_allowed()

@@ -27,7 +27,7 @@ def decide_action(case: RecoveryCaseContext, diagnosis: DiagnosisResult, provide
     1. create_payment_link: Generate a new payment link for a customer-driven payment. Use for abandoned checkouts, overdue invoices, or subscription soft declines. Provide parameter: {{"delay_hours": <int>}}. Do NOT use if max retries reached.
     2. offer_discount: Use for 'friction' or pricing-related drop-offs. Provide parameter: {{"discount_percent": <int>}}. Do NOT exceed {PolicyConfig.MAX_DISCOUNT_PERCENT}%.
     3. send_reminder: Use for 'missed_payment', soft declines, or if the user simply needs a nudge. Provide parameter: {{"channel": "email" | "sms" | "whatsapp"}}.
-    4. switch_rail: Use when a specific payment rail (e.g. card decline, mandate failure) fails and offering an alternative method (e.g. UPI payment link) has a higher likelihood of success. Provide parameters: {{"target_rail": "upi" | "card" | "netbanking", "channel": "email" | "sms"}}.
+    4. switch_rail: Use when a specific payment rail (e.g. UPI, card decline, mandate failure) fails and offering an alternative method (e.g. UPI, card, netbanking, or eNACH) has a higher likelihood of success. Provide parameters: {{"target_rail": "upi" | "card" | "netbanking" | "enach", "channel": "email" | "sms" | "whatsapp"}}.
     5. escalate_to_human: Use for 'dispute', 'hard_decline', high-value cases over {int(PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE / 100):,} INR, or if the diagnosis is 'unknown'/'low confidence'.
     6. stop: Use if the case is unrecoverable and should be closed (e.g., fraud confirmed).
     

@@ -8,6 +8,8 @@ class RecoveryCaseBase(BaseModel):
     amount_paise: int = Field(gt=0, description="Amount at risk in the smallest currency unit (e.g., paise for INR)")
     currency: str = Field(default="INR")
     customer_id: str
+    customer_email: Optional[str] = None
+    customer_phone: Optional[str] = None
     payment_rail: Optional[str] = None
     raw_signal_payload: Dict[str, Any]
 
@@ -22,8 +24,10 @@ class RecoveryCaseResponse(RecoveryCaseBase):
     cumulative_discount_paise: int
     cumulative_comms_cost_paise: int
     latest_diagnosis_category: Optional[str] = None
+    latest_diagnosis_confidence: Optional[float] = None
     latest_diagnosis_reasoning: Optional[str] = None
     latest_action_recommended: Optional[str] = None
+    latest_channel: Optional[str] = None
     latest_comms_preview: Optional[str] = None
     promise_to_pay_date: Optional[date] = None
     last_notified_at: Optional[datetime] = None
@@ -55,6 +59,8 @@ class OptOutRequest(BaseModel):
 class InvoiceOverdueSignalRequest(BaseModel):
     invoice_id: str
     customer_id: str
+    customer_email: Optional[str] = None
+    customer_phone: Optional[str] = None
     amount_paise: int = Field(gt=0, description="Invoice amount in paise")
     currency: str = "INR"
     days_overdue: int = Field(default=1, ge=1)
@@ -67,6 +73,8 @@ class CheckoutBeaconRequest(BaseModel):
     amount_paise: int
     currency: str = "INR"
     customer_id: str
+    customer_email: Optional[str] = None
+    customer_phone: Optional[str] = None
     cart_items: int = 1
 
 class AuditLogResponse(BaseModel):
@@ -78,13 +86,14 @@ class AuditLogResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
 class PolicyConfigResponse(BaseModel):
     max_retries: int
     max_discount_percent: int
     require_human_approval_above_paise: int
     block_hard_declines: bool
     min_confidence_score: float = 0.7
-    min_enach_delay_hours: int = 24
+    min_enach_delay_hours: int = 72
     pre_debit_notice_hours: int = 24
     max_days_pursued: int = 14
 

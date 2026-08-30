@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime, Date, Enum, ForeignKey, JSON, Boolean
+from sqlalchemy import Column, String, Integer, Float, DateTime, Date, Enum, ForeignKey, JSON, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
 
 # Use JSONB for Postgres, fallback to JSON for SQLite (tests)
@@ -61,6 +61,8 @@ class RecoveryCase(Base):
     amount_paise = Column(Integer, nullable=False) # Store in smallest currency unit
     currency = Column(String, nullable=False, default="INR")
     customer_id = Column(String, nullable=False, index=True)
+    customer_email = Column(String(255), nullable=True)
+    customer_phone = Column(String(50), nullable=True)
     payment_rail = Column(String, nullable=True) # e.g., 'card', 'upi', 'enach'
     priority_score = Column(Integer, nullable=False, default=0, index=True) # Expected Value = amount x probability
     
@@ -83,8 +85,10 @@ class RecoveryCase(Base):
 
     # UI Visibility Cache (Latest AI Pipeline Outputs)
     latest_diagnosis_category = Column(String(50), nullable=True)
+    latest_diagnosis_confidence = Column(Float, nullable=True)
     latest_diagnosis_reasoning = Column(String(500), nullable=True)
     latest_action_recommended = Column(String(50), nullable=True)
+    latest_channel = Column(String(50), nullable=True)
     latest_comms_preview = Column(String(500), nullable=True)
 
     # Idempotency for Checkouts (Feature 1)

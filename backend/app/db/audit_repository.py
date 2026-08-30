@@ -27,12 +27,19 @@ def _generate_audit_id(case_id: str, stage: str, logical_attempt: int) -> str:
 
 def record_diagnosis_checkpoint(session: Session, case: RecoveryCaseContext, diagnosis: DiagnosisResult) -> bool:
     audit_id = _generate_audit_id(case.id, "DIAGNOSIS_COMPLETED", case.retry_count)
+    import json
+    reasoning_payload = json.dumps({
+        "reasoning": diagnosis.reasoning,
+        "confidence_score": diagnosis.confidence_score,
+        "category": diagnosis.root_cause_category.value,
+        "specific_reason": diagnosis.specific_reason
+    })
     stmt = insert(AuditLog).values(
         id=audit_id,
         case_id=case.id,
         action_type="DIAGNOSIS_COMPLETED",
-        description=f"Diagnosis completed with category: {diagnosis.root_cause_category.value}",
-        reasoning=diagnosis.reasoning
+        description=f"Diagnosis completed with category: {diagnosis.root_cause_category.value} (confidence: {int(diagnosis.confidence_score * 100)}%)",
+        reasoning=reasoning_payload
     ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
     inserted_id = result.scalar()
@@ -41,6 +48,7 @@ def record_diagnosis_checkpoint(session: Session, case: RecoveryCaseContext, dia
         db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case.id).first()
         if db_case:
             db_case.latest_diagnosis_category = diagnosis.root_cause_category.value
+            db_case.latest_diagnosis_confidence = diagnosis.confidence_score
             db_case.latest_diagnosis_reasoning = diagnosis.reasoning
 
     session.commit()
@@ -111,24 +119,34 @@ def record_communication_checkpoint(session: Session, case: RecoveryCaseContext,
 
 def record_execution_checkpoint(session: Session, case: RecoveryCaseContext, exec_result) -> bool:
     audit_id = _generate_audit_id(case.id, "ACTION_EXECUTED", case.retry_count)
+    import json
+    reasoning_payload = json.dumps({
+        "reason": exec_result.reason,
+        "action_parameters_used": exec_result.action_parameters_used,
+        "external_reference_id": exec_result.external_reference_id
+    })
     stmt = insert(AuditLog).values(
         id=audit_id,
         case_id=case.id,
         action_type="ACTION_EXECUTED",
         description=f"Execution {exec_result.status.value}: {exec_result.action_taken.value}",
-        reasoning=exec_result.reason
+        reasoning=reasoning_payload
     ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
     inserted_id = result.scalar()
     
-    # Update cumulative discount if applicable, only if the execution log was actually inserted.
-    # This prevents double-counting if Inngest replays an already-completed step.
-    if inserted_id is not None and exec_result.status == ExecutionStatus.SUCCESS and exec_result.action_taken == RecoveryActionType.OFFER_DISCOUNT:
-        discount_applied = exec_result.action_parameters_used.get("discount_applied_paise", 0)
-        if discount_applied > 0:
-            db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case.id).first()
-            if db_case:
-                db_case.cumulative_discount_paise += discount_applied
+    if inserted_id is not None:
+        db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case.id).first()
+        if db_case:
+            channel = exec_result.action_parameters_used.get("channel")
+            if channel:
+                db_case.latest_channel = channel
+            
+            # Update cumulative discount if applicable, only if the execution log was actually inserted.
+            if exec_result.status == ExecutionStatus.SUCCESS and exec_result.action_taken == RecoveryActionType.OFFER_DISCOUNT:
+                discount_applied = exec_result.action_parameters_used.get("discount_applied_paise", 0)
+                if discount_applied > 0:
+                    db_case.cumulative_discount_paise += discount_applied
 
     session.commit()
     return inserted_id is not None

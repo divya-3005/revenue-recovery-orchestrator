@@ -44,7 +44,7 @@ def _get_inngest_function():
     @inngest_client.create_function(
         fn_id="process-recovery-case",
         trigger=TriggerEvent(event="case.received"),
-        concurrency=[Concurrency(limit=1)]
+        concurrency=[Concurrency(limit=1, key="event.data.case_id")]
     )
     async def process_case_workflow(ctx: Context, step):
         return await inner_process_case_workflow(ctx, step)

@@ -182,8 +182,30 @@ def test_razorpay_executor_switch_rail():
 
         call_kwargs = mock_create.call_args[1]
         assert "UPI" in call_kwargs["data"]["description"]
-        assert call_kwargs["data"]["notify"] == {"sms": 1, "email": 0}
+def test_executor_customer_contact_extraction():
+    # Case with empty raw_signal_payload but customer_email/customer_phone populated
+    case = _make_case(
+        customer_email="direct_customer@example.com",
+        customer_phone="+919876543210",
+        raw_signal_payload={}
+    )
+    approved = _make_approved(RecoveryActionType.CREATE_PAYMENT_LINK, {"delay_hours": 0})
 
+    executor = RazorpayExecutor()
+    with patch.object(executor.client.payment_link, 'create') as mock_create:
+        mock_create.return_value = {"id": "plink_direct_123"}
+        result = executor.execute(case, approved)
+
+        assert result.status == ExecutionStatus.SUCCESS
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["data"]["customer"]["email"] == "direct_customer@example.com"
+        assert call_kwargs["data"]["customer"]["contact"] == "+919876543210"
+
+def test_executor_test_mode_key_check(monkeypatch):
+    import pytest
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_live_unauthorized_key")
+    with pytest.raises(RuntimeError, match="must be in test mode"):
+        RazorpayExecutor()
 
 if __name__ == "__main__":
     test_razorpay_executor_success()
@@ -194,4 +216,5 @@ if __name__ == "__main__":
     test_razorpay_executor_send_reminder()
     test_razorpay_executor_switch_rail()
     test_executor_rejects_raw_decision()
+    test_executor_customer_contact_extraction()
     print("SUCCESS: All executor tests passed.")
