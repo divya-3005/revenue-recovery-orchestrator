@@ -35,7 +35,8 @@ from app.domain import (
 )
 from app.workflows.case_workflow import inner_process_case_workflow
 from inngest import Event
-from sqlalchemy import select
+from sqlalchemy import select, create_engine
+from sqlalchemy.orm import sessionmaker
 
 client = TestClient(app)
 
@@ -766,9 +767,6 @@ async def test_ptp_partially_recovered_resolves_workflow():
 
 
 def test_receive_checkout_beacon_endpoint():
-    from fastapi.testclient import TestClient
-    from app.main import app
-    client = TestClient(app)
     from datetime import datetime, timezone, timedelta
     past_time = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
     session_id = f"sess_beacon_test_{random.randint(10000, 99999)}"
