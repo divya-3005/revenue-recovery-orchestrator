@@ -144,7 +144,7 @@ export default function Dashboard() {
   const runBatch = async () => {
     setActionBusy("batch");
     try {
-      await fetch(`${API_BASE}/batch?simulate=true`, { method: "POST" });
+      await fetch(`${API_BASE}/batch`, { method: "POST" });
       await refreshData();
     } finally {
       setActionBusy(null);
