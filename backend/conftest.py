@@ -31,10 +31,16 @@ def setup_test_db(monkeypatch):
     # We only override the database configuration if it's the test DB
     if "sqlite" in TEST_DATABASE_URL:
         engine = create_engine(
-            TEST_DATABASE_URL, 
+            "sqlite://", 
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
+        from sqlalchemy import event
+        @event.listens_for(engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=OFF")
+            cursor.close()
     else:
         engine = create_engine(TEST_DATABASE_URL)
 
@@ -46,4 +52,7 @@ def setup_test_db(monkeypatch):
     monkeypatch.setattr(app.database, "engine", engine)
     
     yield
-    Base.metadata.drop_all(bind=engine)
+    try:
+        Base.metadata.drop_all(bind=engine)
+    except Exception:
+        pass

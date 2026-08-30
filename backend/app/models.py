@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime, Date, Enum, ForeignKey, JSON
+from sqlalchemy import Column, String, Integer, DateTime, Date, Enum, ForeignKey, JSON, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
 
 # Use JSONB for Postgres, fallback to JSON for SQLite (tests)
@@ -94,6 +94,8 @@ class RecoveryCase(Base):
     retry_count = Column(Integer, nullable=False, default=0)
     cumulative_discount_paise = Column(Integer, nullable=False, default=0)
     cumulative_comms_cost_paise = Column(Integer, nullable=False, default=0)
+    last_notified_at = Column(DateTime(timezone=True), nullable=True)
+    opted_out = Column(Boolean, nullable=False, default=False)
 
     # Promise-to-Pay (Feature 14)
     promise_to_pay_date = Column(Date, nullable=True)

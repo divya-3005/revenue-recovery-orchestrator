@@ -1,4 +1,6 @@
-from app.database import SessionLocal
+from app import database
+def SessionLocal():
+    return database.SessionLocal()
 from app import models
 from app.domain import (
     RecoveryCaseContext, DiagnosisResult, RootCauseCategory,

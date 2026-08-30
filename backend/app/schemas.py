@@ -26,6 +26,8 @@ class RecoveryCaseResponse(RecoveryCaseBase):
     latest_action_recommended: Optional[str] = None
     latest_comms_preview: Optional[str] = None
     promise_to_pay_date: Optional[date] = None
+    last_notified_at: Optional[datetime] = None
+    opted_out: bool = False
     pending_decision_json: Optional[Dict[str, Any]] = None
     pending_diagnosis_json: Optional[Dict[str, Any]] = None
     approval_status: Optional[str] = None
@@ -47,6 +49,17 @@ class DecisionApprovalRequest(BaseModel):
     reviewer_id: Optional[str] = None
     decision_hash: str
 
+class OptOutRequest(BaseModel):
+    reason: Optional[str] = "Customer requested communication opt-out"
+
+class InvoiceOverdueSignalRequest(BaseModel):
+    invoice_id: str
+    customer_id: str
+    amount_paise: int = Field(gt=0, description="Invoice amount in paise")
+    currency: str = "INR"
+    days_overdue: int = Field(default=1, ge=1)
+    due_date: Optional[str] = None
+    invoice_number: Optional[str] = None
 
 class CheckoutBeaconRequest(BaseModel):
     session_id: str

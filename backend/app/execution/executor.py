@@ -50,6 +50,9 @@ class RazorpayExecutor(ActionExecutor):
         key_id = os.getenv("RAZORPAY_KEY_ID", "dummy_key_id")
         key_secret = os.getenv("RAZORPAY_KEY_SECRET", "dummy_key_secret")
 
+        if key_id != "dummy_key_id" and not key_id.startswith("test_"):
+            assert key_id.startswith("rzp_test_"), "CRITICAL: Razorpay Key ID must be in test mode (starts with 'rzp_test_')"
+
         try:
             # Import lazily so the app remains usable in local/test environments without the SDK installed.
             razorpay_module = importlib.import_module("razorpay")
@@ -128,7 +131,7 @@ class RazorpayExecutor(ActionExecutor):
             )
 
         # ── Payment Link actions ─────────
-        if action in [RecoveryActionType.CREATE_PAYMENT_LINK, RecoveryActionType.SEND_REMINDER]:
+        if action in [RecoveryActionType.CREATE_PAYMENT_LINK, RecoveryActionType.SEND_REMINDER, RecoveryActionType.SWITCH_RAIL]:
             return self._create_payment_link(case, approved_decision)
             
         if action == RecoveryActionType.OFFER_DISCOUNT:
@@ -150,7 +153,7 @@ class RazorpayExecutor(ActionExecutor):
         )
 
     def _create_payment_link(self, case: RecoveryCaseContext, approved_decision: PolicyApprovedDecision, amount_override: int | None = None) -> ExecutionResult:
-        """Create a Razorpay Payment Link for retry or reminder actions."""
+        """Create a Razorpay Payment Link for retry, reminder, discount, or rail-switching actions."""
         action = approved_decision.decision.recommended_action
 
         try:
@@ -161,6 +164,9 @@ class RazorpayExecutor(ActionExecutor):
 
             if action == RecoveryActionType.OFFER_DISCOUNT:
                 description = f"Discounted payment for case {case.id}"
+            elif action == RecoveryActionType.SWITCH_RAIL:
+                target_rail = approved_decision.decision.action_parameters.get("target_rail", "upi")
+                description = f"Alternative payment via {target_rail.upper()} for case {case.id}"
             else:
                 description = (
                     f"Retry payment for case {case.id}"
@@ -212,17 +218,13 @@ class RazorpayExecutor(ActionExecutor):
 
             # Set Razorpay notify field for actual channel dispatch
             channel = approved_decision.decision.action_parameters.get("channel", "email")
-            if action == RecoveryActionType.SEND_REMINDER:
-                if channel == "sms":
-                    link_data["notify"] = {"sms": 1, "email": 0}
-                elif channel == "whatsapp":
-                    # Razorpay Payment Links API does not support native WhatsApp notify.
-                    # We simulate it here, skipping the 'notify' dictionary.
-                    pass
-                else:  # email (default)
-                    link_data["notify"] = {"email": 1, "sms": 0}
-            elif action == RecoveryActionType.OFFER_DISCOUNT:
-                # Discounts always notified via email so customer sees the offer details
+            if channel == "sms":
+                link_data["notify"] = {"sms": 1, "email": 0}
+            elif channel == "whatsapp":
+                # Razorpay Payment Links API does not support native WhatsApp notify.
+                # We simulate it here, skipping the 'notify' dictionary.
+                pass
+            else:  # email (default)
                 link_data["notify"] = {"email": 1, "sms": 0}
 
             # SDK call: payment_link.create(data) — no headers kwarg

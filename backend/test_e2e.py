@@ -12,7 +12,20 @@ from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 from app.main import app
 from app.models import CaseType, CaseStatus
-from app.database import SessionLocal
+from app import database
+from app.database import get_db
+
+def SessionLocal():
+    return database.SessionLocal()
+
+def override_get_db():
+    db = database.SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+app.dependency_overrides[get_db] = override_get_db
 from app import models
 from app.db.audit_repository import update_case_status
 from app.domain import (
@@ -47,63 +60,63 @@ class MockContext:
 
 @pytest.mark.asyncio
 async def test_e2e_happy_path():
+    # 1. Submit case via API
+    with patch('app.main.inngest_client.send_sync') as mock_send:
+        response = client.post("/api/v1/cases", json={
+            "case_type": CaseType.CHECKOUT_ABANDONED.value,
+            "amount_paise": 500000,
+            "currency": "INR",
+            "customer_id": "cust_e2e_happy",
+            "payment_rail": "upi",
+            "raw_signal_payload": {"merchant_id": "m_123", "email": "test@example.com"}
+        })
+        assert response.status_code == 201
+        case_id = response.json()["id"]
+
+        # Verify event was dispatched
+        assert mock_send.call_count == 1
+        event = mock_send.call_args[0][0]
+        assert event.name == "case.received"
+        assert event.data["case_id"] == case_id
+
+    # 2. Run the workflow (simulating Inngest worker)
+    ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
+    step = MockStep()
+
+    mock_diagnosis = DiagnosisResult(
+        root_cause_category=RootCauseCategory.SOFT_DECLINE,
+        specific_reason="insufficient_funds",
+        confidence_score=0.9,
+        reasoning="Customer lacks funds."
+    )
+    mock_decision = DecisionResult(
+        recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
+        action_parameters={"delay_hours": 24},
+        confidence_score=0.9,
+        reasoning="Retrying is best."
+    )
+
+    with patch('app.ai.provider.GeminiProvider.ask_structured', side_effect=[mock_diagnosis, mock_decision]), \
+         patch('razorpay.Client') as mock_rz_class:
+
+        mock_rz = mock_rz_class.return_value
+        mock_rz.payment_link.create.return_value = {"id": "plink_test_ok"}
+
+        try:
+            await inner_process_case_workflow(ctx, step)
+            assert False, "Should have suspended at sleep"
+        except SuspendWorkflow as e:
+            assert str(e) == "awaiting_payment"
+
+        mock_rz.payment_link.create.assert_called_once()
+
+        # Verify reference_id is ≤ 40 chars
+        call_data = mock_rz.payment_link.create.call_args[1]["data"]
+        assert len(call_data["reference_id"]) <= 40
+
+    # 3. Verify audit trail
     db = SessionLocal()
     try:
-        # 1. Submit case via API
-        with patch('app.main.inngest_client.send_sync') as mock_send:
-            response = client.post("/api/v1/cases", json={
-                "case_type": CaseType.CHECKOUT_ABANDONED.value,
-                "amount_paise": 500000,
-                "currency": "INR",
-                "customer_id": "cust_e2e_happy",
-                "payment_rail": "upi",
-                "raw_signal_payload": {"merchant_id": "m_123", "email": "test@example.com"}
-            })
-            assert response.status_code == 201
-            case_id = response.json()["id"]
-
-            # Verify event was dispatched
-            assert mock_send.call_count == 1
-            event = mock_send.call_args[0][0]
-            assert event.name == "case.received"
-            assert event.data["case_id"] == case_id
-
-        # 2. Run the workflow (simulating Inngest worker)
-        ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
-        step = MockStep()
-
-        mock_diagnosis = DiagnosisResult(
-            root_cause_category=RootCauseCategory.SOFT_DECLINE,
-            specific_reason="insufficient_funds",
-            confidence_score=0.9,
-            reasoning="Customer lacks funds."
-        )
-        mock_decision = DecisionResult(
-            recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
-            action_parameters={"delay_hours": 24},
-            confidence_score=0.9,
-            reasoning="Retrying is best."
-        )
-
-        with patch('app.ai.provider.GeminiProvider.ask_structured', side_effect=[mock_diagnosis, mock_decision]), \
-             patch('razorpay.Client') as mock_rz_class:
-
-            mock_rz = mock_rz_class.return_value
-            mock_rz.payment_link.create.return_value = {"id": "plink_test_ok"}
-
-            try:
-                await inner_process_case_workflow(ctx, step)
-                assert False, "Should have suspended at sleep"
-            except SuspendWorkflow as e:
-                assert str(e) == "awaiting_payment"
-
-            mock_rz.payment_link.create.assert_called_once()
-
-            # Verify reference_id is ≤ 40 chars
-            call_data = mock_rz.payment_link.create.call_args[1]["data"]
-            assert len(call_data["reference_id"]) <= 40
-
-        # 3. Verify audit trail
         logs = db.execute(select(models.AuditLog).where(
             models.AuditLog.case_id == case_id
         )).scalars().all()
@@ -116,12 +129,10 @@ async def test_e2e_happy_path():
         assert "ACTION_EXECUTED" in action_types
 
         # 4. Verify case status updated to PAYMENT_PENDING
-        db.expire_all()
         updated_case = db.query(models.RecoveryCase).filter(
             models.RecoveryCase.id == case_id
         ).first()
         assert updated_case.status == CaseStatus.PAYMENT_PENDING
-
     finally:
         db.close()
 
@@ -130,54 +141,52 @@ async def test_e2e_happy_path():
 
 @pytest.mark.asyncio
 async def test_e2e_policy_rejection():
+    with patch('app.main.inngest_client.send_sync'):
+        response = client.post("/api/v1/cases", json={
+            "case_type": CaseType.CHECKOUT_ABANDONED.value,
+            "amount_paise": 1500000,
+            "currency": "INR",
+            "customer_id": "cust_e2e_unsafe",
+            "payment_rail": "enach",
+            "raw_signal_payload": {"email": "test@example.com"}
+        })
+        case_id = response.json()["id"]
+
+    ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
+    step = MockStep()
+
+    mock_diagnosis = DiagnosisResult(
+        root_cause_category=RootCauseCategory.SOFT_DECLINE,
+        specific_reason="insufficient_funds",
+        confidence_score=0.9,
+        reasoning="Test."
+    )
+    mock_decision_unsafe = DecisionResult(
+        recommended_action=RecoveryActionType.OFFER_DISCOUNT,
+        action_parameters={"discount_percent": 50},  # exceeds 15% cap
+        confidence_score=0.9,
+        reasoning="Too much discount"
+    )
+
+    with patch('app.ai.provider.GeminiProvider.ask_structured',
+                side_effect=[mock_diagnosis, mock_decision_unsafe]):
+        result = await inner_process_case_workflow(ctx, step)
+
+        assert result["status"] == "policy_rejected"
+
+    # Verify no execution happened
     db = SessionLocal()
     try:
-        with patch('app.main.inngest_client.send_sync'):
-            response = client.post("/api/v1/cases", json={
-                "case_type": CaseType.CHECKOUT_ABANDONED.value,
-                "amount_paise": 1500000,
-                "currency": "INR",
-                "customer_id": "cust_e2e_unsafe",
-                "payment_rail": "enach",
-                "raw_signal_payload": {"email": "test@example.com"}
-            })
-            case_id = response.json()["id"]
-
-        ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
-        step = MockStep()
-
-        mock_diagnosis = DiagnosisResult(
-            root_cause_category=RootCauseCategory.SOFT_DECLINE,
-            specific_reason="insufficient_funds",
-            confidence_score=0.9,
-            reasoning="Test."
-        )
-        mock_decision_unsafe = DecisionResult(
-            recommended_action=RecoveryActionType.OFFER_DISCOUNT,
-            action_parameters={"discount_percent": 50},  # exceeds 15% cap
-            confidence_score=0.9,
-            reasoning="Too much discount"
-        )
-
-        with patch('app.ai.provider.GeminiProvider.ask_structured',
-                    side_effect=[mock_diagnosis, mock_decision_unsafe]):
-            result = await inner_process_case_workflow(ctx, step)
-
-            assert result["status"] == "policy_rejected"
-
-            # Verify no execution happened
-            logs = db.execute(select(models.AuditLog).where(
-                models.AuditLog.case_id == case_id
-            )).scalars().all()
-            action_types = [log.action_type for log in logs]
-            assert "POLICY_EVALUATED" in action_types
-            assert "ACTION_EXECUTED" not in action_types
+        logs = db.execute(select(models.AuditLog).where(
+            models.AuditLog.case_id == case_id
+        )).scalars().all()
+        action_types = [log.action_type for log in logs]
+        assert "POLICY_EVALUATED" in action_types
+        assert "ACTION_EXECUTED" not in action_types
 
         # Verify case status is FAILED
-        db.expire_all()
         case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
         assert case.status == CaseStatus.FAILED
-
     finally:
         db.close()
 
@@ -186,58 +195,54 @@ async def test_e2e_policy_rejection():
 
 @pytest.mark.asyncio
 async def test_e2e_razorpay_failure():
+    with patch('app.main.inngest_client.send_sync'):
+        response = client.post("/api/v1/cases", json={
+            "case_type": CaseType.CHECKOUT_ABANDONED.value,
+            "amount_paise": 600000,
+            "currency": "INR",
+            "customer_id": "cust_e2e_fail",
+            "payment_rail": "upi",
+            "raw_signal_payload": {"email": "test@example.com"}
+        })
+        case_id = response.json()["id"]
+
+    ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
+    step = MockStep()
+
+    mock_diagnosis = DiagnosisResult(
+        root_cause_category=RootCauseCategory.SOFT_DECLINE,
+        specific_reason="insufficient_funds",
+        confidence_score=0.9,
+        reasoning="Test."
+    )
+    mock_decision = DecisionResult(
+        recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
+        action_parameters={"delay_hours": 24},
+        confidence_score=0.9,
+        reasoning="Retry"
+    )
+
+    with patch('app.ai.provider.GeminiProvider.ask_structured',
+                side_effect=[mock_diagnosis, mock_decision] * 5), \
+         patch('razorpay.Client') as mock_rz_class:
+
+        mock_rz = mock_rz_class.return_value
+        mock_rz.payment_link.create.side_effect = Exception("Razorpay 500 Internal Error")
+
+        result = await inner_process_case_workflow(ctx, step)
+
+        assert result["status"] == "policy_rejected"
+        assert "Max retries" in result["reason"]
+
+    # Verify failure audit entries exist from the first 3 attempts
     db = SessionLocal()
     try:
-        with patch('app.main.inngest_client.send_sync'):
-            response = client.post("/api/v1/cases", json={
-                "case_type": CaseType.CHECKOUT_ABANDONED.value,
-                "amount_paise": 600000,
-                "currency": "INR",
-                "customer_id": "cust_e2e_fail",
-                "payment_rail": "upi",
-                "raw_signal_payload": {"email": "test@example.com"}
-            })
-            case_id = response.json()["id"]
-
-        ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
-        step = MockStep()
-
-        mock_diagnosis = DiagnosisResult(
-            root_cause_category=RootCauseCategory.SOFT_DECLINE,
-            specific_reason="insufficient_funds",
-            confidence_score=0.9,
-            reasoning="Test."
-        )
-        mock_decision = DecisionResult(
-            recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
-            action_parameters={"delay_hours": 24},
-            confidence_score=0.9,
-            reasoning="Retry"
-        )
-
-        with patch('app.ai.provider.GeminiProvider.ask_structured',
-                    side_effect=[mock_diagnosis, mock_decision] * 5), \
-             patch('razorpay.Client') as mock_rz_class:
-
-            mock_rz = mock_rz_class.return_value
-            mock_rz.payment_link.create.side_effect = Exception("Razorpay 500 Internal Error")
-
-            result = await inner_process_case_workflow(ctx, step)
-
-            # After 2 failed Razorpay calls (initial + 1 retry), retry_count hits MAX_RETRIES + 1 (2).
-            # The 3rd attempt's policy check blocks it because retry_count (2) > MAX_RETRIES (1).
-            # This is correct safety behavior: policy limits to exactly 1 retry loop.
-            assert result["status"] == "policy_rejected"
-            assert "Max retries" in result["reason"]
-
-            # Verify failure audit entries exist from the first 3 attempts
-            logs = db.execute(select(models.AuditLog).where(
-                models.AuditLog.case_id == case_id
-            )).scalars().all()
-            exec_logs = [l for l in logs if l.action_type == "ACTION_EXECUTED"]
-            assert len(exec_logs) > 0
-            assert "Razorpay API failure" in exec_logs[0].reasoning
-
+        logs = db.execute(select(models.AuditLog).where(
+            models.AuditLog.case_id == case_id
+        )).scalars().all()
+        exec_logs = [l for l in logs if l.action_type == "ACTION_EXECUTED"]
+        assert len(exec_logs) > 0
+        assert "Razorpay API failure" in exec_logs[0].reasoning
     finally:
         db.close()
 
@@ -276,56 +281,55 @@ def test_create_case_inngest_failure_still_commits():
 
 @pytest.mark.asyncio
 async def test_e2e_communication():
+    with patch('app.main.inngest_client.send_sync'):
+        response = client.post("/api/v1/cases", json={
+            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
+            "amount_paise": 49900,
+            "currency": "INR",
+            "customer_id": "cust_e2e_comms",
+            "payment_rail": "card",
+            "raw_signal_payload": {"reason": "insufficient_funds", "email": "test@example.com"}
+        })
+        case_id = response.json()["id"]
+
+    ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
+    step = MockStep()
+
+    mock_diagnosis = DiagnosisResult(
+        root_cause_category=RootCauseCategory.SOFT_DECLINE,
+        specific_reason="insufficient_funds",
+        confidence_score=0.9,
+        reasoning="Funds issue."
+    )
+    mock_decision = DecisionResult(
+        recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
+        action_parameters={"delay_hours": 24},
+        confidence_score=0.9,
+        reasoning="Retry"
+    )
+
+    with patch('app.ai.provider.GeminiProvider.ask_structured',
+                side_effect=[mock_diagnosis, mock_decision]), \
+         patch('razorpay.Client') as mock_rz_class:
+
+        mock_rz = mock_rz_class.return_value
+        mock_rz.payment_link.create.return_value = {"id": "plink_comms_test"}
+
+        try:
+            await inner_process_case_workflow(ctx, step)
+            assert False, "Should have suspended at sleep"
+        except SuspendWorkflow:
+            pass
+
+    # Verify communication was logged
     db = SessionLocal()
     try:
-        with patch('app.main.inngest_client.send_sync'):
-            response = client.post("/api/v1/cases", json={
-                "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-                "amount_paise": 49900,
-                "currency": "INR",
-                "customer_id": "cust_e2e_comms",
-                "payment_rail": "card",
-                "raw_signal_payload": {"reason": "insufficient_funds", "email": "test@example.com"}
-            })
-            case_id = response.json()["id"]
-
-        ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
-        step = MockStep()
-
-        mock_diagnosis = DiagnosisResult(
-            root_cause_category=RootCauseCategory.SOFT_DECLINE,
-            specific_reason="insufficient_funds",
-            confidence_score=0.9,
-            reasoning="Funds issue."
-        )
-        mock_decision = DecisionResult(
-            recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
-            action_parameters={"delay_hours": 24},
-            confidence_score=0.9,
-            reasoning="Retry"
-        )
-
-        with patch('app.ai.provider.GeminiProvider.ask_structured',
-                    side_effect=[mock_diagnosis, mock_decision]), \
-             patch('razorpay.Client') as mock_rz_class:
-
-            mock_rz = mock_rz_class.return_value
-            mock_rz.payment_link.create.return_value = {"id": "plink_comms_test"}
-
-            try:
-                await inner_process_case_workflow(ctx, step)
-                assert False, "Should have suspended at sleep"
-            except SuspendWorkflow:
-                pass
-
-        # Verify communication was logged
         logs = db.execute(select(models.AuditLog).where(
             models.AuditLog.case_id == case_id
         )).scalars().all()
         comms_logs = [l for l in logs if l.action_type == "COMMUNICATION_SENT"]
         assert len(comms_logs) == 1
         assert "insufficient funds" in comms_logs[0].reasoning  # the generated message
-
     finally:
         db.close()
 
@@ -403,45 +407,44 @@ def test_webhook_confirms_payment():
 
 @pytest.mark.asyncio
 async def test_e2e_escalation():
+    with patch('app.main.inngest_client.send_sync'):
+        response = client.post("/api/v1/cases", json={
+            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
+            "amount_paise": 7000000,  # 70,000 INR — above 50k threshold
+            "currency": "INR",
+            "customer_id": "cust_e2e_escalation",
+            "payment_rail": "enach",
+            "raw_signal_payload": {"reason": "insufficient_funds"}
+        })
+        case_id = response.json()["id"]
+
+    ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
+    step = MockStep()
+
+    mock_diagnosis = DiagnosisResult(
+        root_cause_category=RootCauseCategory.SOFT_DECLINE,
+        specific_reason="insufficient_funds",
+        confidence_score=0.9,
+        reasoning="Funds issue."
+    )
+    # AI proposes retry — but policy will block it for high-value cases
+    mock_decision = DecisionResult(
+        recommended_action=RecoveryActionType.RETRY_CHARGE,
+        action_parameters={"delay_hours": 24},
+        confidence_score=0.9,
+        reasoning="Retry"
+    )
+
+    with patch('app.ai.provider.GeminiProvider.ask_structured',
+                side_effect=[mock_diagnosis, mock_decision]):
+        result = await inner_process_case_workflow(ctx, step)
+
+        assert result["status"] == "awaiting_approval"
+        assert "Human approval" in result["reason"]
+
+    # Verify case status is AWAITING_APPROVAL
     db = SessionLocal()
     try:
-        with patch('app.main.inngest_client.send_sync'):
-            response = client.post("/api/v1/cases", json={
-                "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-                "amount_paise": 7000000,  # 70,000 INR — above 50k threshold
-                "currency": "INR",
-                "customer_id": "cust_e2e_escalation",
-                "payment_rail": "enach",
-                "raw_signal_payload": {"reason": "insufficient_funds"}
-            })
-            case_id = response.json()["id"]
-
-        ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
-        step = MockStep()
-
-        mock_diagnosis = DiagnosisResult(
-            root_cause_category=RootCauseCategory.SOFT_DECLINE,
-            specific_reason="insufficient_funds",
-            confidence_score=0.9,
-            reasoning="Funds issue."
-        )
-        # AI proposes retry — but policy will block it for high-value cases
-        mock_decision = DecisionResult(
-            recommended_action=RecoveryActionType.RETRY_CHARGE,
-            action_parameters={"delay_hours": 24},
-            confidence_score=0.9,
-            reasoning="Retry"
-        )
-
-        with patch('app.ai.provider.GeminiProvider.ask_structured',
-                    side_effect=[mock_diagnosis, mock_decision]):
-            result = await inner_process_case_workflow(ctx, step)
-
-            assert result["status"] == "awaiting_approval"
-            assert "Human approval" in result["reason"]
-
-        # Verify case status is AWAITING_APPROVAL
-        db.expire_all()
         case = db.query(models.RecoveryCase).filter(
             models.RecoveryCase.id == case_id
         ).first()
@@ -451,7 +454,6 @@ async def test_e2e_escalation():
         esc_response = client.get("/api/v1/cases/escalated")
         esc_ids = [c["id"] for c in esc_response.json()]
         assert case_id in esc_ids
-
     finally:
         db.close()
 
@@ -662,3 +664,62 @@ def test_close_endpoint_allows_awaiting_approval_case():
         assert updated.status == CaseStatus.CLOSED
     finally:
         db.close()
+
+
+def test_invoice_overdue_signal_creates_case():
+    payload = {
+        "invoice_id": f"inv_test_{random.randint(1000, 9999)}",
+        "customer_id": "cust_inv_test",
+        "amount_paise": 500000,
+        "currency": "INR",
+        "days_overdue": 5,
+        "due_date": "2026-08-25",
+        "invoice_number": "INV-8888"
+    }
+    response = client.post("/api/v1/signals/invoice-overdue", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "created"
+    assert "case_id" in data
+
+    db = SessionLocal()
+    try:
+        case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == data["case_id"]).first()
+        assert case is not None
+        assert case.case_type == CaseType.INVOICE_OVERDUE
+        assert case.amount_paise == 500000
+    finally:
+        db.close()
+
+
+def test_customer_opt_out_endpoint():
+    db = SessionLocal()
+    try:
+        case = models.RecoveryCase(
+            id=f"case_opt_out_{random.randint(1000, 9999)}",
+            case_type=CaseType.CHECKOUT_ABANDONED,
+            amount_paise=100000,
+            currency="INR",
+            customer_id="cust_opt_out",
+            status=CaseStatus.IN_PROGRESS,
+            raw_signal_payload={"email": "optout@example.com"},
+        )
+        db.add(case)
+        db.commit()
+        case_id = case.id
+    finally:
+        db.close()
+
+    response = client.post(f"/api/v1/cases/{case_id}/opt-out", json={"reason": "Stop contacting me"})
+    assert response.status_code == 200
+    assert response.json()["status"] == "opted_out"
+    assert response.json()["case_status"] == "closed"
+
+    db = SessionLocal()
+    try:
+        updated = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+        assert updated.opted_out is True
+        assert updated.status == CaseStatus.CLOSED
+    finally:
+        db.close()
+

@@ -9,7 +9,7 @@ via PostgreSQL ON CONFLICT DO NOTHING.
 import hashlib
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy import update
+from sqlalchemy import update, func
 from app.models import AuditLog, RecoveryCase, CaseStatus
 from app.domain import RecoveryCaseContext, DiagnosisResult, ExecutionStatus, RecoveryActionType
 
@@ -80,8 +80,9 @@ def record_policy_checkpoint(session: Session, case: RecoveryCaseContext, policy
         reasoning=json.dumps({"allowed": policy_eval.allowed, "rules": policy_eval.rules})
     ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
+    inserted_id = result.scalar()
     session.commit()
-    return result.scalar() is not None
+    return inserted_id is not None
 
 
 def record_communication_checkpoint(session: Session, case: RecoveryCaseContext, message: str) -> bool:
@@ -100,6 +101,7 @@ def record_communication_checkpoint(session: Session, case: RecoveryCaseContext,
         db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case.id).first()
         if db_case:
             db_case.latest_comms_preview = message
+            db_case.last_notified_at = func.now()
             # Assuming a standard comms cost of ₹0.25 (25 paise) per message
             db_case.cumulative_comms_cost_paise += 25
 

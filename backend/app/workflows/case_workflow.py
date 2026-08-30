@@ -23,7 +23,7 @@ from sqlalchemy import select
 import os
 
 from app.inngest_client import inngest_client
-from app.database import SessionLocal
+from app import database
 from app import models
 from app.models import CaseStatus
 from app.domain import (
@@ -60,7 +60,7 @@ async def inner_process_case_workflow(ctx, step):
     
     async def _trigger_stopping_rule(rule_name: str, reason: str):
         def _close_and_audit():
-            db_sess = SessionLocal()
+            db_sess = database.SessionLocal()
             try:
                 from app.models import RecoveryCase, AuditLog
                 from app.db.audit_repository import _generate_audit_id
@@ -82,7 +82,7 @@ async def inner_process_case_workflow(ctx, step):
         return {"status": "closed", "reason": reason}
 
     def _load_case():
-        db = SessionLocal()
+        db = database.SessionLocal()
         try:
             db_case = db.execute(
                 select(models.RecoveryCase).where(models.RecoveryCase.id == case_id)
@@ -94,7 +94,7 @@ async def inner_process_case_workflow(ctx, step):
             db.close()
 
     def _set_status(new_status, inc_retry=False):
-        db = SessionLocal()
+        db = database.SessionLocal()
         try:
             return update_case_status(db, case_id, new_status, increment_retry=inc_retry)
         finally:
@@ -133,16 +133,16 @@ async def inner_process_case_workflow(ctx, step):
         case_dict = await step.run(f"load_case_{attempt}", _load_case)
         case_domain = RecoveryCaseContext.model_validate(case_dict)
 
-        # Stopping Rule A: Max 30-day pursuit window
+        # Stopping Rule A: Max 14-day pursuit window
         if case_domain.created_at:
             from datetime import datetime, timezone
             days_pursued = (datetime.now(timezone.utc) - case_domain.created_at.replace(tzinfo=timezone.utc if case_domain.created_at.tzinfo is None else case_domain.created_at.tzinfo)).days
-            if days_pursued > 30:
-                return await _trigger_stopping_rule("MAX_DAYS", f"Max pursuit period (30 days) exceeded after {days_pursued} days.")
+            if days_pursued >= PolicyConfig.MAX_DAYS_PURSUED:
+                return await _trigger_stopping_rule("MAX_DAYS", f"Max pursuit period ({PolicyConfig.MAX_DAYS_PURSUED} days) reached after {days_pursued} days.")
 
         # Stopping Rule B: Customer opt-out
         payload = case_domain.raw_signal_payload or {}
-        if payload.get("customer_opted_out") or payload.get("opt_out"):
+        if case_domain.opted_out or payload.get("customer_opted_out") or payload.get("opt_out"):
             return await _trigger_stopping_rule("OPT_OUT", "Customer has opted out of recovery communications.")
 
         # Stopping Rule C: Promise-to-Pay — if customer has committed to a date, respect it
@@ -154,7 +154,7 @@ async def inner_process_case_workflow(ctx, step):
             if ptp_date > today:
                 # Promise is still in the future — suppress AI loop, sleep until the committed date
                 hours_to_wait = max(1, (ptp_date - today).days * 24)
-                db_ptp = SessionLocal()
+                db_ptp = database.SessionLocal()
                 try:
                     from app.db.audit_repository import _generate_audit_id
                     from app.models import AuditLog
@@ -229,7 +229,7 @@ async def inner_process_case_workflow(ctx, step):
             # High-value cases needing human sign-off → request approval
             if policy_eval.requires_human_approval:
                 def _persist_approval_request(c_id=case_id, dec=decision, diag=diagnosis):
-                    db_sess = SessionLocal()
+                    db_sess = database.SessionLocal()
                     try:
                         from app.models import RecoveryCase, ApprovalStatus, AuditLog
                         from app.db.audit_repository import _generate_audit_id
@@ -327,11 +327,11 @@ async def inner_process_case_workflow(ctx, step):
                 return {"status": "skipped", "reason": "Case already in terminal state before retry"}
             continue  # loop back to diagnose with updated state
 
-    # 10. All attempts exhausted
-    updated = await step.run("finalize_failed", lambda: _set_status(CaseStatus.FAILED))
+    # 10. All attempts exhausted — escalate to human review queue
+    updated = await step.run("finalize_escalated", lambda: _set_status(CaseStatus.ESCALATED))
     if not updated:
         return {"status": "skipped", "reason": "Case already in terminal state"}
-    return {"status": "failed", "reason": "All recovery attempts exhausted"}
+    return {"status": "escalated", "reason": f"All {max_attempts} recovery attempts exhausted without resolution. Escalated for human review."}
 
 
 @inngest_client.create_function(
@@ -347,7 +347,7 @@ async def execute_approved_action(ctx: Context, step: Step) -> dict:
     case_id = ctx.event.data["case_id"]
 
     def _load_case():
-        db = SessionLocal()
+        db = database.SessionLocal()
         try:
             from app.models import RecoveryCase
             case_orm = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
@@ -381,7 +381,7 @@ async def execute_approved_action(ctx: Context, step: Step) -> dict:
     exec_result = ExecutionResult.model_validate(exec_dict)
     
     def _set_status(new_status):
-        db = SessionLocal()
+        db = database.SessionLocal()
         try:
             return update_case_status(db, case_id, new_status)
         finally:

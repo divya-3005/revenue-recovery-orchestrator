@@ -227,25 +227,24 @@ def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_d
         raw_signal_payload=case_in.raw_signal_payload,
     )
 
-    # Create the initial audit log atomically with the case
+    db.add(db_case)
+    db.commit()
+    db.refresh(db_case)
+
     audit_log_1 = models.AuditLog(
+        case_id=db_case.id,
         action_type="SIGNAL_RECEIVED",
         description=f"Case created for signal type: {case_in.case_type.value}",
         reasoning="Initial ingestion from external signal"
     )
-    db_case.audit_logs.append(audit_log_1)
-    
     audit_log_2 = models.AuditLog(
+        case_id=db_case.id,
         action_type="SIGNAL_NORMALIZED",
         description="Signal successfully normalized into Recovery Case format",
         reasoning="Ready for AI recovery pipeline"
     )
-    db_case.audit_logs.append(audit_log_2)
-    db.add(db_case)
-
-    # IMPORTANT: Commit the case FIRST, then fire the Inngest event.
+    db.add_all([audit_log_1, audit_log_2])
     db.commit()
-    db.refresh(db_case)
 
     try:
         inngest_client.send_sync(Event(name="case.received", data={"case_id": db_case.id}))
@@ -319,6 +318,48 @@ def receive_checkout_beacon(body: schemas.CheckoutBeaconRequest, db: Session = D
     else:
         existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.session_id == body.session_id).first()
         return {"status": "idempotent", "case_id": existing.id if existing else None}
+
+@app.post("/api/v1/signals/invoice-overdue")
+def receive_invoice_overdue_signal(body: schemas.InvoiceOverdueSignalRequest, db: Session = Depends(get_db)):
+    """
+    Ingests INVOICE_OVERDUE signals from external billing/invoice tracking systems.
+    """
+    priority_score = compute_priority_score(
+        CaseType.INVOICE_OVERDUE,
+        body.amount_paise,
+        {"days_overdue": body.days_overdue, "invoice_number": body.invoice_number}
+    )
+
+    db_case = models.RecoveryCase(
+        case_type=CaseType.INVOICE_OVERDUE,
+        amount_paise=body.amount_paise,
+        currency=body.currency,
+        customer_id=body.customer_id,
+        priority_score=priority_score,
+        raw_signal_payload={
+            "invoice_id": body.invoice_id,
+            "days_overdue": body.days_overdue,
+            "due_date": body.due_date,
+            "invoice_number": body.invoice_number or body.invoice_id
+        }
+    )
+
+    audit_log = models.AuditLog(
+        action_type="SIGNAL_RECEIVED",
+        description=f"Invoice overdue signal received for {body.invoice_id} ({body.days_overdue} days past due)",
+        reasoning="Automated detection via external billing signal"
+    )
+    db_case.audit_logs.append(audit_log)
+    db.add(db_case)
+    db.commit()
+    db.refresh(db_case)
+
+    try:
+        inngest_client.send_sync(Event(name="case.received", data={"case_id": db_case.id}))
+    except Exception as e:
+        logger.warning(f"Inngest event dispatch failed for invoice case {db_case.id}: {e}.")
+
+    return {"status": "created", "case_id": db_case.id}
 
 @app.post("/webhooks/razorpay")
 async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(None), db: Session = Depends(get_db)):
@@ -667,9 +708,13 @@ def _generate_synthetic_cases():
     # 12 checkout abandoned — friction signals
     for i in range(12):
         amount = random.choice([19900, 49900, 99900, 249900, 499900])
+        abandoned_hour = random.randint(0, 23)
         payload = {
             "cart_items": random.randint(1, 5),
-            "time_on_page_sec": random.randint(30, 300)
+            "time_on_page_sec": random.randint(30, 300),
+            "is_repeat_customer": random.choice([True, False]),
+            "abandoned_hour": abandoned_hour,
+            "time_of_day": "night" if abandoned_hour in [22, 23, 0, 1, 2, 3, 4, 5] else "day"
         }
         cases.append({
             "case_type": CaseType.CHECKOUT_ABANDONED.value,
@@ -846,8 +891,6 @@ def approve_escalated_case(case_id: str, payload: schemas.DecisionApprovalReques
         .where(models.RecoveryCase.approved_decision_hash == payload.decision_hash)
         .values(
             approval_status=models.ApprovalStatus.APPROVED,
-            approved_decision_id=models.RecoveryCase.approved_decision_id,
-            approved_decision_hash=models.RecoveryCase.approved_decision_hash,
             approved_at=func.now(),
             approved_by=(payload.reviewer_id or payload.decision_id or "human_reviewer")
         )
@@ -967,3 +1010,30 @@ def capture_promise_to_pay(case_id: str, body: schemas.PromiseToPayRequest, db: 
         "promise_to_pay_date": str(body.date),
         "message": f"Reminders suppressed until {body.date}. Auto-escalation on breach."
     }
+
+
+# ── Customer Opt-Out (Feature 8) ────────────────────────────────────────
+
+@app.post("/api/v1/cases/{case_id}/opt-out")
+def record_customer_opt_out(case_id: str, body: schemas.OptOutRequest = schemas.OptOutRequest(), db: Session = Depends(get_db)):
+    """
+    Records customer opt-out from communications. Immediately stops recovery and closes the case.
+    """
+    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+
+    case.opted_out = True
+    case.status = CaseStatus.CLOSED
+
+    audit_log = models.AuditLog(
+        case_id=case_id,
+        action_type="CUSTOMER_OPT_OUT",
+        description="Customer opted out of recovery communications",
+        reasoning=body.reason or "Customer requested communication suppression. Case closed."
+    )
+    db.add(audit_log)
+    db.commit()
+
+    return {"status": "opted_out", "case_id": case_id, "case_status": case.status.value}
+

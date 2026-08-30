@@ -9,11 +9,15 @@ import os
 from unittest.mock import patch
 
 from app.main import app
-from app.database import SessionLocal, get_db
+from app import database
+from app.database import get_db
 from app.models import RecoveryCase, CaseType
 
+def SessionLocal():
+    return database.SessionLocal()
+
 def override_get_db():
-    db = SessionLocal()
+    db = database.SessionLocal()
     try:
         yield db
     finally:

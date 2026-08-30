@@ -24,7 +24,7 @@ def diagnose_case(case: RecoveryCaseContext, provider: AIProvider) -> DiagnosisR
     1. root_cause_category: Must strictly map to one of the following based on the Raw Signal Data:
        - hard_decline: Permanent failure (e.g., stolen card, closed account, invalid mandate). Retries will definitively fail.
        - soft_decline: Temporary failure (e.g., insufficient funds, limit exceeded, network error). Retries might succeed.
-       - friction: User abandoned a checkout or flow before completing (e.g., dropped off at OTP).
+       - friction: User abandoned a checkout or flow before completing (e.g., dropped off at OTP). When evaluating friction, analyze behavioral cues in Raw Signal Data: 'is_repeat_customer' (repeat visitors dropping off indicates checkout friction/distraction rather than disinterest), 'abandoned_hour' / time of day (late-night drop-offs often indicate interrupted sessions), and cart value.
        - dispute: Customer initiated a chargeback or flagged the transaction as fraud.
        - missed_payment: An invoice or payment link past due, not explicitly declined by a bank.
        - unknown: The signal data is genuinely missing, completely ambiguous, or provides insufficient evidence to classify.

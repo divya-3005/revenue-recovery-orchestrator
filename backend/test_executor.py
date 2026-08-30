@@ -167,6 +167,24 @@ def test_executor_rejects_raw_decision():
             assert "PolicyApprovedDecision" in str(e)
 
 
+def test_razorpay_executor_switch_rail():
+    case = _make_case()
+    approved = _make_approved(RecoveryActionType.SWITCH_RAIL, {"target_rail": "upi", "channel": "sms"})
+
+    executor = RazorpayExecutor()
+    with patch.object(executor.client.payment_link, 'create') as mock_create:
+        mock_create.return_value = {"id": "plink_switch_123"}
+        result = executor.execute(case, approved)
+
+        assert result.status == ExecutionStatus.SUCCESS
+        assert result.action_taken == RecoveryActionType.SWITCH_RAIL
+        assert result.external_reference_id == "plink_switch_123"
+
+        call_kwargs = mock_create.call_args[1]
+        assert "UPI" in call_kwargs["data"]["description"]
+        assert call_kwargs["data"]["notify"] == {"sms": 1, "email": 0}
+
+
 if __name__ == "__main__":
     test_razorpay_executor_success()
     test_razorpay_executor_offer_discount()
@@ -174,5 +192,6 @@ if __name__ == "__main__":
     test_razorpay_executor_escalate_no_api_call()
     test_razorpay_executor_stop_no_api_call()
     test_razorpay_executor_send_reminder()
+    test_razorpay_executor_switch_rail()
     test_executor_rejects_raw_decision()
     print("SUCCESS: All executor tests passed.")

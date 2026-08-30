@@ -155,6 +155,43 @@ def test_policy_low_confidence_escalates():
     assert result.requires_human_approval is True
     assert "AI confidence too low" in result.reason
 
+def test_policy_dispute_requires_human_approval():
+    case = create_mock_domain_case(amount_paise=10000)
+    dispute_diag = create_mock_diagnosis(RootCauseCategory.DISPUTE)
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.CREATE_PAYMENT_LINK), dispute_diag)
+    assert result.allowed is False
+    assert result.requires_human_approval is True
+    assert "Customer dispute detected" in result.reason
+
+def test_policy_opted_out_blocks_all_actions():
+    case = create_mock_domain_case(amount_paise=10000)
+    case.opted_out = True
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.SEND_REMINDER, {"channel": "email"}), create_mock_diagnosis())
+    assert result.allowed is False
+    assert "Customer has opted out" in result.reason
+
+def test_policy_switch_rail_allowed_and_capped():
+    case = create_mock_domain_case(amount_paise=10000, retry_count=1)
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.SWITCH_RAIL, {"target_rail": "upi"}), create_mock_diagnosis())
+    assert result.allowed is True
+
+    # Blocked on hard decline
+    hard_diag = create_mock_diagnosis(RootCauseCategory.HARD_DECLINE)
+    result_hard = evaluate_policy(case, create_mock_decision(RecoveryActionType.SWITCH_RAIL, {"target_rail": "upi"}), hard_diag)
+    assert result_hard.allowed is False
+
+    # Blocked on max retries
+    case_capped = create_mock_domain_case(amount_paise=10000, retry_count=PolicyConfig.MAX_RETRIES)
+    result_capped = evaluate_policy(case_capped, create_mock_decision(RecoveryActionType.SWITCH_RAIL, {"target_rail": "upi"}), create_mock_diagnosis())
+    assert result_capped.allowed is False
+
+def test_policy_create_payment_link_hard_decline_blocked():
+    case = create_mock_domain_case(amount_paise=10000)
+    hard_diag = create_mock_diagnosis(RootCauseCategory.HARD_DECLINE)
+    result = evaluate_policy(case, create_mock_decision(RecoveryActionType.CREATE_PAYMENT_LINK), hard_diag)
+    assert result.allowed is False
+    assert "forbids retrying hard declines" in result.reason
+
 def test_get_policy_endpoint():
     client = TestClient(app)
     response = client.get("/api/v1/policy")
@@ -172,5 +209,9 @@ if __name__ == "__main__":
     test_policy_discount_caps()
     test_policy_webhook_hard_decline_blocked()
     test_policy_max_retries_capped()
+    test_policy_dispute_requires_human_approval()
+    test_policy_opted_out_blocks_all_actions()
+    test_policy_switch_rail_allowed_and_capped()
+    test_policy_create_payment_link_hard_decline_blocked()
     test_get_policy_endpoint()
     print("SUCCESS: All policy tests passed!")

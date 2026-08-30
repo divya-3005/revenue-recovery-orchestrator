@@ -48,6 +48,8 @@ class RecoveryCaseContext(BaseModel):
     # Execution State
     retry_count: int
     cumulative_discount_paise: int
+    last_notified_at: Optional[datetime] = None
+    opted_out: bool = False
 
     # We allow ORM mapping so we can easily convert from SQLAlchemy models
     model_config = ConfigDict(from_attributes=True)
@@ -59,6 +61,7 @@ class RecoveryActionType(str, enum.Enum):
     OFFER_DISCOUNT = "offer_discount"
     ESCALATE_TO_HUMAN = "escalate_to_human"
     STOP = "stop"
+    SWITCH_RAIL = "switch_rail"
 
 class DecisionResult(BaseModel):
     recommended_action: RecoveryActionType
@@ -89,6 +92,11 @@ class DecisionResult(BaseModel):
                 raise ValueError("SEND_REMINDER requires 'channel' parameter")
             if self.action_parameters["channel"] not in ["email", "sms", "whatsapp"]:
                 raise ValueError("'channel' must be 'email', 'sms', or 'whatsapp'")
+        elif self.recommended_action == RecoveryActionType.SWITCH_RAIL:
+            if "target_rail" not in self.action_parameters:
+                self.action_parameters["target_rail"] = "upi"
+            if "channel" not in self.action_parameters:
+                self.action_parameters["channel"] = "email"
 
         if not self.decision_id:
             self.decision_id = self._derive_decision_id()

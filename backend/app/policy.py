@@ -13,6 +13,8 @@ class PolicyConfig:
     MIN_CONFIDENCE_SCORE: float = 0.7
     # RBI mandate: eNACH/NACH charges require minimum 3 business-day (72h) pre-debit notification
     MIN_ENACH_DELAY_HOURS: int = 72
+    PRE_DEBIT_NOTICE_HOURS: int = 24
+    MAX_DAYS_PURSUED: int = 14
 
 def _generate_idempotency_key(case: RecoveryCaseContext, decision: DecisionResult) -> str:
     """Generates a deterministic idempotency key for the approved action."""
@@ -40,10 +42,22 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
         )
         return PolicyEvaluationResult(allowed=True, reason=reason, approved_decision=approved, requires_human_approval=False, rules=rules)
 
+    # Rule 0: Customer opt-out — immediate hard block on all actions
+    if case.opted_out:
+        rules.append({"name": "customer_opt_out", "passed": False})
+        return reject("Action blocked: Customer has opted out of recovery communications.")
+    rules.append({"name": "customer_opt_out", "passed": True})
+
     # Rule 1: Escalation and stopping are always allowed
     if proposed_action in [RecoveryActionType.ESCALATE_TO_HUMAN, RecoveryActionType.STOP]:
         rules.append({"name": "always_allowed", "passed": True, "action": proposed_action.value})
         return approve(f"Action {proposed_action.value} is always permitted.")
+
+    # Rule 1b: Deterministic dispute gate — disputes require human review
+    if diagnosis.root_cause_category == RootCauseCategory.DISPUTE:
+        rules.append({"name": "dispute_human_gate", "passed": False})
+        return reject("Action blocked: Customer dispute detected. Immediate human intervention required.", requires_human_approval=True)
+    rules.append({"name": "dispute_human_gate", "passed": True})
 
     # Rule 2: High value cases require human approval for financial actions
     if case.amount_paise > PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE:
@@ -70,15 +84,15 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
             return reject(f"Action blocked: Cumulative discount exceeds policy maximum ({PolicyConfig.MAX_DISCOUNT_PERCENT}%).")
         rules.append({"name": "discount_cap", "passed": True})
 
-    # Rule 4: Block retries on hard declines
-    if proposed_action == RecoveryActionType.RETRY_CHARGE and PolicyConfig.BLOCK_HARD_DECLINES:
+    # Rule 4: Block retries, payment links, and rail switches on hard declines
+    if proposed_action in (RecoveryActionType.RETRY_CHARGE, RecoveryActionType.CREATE_PAYMENT_LINK, RecoveryActionType.SWITCH_RAIL) and PolicyConfig.BLOCK_HARD_DECLINES:
         if diagnosis.root_cause_category == RootCauseCategory.HARD_DECLINE:
             rules.append({"name": "block_hard_declines", "passed": False})
             return reject("Action blocked: Policy forbids retrying hard declines.")
         rules.append({"name": "block_hard_declines", "passed": True})
 
     # Rule 5: Max retries cap
-    if proposed_action in (RecoveryActionType.RETRY_CHARGE, RecoveryActionType.CREATE_PAYMENT_LINK):
+    if proposed_action in (RecoveryActionType.RETRY_CHARGE, RecoveryActionType.CREATE_PAYMENT_LINK, RecoveryActionType.SWITCH_RAIL):
         if case.retry_count >= PolicyConfig.MAX_RETRIES:
             rules.append({"name": "max_retries", "passed": False, "observed": case.retry_count, "limit": PolicyConfig.MAX_RETRIES})
             return reject(f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached.")
@@ -94,7 +108,7 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
     rules.append({"name": "min_confidence", "passed": True})
 
     # Rule 7: RBI pre-debit notice — eNACH/NACH mandates require min 72h notice before charge
-    if proposed_action == RecoveryActionType.RETRY_CHARGE:
+    if proposed_action in (RecoveryActionType.RETRY_CHARGE, RecoveryActionType.CREATE_PAYMENT_LINK):
         if case.payment_rail in ("enach", "nach", "mandate"):
             delay_hours = proposed_parameters.get("delay_hours", 0)
             if delay_hours < PolicyConfig.MIN_ENACH_DELAY_HOURS:
