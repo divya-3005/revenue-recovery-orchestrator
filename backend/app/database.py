@@ -11,7 +11,10 @@ DATABASE_URL = os.getenv(
     "postgresql+psycopg://postgres:postgres@localhost:5432/revenue_recovery"
 )
 
-engine = create_engine(DATABASE_URL)
+# Use SQLite specific arguments if SQLite
+connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
@@ -22,3 +25,9 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# Auto-create tables if using SQLite (for tests)
+if "sqlite" in DATABASE_URL:
+    # Need to import models so Base knows about them
+    from app.models import Base
+    Base.metadata.create_all(bind=engine)

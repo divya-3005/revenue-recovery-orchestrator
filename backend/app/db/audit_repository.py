@@ -146,8 +146,9 @@ def update_case_status(session: Session, case_id: str, new_status, increment_ret
         CaseStatus.FAILED,
         CaseStatus.CLOSED,
         CaseStatus.ESCALATED,
-        CaseStatus.AWAITING_APPROVAL,
     ]
+    if new_status not in (CaseStatus.PAYMENT_PENDING, CaseStatus.FAILED, CaseStatus.CLOSED, CaseStatus.ESCALATED):
+        terminal_or_locked.append(CaseStatus.AWAITING_APPROVAL)
 
     values = {"status": new_status}
     if increment_retry:

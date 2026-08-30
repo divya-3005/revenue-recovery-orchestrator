@@ -400,13 +400,19 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         case_type = CaseType.INVOICE_OVERDUE
         if "payment_link" in payload.get("payload", {}):
             link = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+            if link.get("notes", {}).get("case_id"):
+                return {"status": "ignored", "reason": "internal_payment_link_expired"}
         else:
             link = payload.get("payload", {}).get("invoice", {}).get("entity", {})
+            if link.get("notes", {}).get("case_id"):
+                return {"status": "ignored", "reason": "internal_invoice_expired"}
+        
         amount_paise = link.get("amount", 0)
         currency = link.get("currency", "INR")
+        customer = link.get("customer") or {}
         customer_id = (
-            link.get("customer", {}).get("id")
-            or link.get("customer", {}).get("email")
+            customer.get("id")
+            or customer.get("email")
             or "unknown"
         )
         payment_rail = None
@@ -447,6 +453,8 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         existing_case = db.query(models.RecoveryCase).filter(
             models.RecoveryCase.razorpay_event_id == event_id
         ).first()
+        if not existing_case:
+            raise HTTPException(status_code=500, detail="Concurrency conflict, please retry")
         case_id = existing_case.id
     
     if not inserted:
