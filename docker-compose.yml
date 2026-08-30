@@ -24,7 +24,8 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql+psycopg://postgres:postgres@db:5432/revenue_recovery
-      - INNGEST_BASE_URL=http://host.docker.internal:8288
+      - INNGEST_API_BASE_URL=http://host.docker.internal:8288
+      - INNGEST_EVENT_API_BASE_URL=http://host.docker.internal:8288
       - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID}
       - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET}
       - RAZORPAY_WEBHOOK_SECRET=${RAZORPAY_WEBHOOK_SECRET}

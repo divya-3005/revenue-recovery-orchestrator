@@ -19,12 +19,11 @@ import hmac
 import hashlib
 import os
 import json
-import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc, update
+from sqlalchemy import update
 from typing import List
 
 import inngest.fast_api
@@ -32,7 +31,7 @@ from inngest import Event
 
 from app import models, schemas
 from app.models import CaseType, CaseStatus
-from app.database import engine, get_db
+from app.database import get_db
 from app.policy import PolicyConfig
 from app.inngest_client import inngest_client
 from app.workflows.case_workflow import process_case_workflow
@@ -224,7 +223,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         currency = payment.get("currency", "INR")
         customer_id = payment.get("customer_id") or payment.get("email") or "unknown"
         payment_rail = payment.get("method")
-        priority_score = compute_priority_score(case_type, amount_paise, payload)
+        priority_score = compute_priority_score(case_type, amount_paise, {"reason": payment.get("error_reason", "")})
     elif event_type == "subscription.pending":
         case_type = CaseType.SUBSCRIPTION_FAILED
         sub = payload.get("payload", {}).get("subscription", {}).get("entity", {})
@@ -232,7 +231,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         currency = "INR"
         customer_id = sub.get("customer_id") or "unknown"
         payment_rail = None
-        priority_score = compute_priority_score(case_type, amount_paise, payload)
+        priority_score = compute_priority_score(case_type, amount_paise, {})
         
     if amount_paise <= 0:
         return {"status": "ignored", "reason": "invalid_amount"}
