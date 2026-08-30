@@ -127,6 +127,64 @@ async def inner_process_case_workflow(ctx, step):
                 return {"status": "skipped", "reason": "Case already in terminal state"}
             return {"status": "closed", "reason": "Customer has opted out of recovery communications."}
 
+        # Stopping Rule C: Promise-to-Pay — if customer has committed to a date, respect it
+        if case_domain.promise_to_pay_date:
+            from datetime import datetime, timezone, date as date_type
+            ptp_date = case_domain.promise_to_pay_date
+            today = datetime.now(timezone.utc).date()
+
+            if ptp_date > today:
+                # Promise is still in the future — suppress AI loop, sleep until the committed date
+                hours_to_wait = max(1, (ptp_date - today).days * 24)
+                db_ptp = SessionLocal()
+                try:
+                    from app.db.audit_repository import _generate_audit_id
+                    from app.models import AuditLog
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+                    audit_id = _generate_audit_id(case_id, f"PTP_WAIT_{attempt}", case_domain.retry_count)
+                    stmt = pg_insert(AuditLog).values(
+                        id=audit_id, case_id=case_id, action_type="PTP_WAIT",
+                        description=f"Suppressing reminders — customer promised to pay by {ptp_date}. Sleeping {hours_to_wait}h.",
+                        reasoning=f"Promise-to-pay date: {ptp_date}. Standard recovery actions suspended."
+                    ).on_conflict_do_nothing()
+                    db_ptp.execute(stmt)
+                    db_ptp.commit()
+                finally:
+                    db_ptp.close()
+
+                await step.sleep(f"ptp_wait_{attempt}", f"{hours_to_wait}h")
+
+                # Re-check case after waking — did payment come in?
+                woken_dict = await step.run(f"ptp_reload_{attempt}", _load_case)
+                woken = RecoveryCaseContext.model_validate(woken_dict)
+                if woken.status in [CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED]:
+                    return {"status": woken.status.value, "reason": "Case resolved during promise-to-pay window."}
+
+                # Promise broken — escalate
+                updated = await step.run(
+                    f"ptp_broken_{attempt}",
+                    lambda: _set_status(CaseStatus.ESCALATED)
+                )
+                if not updated:
+                    return {"status": "skipped", "reason": "Case already in terminal state"}
+                return {
+                    "status": "escalated",
+                    "reason": f"Promise to pay broken: customer committed to pay by {ptp_date} but payment was not received."
+                }
+
+            else:
+                # PTP date has already passed — escalate immediately
+                updated = await step.run(
+                    f"ptp_overdue_{attempt}",
+                    lambda: _set_status(CaseStatus.ESCALATED)
+                )
+                if not updated:
+                    return {"status": "skipped", "reason": "Case already in terminal state"}
+                return {
+                    "status": "escalated",
+                    "reason": f"Promise to pay overdue: customer committed to pay by {ptp_date}, payment not received."
+                }
+
         # 2. Diagnose
         def _diagnose(case=case_domain):
             return run_diagnosis_step(case, _get_provider()).model_dump()

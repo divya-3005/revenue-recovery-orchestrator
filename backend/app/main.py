@@ -545,3 +545,48 @@ def approve_escalated_case(case_id: str, db: Session = Depends(get_db)):
         logger.warning(f"Inngest dispatch failed for approved case {case_id}: {e}")
 
     return {"status": "approved", "case_id": case_id}
+
+
+# ── Promise-to-Pay Capture (Feature 14) ─────────────────────────────────
+
+@app.post("/api/v1/cases/{case_id}/promise-to-pay")
+def capture_promise_to_pay(case_id: str, body: schemas.PromiseToPayRequest, db: Session = Depends(get_db)):
+    """
+    Capture a customer's verbal/written commitment to pay by a specific date.
+    
+    Effect:
+    - Records the date on the case.
+    - Suppresses standard AI reminders until that date (the workflow checks this field).
+    - If payment is not received by the promised date, the case is auto-escalated
+      with reason 'promise to pay broken'.
+    """
+    existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+    if existing.status in [CaseStatus.RECOVERED, CaseStatus.CLOSED]:
+        raise HTTPException(status_code=400, detail=f"Case is already resolved ({existing.status.value}); cannot set a promise-to-pay date.")
+
+    from datetime import date
+    if body.date < date.today():
+        raise HTTPException(status_code=400, detail="promise_to_pay_date must be today or in the future.")
+
+    existing.promise_to_pay_date = body.date
+    audit_log = models.AuditLog(
+        case_id=case_id,
+        action_type="PTP_CAPTURED",
+        description=f"Promise-to-pay captured: customer committed to pay by {body.date}",
+        reasoning=(
+            f"{body.note or 'Customer stated they will pay by this date.'} "
+            f"Standard recovery reminders suppressed until {body.date}. "
+            f"Automatic escalation will trigger if payment is not received by then."
+        )
+    )
+    db.add(audit_log)
+    db.commit()
+
+    return {
+        "status": "captured",
+        "case_id": case_id,
+        "promise_to_pay_date": str(body.date),
+        "message": f"Reminders suppressed until {body.date}. Auto-escalation on breach."
+    }

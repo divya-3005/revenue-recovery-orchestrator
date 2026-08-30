@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, date
 from app.models import CaseType, CaseStatus
 
 class RecoveryCaseBase(BaseModel):
@@ -20,10 +20,16 @@ class RecoveryCaseResponse(RecoveryCaseBase):
     priority_score: int
     retry_count: int
     cumulative_discount_paise: int
+    promise_to_pay_date: Optional[date] = None
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PromiseToPayRequest(BaseModel):
+    date: date
+    note: Optional[str] = None
 
 class AuditLogResponse(BaseModel):
     id: str

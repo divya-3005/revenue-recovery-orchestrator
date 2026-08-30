@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime, Enum, ForeignKey
+from sqlalchemy import Column, String, Integer, DateTime, Date, Enum, ForeignKey
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -51,6 +51,9 @@ class RecoveryCase(Base):
     # Execution State
     retry_count = Column(Integer, nullable=False, default=0)
     cumulative_discount_paise = Column(Integer, nullable=False, default=0)
+
+    # Promise-to-Pay (Feature 14)
+    promise_to_pay_date = Column(Date, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

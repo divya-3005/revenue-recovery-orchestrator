@@ -1,6 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Dict, Optional
-from datetime import datetime
+from datetime import datetime, date
 import enum
 from app.models import CaseType, CaseStatus
 
@@ -33,6 +33,7 @@ class RecoveryCaseContext(BaseModel):
     priority_score: int = 0
     raw_signal_payload: Dict[str, Any]
     created_at: Optional[datetime] = None
+    promise_to_pay_date: Optional[date] = None
 
     # Execution State
     retry_count: int

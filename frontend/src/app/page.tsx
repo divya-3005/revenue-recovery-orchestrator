@@ -9,7 +9,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import {
   RefreshCw, Play, Search, AlertCircle, Activity, ShieldCheck,
   TrendingUp, ChevronRight, Users, CheckCircle2, XCircle,
-  BarChart3, Inbox, AlertTriangle, DollarSign, Minus, ArrowUpRight
+  BarChart3, Inbox, AlertTriangle, DollarSign, Minus, ArrowUpRight,
+  CalendarClock
 } from "lucide-react";
 
 // --- Types ---
@@ -24,6 +25,7 @@ interface RecoveryCase {
   status: CaseStatus;
   retry_count: number;
   cumulative_discount_paise: number;
+  promise_to_pay_date: string | null;
   created_at: string;
 }
 
@@ -76,6 +78,12 @@ const STATUS_COLORS: Record<string, string> = {
   open: "bg-white/5 text-slate-300 border-white/10",
 };
 
+// Tomorrow as YYYY-MM-DD — must be at module level so component state can reference it
+const tomorrowStr = () => {
+  const d = new Date(); d.setDate(d.getDate() + 1);
+  return d.toISOString().split("T")[0];
+};
+
 type Tab = "queue" | "escalation" | "analytics";
 
 export default function Dashboard() {
@@ -86,6 +94,14 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [batchLoading, setBatchLoading] = useState(false);
   const [approvingId, setApprovingId] = useState<string | null>(null);
+
+  // Promise-to-Pay state
+  const [ptpModalOpen, setPtpModalOpen] = useState(false);
+  const [ptpCaseId, setPtpCaseId] = useState<string | null>(null);
+  const [ptpDate, setPtpDate] = useState(tomorrowStr());
+  const [ptpNote, setPtpNote] = useState("");
+  const [ptpLoading, setPtpLoading] = useState(false);
+  const [ptpError, setPtpError] = useState<string | null>(null);
 
   const [auditModalOpen, setAuditModalOpen] = useState(false);
   const [selectedCaseId, setSelectedCaseId] = useState<string | null>(null);
@@ -151,6 +167,38 @@ export default function Dashboard() {
       console.error("Failed to approve case:", err);
     } finally {
       setApprovingId(null);
+    }
+  };
+
+  const openPtpModal = (caseId: string) => {
+    setPtpCaseId(caseId);
+    setPtpDate(tomorrowStr());
+    setPtpNote("");
+    setPtpError(null);
+    setPtpModalOpen(true);
+  };
+
+  const submitPtp = async () => {
+    if (!ptpCaseId || !ptpDate) return;
+    setPtpLoading(true);
+    setPtpError(null);
+    try {
+      const res = await fetch(`${API_BASE}/cases/${ptpCaseId}/promise-to-pay`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date: ptpDate, note: ptpNote || undefined }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        setPtpError(err.detail ?? "Failed to capture promise.");
+        return;
+      }
+      setPtpModalOpen(false);
+      await loadData();
+    } catch (err) {
+      setPtpError("Network error — please try again.");
+    } finally {
+      setPtpLoading(false);
     }
   };
 
@@ -292,11 +340,24 @@ export default function Dashboard() {
                           ) : "—"}
                         </TableCell>
                         <TableCell>
-                          <Button variant="ghost" size="sm"
-                            onClick={(e) => { e.stopPropagation(); viewAudit(c.id); }}
-                            className="text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg">
-                            <Search className="w-4 h-4" />
-                          </Button>
+                          <div className="flex items-center gap-1 justify-end">
+                            {c.promise_to_pay_date && (
+                              <Badge variant="outline" className="bg-teal-500/10 text-teal-400 border-teal-500/20 text-xs font-mono">
+                                PTP {new Date(c.promise_to_pay_date + "T00:00:00").toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}
+                              </Badge>
+                            )}
+                            <Button variant="ghost" size="sm"
+                              onClick={(e) => { e.stopPropagation(); openPtpModal(c.id); }}
+                              title="Set Promise-to-Pay date"
+                              className="text-teal-500/60 hover:text-teal-300 hover:bg-teal-500/10 rounded-lg">
+                              <CalendarClock className="w-4 h-4" />
+                            </Button>
+                            <Button variant="ghost" size="sm"
+                              onClick={(e) => { e.stopPropagation(); viewAudit(c.id); }}
+                              className="text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg">
+                              <Search className="w-4 h-4" />
+                            </Button>
+                          </div>
                         </TableCell>
                       </TableRow>
                     ))}
@@ -531,7 +592,62 @@ export default function Dashboard() {
         )}
       </div>
 
+      {/* Promise-to-Pay Modal */}
+      <Dialog open={ptpModalOpen} onOpenChange={setPtpModalOpen}>
+        <DialogContent className="max-w-md bg-[#0F1523] border-white/10 shadow-2xl shadow-black p-0 gap-0">
+          <DialogHeader className="p-6 pb-4 bg-white/[0.02] border-b border-white/5">
+            <DialogTitle className="flex items-center text-lg text-white font-medium">
+              <CalendarClock className="w-5 h-5 mr-3 text-teal-400" />
+              Capture Promise-to-Pay
+            </DialogTitle>
+          </DialogHeader>
+          <div className="p-6 space-y-5">
+            <p className="text-sm text-slate-400">
+              Record the date the customer committed to paying. Standard AI reminders will be suppressed until then.
+              If payment is not received by this date, the case will auto-escalate.
+            </p>
+            <div>
+              <label className="block text-xs text-slate-400 uppercase tracking-wider mb-2">Payment Date *</label>
+              <input
+                type="date"
+                value={ptpDate}
+                onChange={(e) => setPtpDate(e.target.value)}
+                min={new Date().toISOString().split("T")[0]}
+                className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2.5 text-slate-200 text-sm focus:outline-none focus:border-teal-500/50 focus:ring-1 focus:ring-teal-500/30"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-slate-400 uppercase tracking-wider mb-2">Customer Note (optional)</label>
+              <input
+                type="text"
+                value={ptpNote}
+                onChange={(e) => setPtpNote(e.target.value)}
+                placeholder="e.g. Customer said payment will clear on salary day"
+                className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2.5 text-slate-200 text-sm placeholder:text-slate-600 focus:outline-none focus:border-teal-500/50 focus:ring-1 focus:ring-teal-500/30"
+              />
+            </div>
+            {ptpError && (
+              <div className="bg-rose-500/10 border border-rose-500/20 rounded-lg px-4 py-3 text-rose-400 text-sm flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />{ptpError}
+              </div>
+            )}
+            <div className="flex gap-3 pt-1">
+              <Button variant="outline" onClick={() => setPtpModalOpen(false)}
+                className="flex-1 bg-white/5 border-white/10 text-slate-400 hover:text-white hover:bg-white/10">
+                Cancel
+              </Button>
+              <Button onClick={submitPtp} disabled={ptpLoading || !ptpDate}
+                className="flex-1 bg-teal-600/80 hover:bg-teal-500 text-white border border-teal-500/50">
+                {ptpLoading ? <RefreshCw className="w-4 h-4 animate-spin mr-2" /> : <CalendarClock className="w-4 h-4 mr-2" />}
+                {ptpLoading ? "Saving…" : "Capture Promise"}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Audit Trail Modal */}
+
       <Dialog open={auditModalOpen} onOpenChange={setAuditModalOpen}>
         <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col p-0 gap-0 overflow-hidden bg-[#0F1523] border-white/10 shadow-2xl shadow-black">
           <DialogHeader className="p-6 pb-4 bg-white/[0.02] border-b border-white/5">
