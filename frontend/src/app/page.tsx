@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
   RefreshCw, Play, Search, AlertCircle, Activity, ShieldCheck,
-  TrendingUp, ChevronRight, Users, CheckCircle2, XCircle,
+  TrendingUp, ChevronRight, Users, CheckCircle2,
   BarChart3, Inbox, AlertTriangle, DollarSign, Minus, ArrowUpRight,
   CalendarClock
 } from "lucide-react";
@@ -195,7 +195,7 @@ export default function Dashboard() {
       }
       setPtpModalOpen(false);
       await loadData();
-    } catch (err) {
+    } catch {
       setPtpError("Network error — please try again.");
     } finally {
       setPtpLoading(false);
