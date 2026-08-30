@@ -603,7 +603,6 @@ def _simulate_batch_pipeline(case_ids: List[str]):
     try:
         from app.models import RecoveryCase, CaseStatus
         from app.domain import RecoveryCaseContext, ExecutionStatus
-        from app.ai.provider import AIProvider
         from app.ai.diagnosis import diagnose_failure
         from app.ai.decision import decide_action
         from app.policy import evaluate_policy
@@ -805,7 +804,6 @@ def get_analytics(db: Session = Depends(get_db)):
     by_channel = {}
     
     # Get latest EXECUTION audit log for each case to determine channel
-    from sqlalchemy import desc
     execution_logs = db.query(models.AuditLog).filter(
         models.AuditLog.action_type == "ACTION_EXECUTED"
     ).order_by(models.AuditLog.created_at.desc()).all()

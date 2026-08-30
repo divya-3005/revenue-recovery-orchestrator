@@ -216,7 +216,48 @@ def test_race_condition_guarding():
     finally:
         db.close()
 
+def test_comms_channel_formatting():
+    from app.comms import generate_message
+    from app.domain import RecoveryCaseContext, DiagnosisResult, RootCauseCategory, CaseType
+    
+    case = RecoveryCaseContext(
+        id="case_comms_test",
+        case_type=CaseType.SUBSCRIPTION_FAILED,
+        amount_paise=500000,
+        currency="INR",
+        customer_id="cust_comms_test",
+        status=CaseStatus.IN_PROGRESS,
+        retry_count=0,
+        cumulative_discount_paise=0,
+        cumulative_comms_cost_paise=0,
+        opted_out=False,
+        raw_signal_payload={}
+    )
+    diagnosis = DiagnosisResult(
+        root_cause_category=RootCauseCategory.SOFT_DECLINE,
+        specific_reason="insufficient_funds",
+        confidence_score=0.9,
+        reasoning="Insufficient account balance"
+    )
+
+    # SMS channel message must be compact (<160 characters)
+    sms_msg = generate_message(case, diagnosis, attempt=1, channel="sms")
+    assert len(sms_msg) <= 160
+    assert "₹5,000" in sms_msg
+    assert "insufficient funds" in sms_msg
+
+    # WhatsApp channel message must also be compact
+    wa_msg = generate_message(case, diagnosis, attempt=1, channel="whatsapp")
+    assert len(wa_msg) <= 160
+
+    # Email channel message contains complete professional context
+    email_msg = generate_message(case, diagnosis, attempt=1, channel="email")
+    assert "Dear Customer" in email_msg
+    assert len(email_msg) > len(sms_msg)
+
 if __name__ == "__main__":
     test_workflow_diagnosis()
     test_workflow_execution_retry_idempotency()
     test_race_condition_guarding()
+    test_comms_channel_formatting()
+    print("SUCCESS: All workflow tests passed!")

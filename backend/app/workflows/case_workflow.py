@@ -147,7 +147,7 @@ async def inner_process_case_workflow(ctx, step):
 
         # Stopping Rule C: Promise-to-Pay — if customer has committed to a date, respect it
         if case_domain.promise_to_pay_date:
-            from datetime import datetime, timezone, date as date_type
+            from datetime import datetime, timezone
             ptp_date = case_domain.promise_to_pay_date
             today = datetime.now(timezone.utc).date()
 
