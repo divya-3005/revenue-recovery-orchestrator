@@ -1,5 +1,6 @@
 import hashlib
 from abc import ABC, abstractmethod
+from typing import Any
 from app.domain import (
     RecoveryCaseContext, PolicyApprovedDecision,
     ExecutionResult, ExecutionStatus, RecoveryActionType
@@ -18,8 +19,7 @@ class DryRunExecutor(ActionExecutor):
     """Safe executor for testing — logs what would happen without calling any external API."""
 
     def execute(self, case: RecoveryCaseContext, approved_decision: PolicyApprovedDecision) -> ExecutionResult:
-        # Runtime enforcement: only PolicyApprovedDecision can reach here
-        if not isinstance(approved_decision, PolicyApprovedDecision):
+        if not isinstance(approved_decision, PolicyApprovedDecision):  # type: ignore[unnecessary-isinstance]
             raise TypeError("ActionExecutor requires a PolicyApprovedDecision. Unapproved decisions cannot be executed.")
 
         return ExecutionResult(
@@ -44,17 +44,22 @@ class RazorpayExecutor(ActionExecutor):
     """
 
     def __init__(self):
+        import importlib
         import os
-        import razorpay
 
         key_id = os.getenv("RAZORPAY_KEY_ID", "dummy_key_id")
         key_secret = os.getenv("RAZORPAY_KEY_SECRET", "dummy_key_secret")
 
-        self.client = razorpay.Client(auth=(key_id, key_secret))
+        try:
+            # Import lazily so the app remains usable in local/test environments without the SDK installed.
+            razorpay_module = importlib.import_module("razorpay")
+            self.client: Any = razorpay_module.Client(auth=(key_id, key_secret))
+        except Exception:
+            # Keep the executor importable in test and local environments where the SDK is not installed.
+            self.client = None
 
     def execute(self, case: RecoveryCaseContext, approved_decision: PolicyApprovedDecision) -> ExecutionResult:
-        # Runtime enforcement: only PolicyApprovedDecision can reach here
-        if not isinstance(approved_decision, PolicyApprovedDecision):
+        if not isinstance(approved_decision, PolicyApprovedDecision):  # type: ignore[unnecessary-isinstance]
             raise TypeError("RazorpayExecutor requires a PolicyApprovedDecision. Unapproved decisions cannot be executed.")
 
         action = approved_decision.decision.recommended_action
@@ -130,7 +135,7 @@ class RazorpayExecutor(ActionExecutor):
             action_parameters_used=approved_decision.decision.action_parameters
         )
 
-    def _create_payment_link(self, case: RecoveryCaseContext, approved_decision: PolicyApprovedDecision, amount_override: int = None) -> ExecutionResult:
+    def _create_payment_link(self, case: RecoveryCaseContext, approved_decision: PolicyApprovedDecision, amount_override: int | None = None) -> ExecutionResult:
         """Create a Razorpay Payment Link for retry or reminder actions."""
         action = approved_decision.decision.recommended_action
 
@@ -179,7 +184,7 @@ class RazorpayExecutor(ActionExecutor):
                     action_parameters_used=approved_decision.decision.action_parameters
                 )
 
-            link_data = {
+            link_data: dict[str, Any] = {
                 "amount": amount_to_charge,
                 "currency": case.currency,
                 "description": description,
@@ -207,7 +212,17 @@ class RazorpayExecutor(ActionExecutor):
                 link_data["notify"] = {"email": 1, "sms": 0}
 
             # SDK call: payment_link.create(data) — no headers kwarg
-            payment_link = self.client.payment_link.create(data=link_data)
+            payment_client = self.client
+            if payment_client is None:
+                return ExecutionResult(
+                    status=ExecutionStatus.FAILED,
+                    action_taken=action,
+                    reason="Razorpay SDK is unavailable in this environment; cannot create payment link.",
+                    external_reference_id=None,
+                    action_parameters_used=approved_decision.decision.action_parameters.copy()
+                )
+
+            payment_link: Any = payment_client.payment_link.create(data=link_data)
 
             # Important: make a copy of parameters to avoid mutating the original decision
             params_used = approved_decision.decision.action_parameters.copy()
@@ -225,19 +240,16 @@ class RazorpayExecutor(ActionExecutor):
                 action_parameters_used=params_used
             )
         except Exception as e:
-            # Check if this is a BadRequestError specifically for a duplicate reference_id
-            import razorpay.errors
-            if isinstance(e, razorpay.errors.BadRequestError):
-                error_msg = str(e).lower()
-                if "reference_id" in error_msg and "already exists" in error_msg:
-                    # Idempotency hit: the link was already created in a previous (crashed) attempt.
-                    return ExecutionResult(
-                        status=ExecutionStatus.SUCCESS,
-                        action_taken=action,
-                        reason="Razorpay payment link already exists (idempotency recovered).",
-                        external_reference_id="idempotent_recovery",
-                        action_parameters_used=approved_decision.decision.action_parameters.copy()
-                    )
+            error_msg = str(e).lower()
+            if "reference_id" in error_msg and "already exists" in error_msg:
+                # Idempotency hit: the link was already created in a previous (crashed) attempt.
+                return ExecutionResult(
+                    status=ExecutionStatus.SUCCESS,
+                    action_taken=action,
+                    reason="Razorpay payment link already exists (idempotency recovered).",
+                    external_reference_id="idempotent_recovery",
+                    action_parameters_used=approved_decision.decision.action_parameters.copy()
+                )
 
             return ExecutionResult(
                 status=ExecutionStatus.FAILED,

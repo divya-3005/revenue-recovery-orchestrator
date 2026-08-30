@@ -139,15 +139,25 @@ def update_case_status(session: Session, case_id: str, new_status, increment_ret
     if new_status in (CaseStatus.RECOVERED, CaseStatus.PARTIALLY_RECOVERED):
         raise ValueError(f"{new_status.value} may only be reached by payment confirmation")
 
+    # A case awaiting human approval is intentionally locked while a decision is pending.
+    # Re-entering the AI workflow here would race with the human decision or closure flow.
+    terminal_or_locked = [
+        CaseStatus.RECOVERED,
+        CaseStatus.FAILED,
+        CaseStatus.CLOSED,
+        CaseStatus.ESCALATED,
+        CaseStatus.AWAITING_APPROVAL,
+    ]
+
     values = {"status": new_status}
     if increment_retry:
         values["retry_count"] = RecoveryCase.retry_count + 1
-        
+
     stmt = update(RecoveryCase).where(
         RecoveryCase.id == case_id,
-        RecoveryCase.status.notin_([CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED, CaseStatus.ESCALATED])
+        RecoveryCase.status.notin_(terminal_or_locked)
     ).values(**values).returning(RecoveryCase.id)
-    
+
     result = session.execute(stmt)
     updated_id = result.scalar()
     session.commit()

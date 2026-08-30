@@ -829,20 +829,20 @@ def approve_escalated_case(case_id: str, payload: schemas.DecisionApprovalReques
 
 @app.post("/api/v1/cases/{case_id}/close")
 def close_escalated_case(case_id: str, db: Session = Depends(get_db)):
-    """Human closure: Mark an escalated case as closed."""
+    """Human closure: Mark an escalated or approval-pending case as closed."""
     stmt = (
         update(models.RecoveryCase)
         .where(models.RecoveryCase.id == case_id)
-        .where(models.RecoveryCase.status == CaseStatus.ESCALATED)
+        .where(models.RecoveryCase.status.in_([CaseStatus.ESCALATED, CaseStatus.AWAITING_APPROVAL]))
         .values(status=CaseStatus.CLOSED)
         .returning(models.RecoveryCase.id)
     )
     result = db.execute(stmt)
     updated_id = result.scalar()
-    
+
     if not updated_id:
-        raise HTTPException(status_code=400, detail="Cannot close case: not found or not in ESCALATED status.")
-        
+        raise HTTPException(status_code=400, detail="Cannot close case: not found or not in an escalated/approval-pending state.")
+
     db.commit()
     return {"status": "closed", "case_id": case_id}
 

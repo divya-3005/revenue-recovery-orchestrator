@@ -14,6 +14,7 @@ from app.main import app
 from app.models import CaseType, CaseStatus
 from app.database import SessionLocal
 from app import models
+from app.db.audit_repository import update_case_status
 from app.domain import (
     DiagnosisResult, RootCauseCategory, DecisionResult,
     RecoveryActionType, ExecutionStatus, PolicyEvaluationResult,
@@ -605,5 +606,59 @@ async def test_close_path_b():
         
         db.refresh(db_case)
         assert db_case.status == CaseStatus.CLOSED
+    finally:
+        db.close()
+
+
+def test_update_case_status_block_reentry_from_awaiting_approval():
+    db = SessionLocal()
+    try:
+        case = models.RecoveryCase(
+            id=f"case_approval_lock_regression_{random.randint(1000, 9999)}",
+            case_type=CaseType.SUBSCRIPTION_FAILED,
+            amount_paise=200000,
+            currency="INR",
+            customer_id="cust_regression",
+            status=CaseStatus.AWAITING_APPROVAL,
+            raw_signal_payload={},
+        )
+        db.add(case)
+        db.commit()
+
+        updated = update_case_status(db, case.id, CaseStatus.IN_PROGRESS)
+        assert updated is False
+
+        db.refresh(case)
+        assert case.status == CaseStatus.AWAITING_APPROVAL
+    finally:
+        db.close()
+
+
+def test_close_endpoint_allows_awaiting_approval_case():
+    db = SessionLocal()
+    try:
+        case = models.RecoveryCase(
+            id=f"case_close_waiting_regression_{random.randint(1000, 9999)}",
+            case_type=CaseType.INVOICE_OVERDUE,
+            amount_paise=350000,
+            currency="INR",
+            customer_id="cust_close_waiting",
+            status=CaseStatus.AWAITING_APPROVAL,
+            raw_signal_payload={"email": "user@example.com"},
+        )
+        db.add(case)
+        db.commit()
+        case_id = case.id
+    finally:
+        db.close()
+
+    response = client.post(f"/api/v1/cases/{case_id}/close")
+    assert response.status_code == 200
+    assert response.json()["status"] == "closed"
+
+    db = SessionLocal()
+    try:
+        updated = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+        assert updated.status == CaseStatus.CLOSED
     finally:
         db.close()
