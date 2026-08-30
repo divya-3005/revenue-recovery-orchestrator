@@ -46,7 +46,7 @@ class GroqProvider(AIProvider):
                 "Set it to use the Groq provider, or use a mock in tests."
             )
         self.client = Groq(api_key=api_key)
-        self.model_id = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
+        self.model_id = os.getenv("GROQ_MODEL_ID", "openai/gpt-oss-120b")
         
     def ask_structured(self, prompt: str, response_schema: Type[T]) -> T:
         chat_completion = self.client.chat.completions.create(
@@ -69,7 +69,7 @@ class AnthropicProvider(AIProvider):
                 "Set it to use the Anthropic provider, or use a mock in tests."
             )
         self.client = Anthropic(api_key=api_key)
-        self.model_id = os.getenv("ANTHROPIC_MODEL_ID", "claude-3-5-sonnet-latest")
+        self.model_id = os.getenv("ANTHROPIC_MODEL_ID", "claude-sonnet-5")
         
     def ask_structured(self, prompt: str, response_schema: Type[T]) -> T:
         full_prompt = (
