@@ -95,6 +95,9 @@ class RecoveryCase(Base):
     # Promise-to-Pay (Feature 14)
     promise_to_pay_date = Column(Date, nullable=True)
 
+    # Webhook Idempotency
+    razorpay_event_id = Column(String, nullable=True, unique=True, index=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

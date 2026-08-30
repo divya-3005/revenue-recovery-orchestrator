@@ -26,10 +26,13 @@ Endpoints:
 
 import json
 import logging
+import hmac
+import hashlib
+import os
 from datetime import date
 from typing import List
 
-from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -109,15 +112,38 @@ def create_case(
 # ── Webhook Ingestion (Feature 1 — real signal listeners) ───────────────
 
 @app.post("/api/v1/webhooks/razorpay", status_code=status.HTTP_200_OK)
-def razorpay_webhook(
-    event_payload: dict,
+async def razorpay_webhook(
+    request: Request,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     """
     Webhook listener for Razorpay events.
-    Handles payment failures → new cases, and payment success → recovery confirmation.
+    Verifies HMAC signature, enforces idempotency, and routes events.
     """
+    body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+    
+    if secret:
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            raise HTTPException(400, "Invalid webhook signature")
+            
+    try:
+        event_payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body")
+        
+    event_id = event_payload.get("id")
+    if not event_id:
+        return {"status": "ignored", "reason": "no event id"}
+        
+    # Idempotency check: Have we processed this event before?
+    existing = db.query(RecoveryCase).filter(RecoveryCase.razorpay_event_id == event_id).first()
+    if existing:
+        return {"status": "ignored", "reason": "duplicate event"}
+        
     event_name = event_payload.get("event", "")
     data = event_payload.get("payload", {})
 
@@ -170,6 +196,7 @@ def razorpay_webhook(
         case_type=case_type, amount_paise=amount, customer_id=customer_id,
         customer_email=raw_payload.get("email"), customer_phone=raw_payload.get("contact"),
         payment_rail=payment_rail, priority_score=priority, raw_signal_payload=raw_payload,
+        razorpay_event_id=event_id,
     )
     db.add(case)
     db.commit()
@@ -550,10 +577,16 @@ def _execute_approved(case_id: str):
         _audit(db, case.id, "ACTION_EXECUTED",
                f"Approved action executed: {exec_result.status.value}",
                json.dumps({"reason": exec_result.reason,
-                           "external_ref": exec_result.external_reference_id}))
+                           "external_ref": exec_result.external_reference_id,
+                           "params": exec_result.action_parameters_used}))
 
-        from app.models import ExecutionStatus
+        from app.models import ExecutionStatus, RecoveryActionType
         if exec_result.status in (ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN):
+            if exec_result.action_taken == RecoveryActionType.OFFER_DISCOUNT:
+                discount = exec_result.action_parameters_used.get("discount_applied_paise", 0)
+                if discount:
+                    case.cumulative_discount_paise += discount
+
             case.status = CaseStatus.PAYMENT_PENDING
         else:
             case.status = CaseStatus.FAILED
@@ -573,9 +606,10 @@ def _simulate_payment(db: Session, case_id: str):
     if case.status not in (CaseStatus.PAYMENT_PENDING, CaseStatus.IN_PROGRESS, CaseStatus.OPEN):
         return
 
-    case.recovered_amount_paise = case.amount_paise
+    actual_paid = max(0, case.amount_paise - case.cumulative_discount_paise)
+    case.recovered_amount_paise = actual_paid
     case.status = CaseStatus.RECOVERED
     _audit(db, case.id, "PAYMENT_CONFIRMED",
-           f"Payment confirmed for {case.amount_paise} paise (simulated)",
-           "Simulated payment for demo/batch processing")
+           f"Payment confirmed for {actual_paid} paise",
+           "Payment confirmed and case marked as recovered")
     db.commit()

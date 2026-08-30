@@ -44,6 +44,8 @@ The app starts immediately with SQLite — no database setup needed.
 |--------|----------|-------------|
 | GET | `/health` | Health check |
 | POST | `/api/v1/cases` | Ingest a new recovery case |
+| POST | `/api/v1/webhooks/razorpay` | Razorpay webhook listener (failures & payment confirmation) |
+| POST | `/api/v1/beacon/checkout-abandoned` | Checkout drop-off beacon |
 | GET | `/api/v1/cases` | List all cases (sorted by priority) |
 | GET | `/api/v1/cases/{id}/audit` | Full audit trail for a case |
 | GET | `/api/v1/cases/escalated` | Cases needing human review |

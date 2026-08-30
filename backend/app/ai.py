@@ -146,11 +146,22 @@ def decide(case: RecoveryCase, diagnosis: DiagnosisResult, provider: AIProvider)
     """Propose the next-best recovery action based on diagnosis and case state."""
     from app.policy import POLICY
 
+    rail = (case.payment_rail or "").lower()
+    is_mandate_rail = rail in ("enach", "nach", "emandate", "mandate")
+    mandate_note = ""
+    if is_mandate_rail:
+        mandate_note = (
+            f" IMPORTANT: this case is on the {case.payment_rail} rail — RBI regulations require "
+            f"AT LEAST {POLICY['pre_debit_notice_hours']}h pre-debit notice, so delay_hours MUST be "
+            f">= {POLICY['pre_debit_notice_hours']}."
+        )
+
     prompt = f"""You are an expert payments and revenue recovery AI.
 Based on the diagnosis and case state, propose the NEXT BEST recovery action.
 
 [CASE STATE]
 Amount: {case.amount_paise} paise
+Payment Rail: {case.payment_rail or "Not specified"}
 Retry Count: {case.retry_count} (Max: {POLICY['max_retries']})
 Cumulative Discount: {case.cumulative_discount_paise} paise
 
@@ -160,12 +171,10 @@ Reason: {diagnosis.specific_reason}
 Confidence: {diagnosis.confidence_score}
 
 [ACTIONS]
-1. create_payment_link — for soft declines, abandoned checkouts, overdue invoices. Params: {{"delay_hours": int}}
+1. create_payment_link — for soft declines, abandoned checkouts, overdue invoices. Params: {{"delay_hours": int, "channel": "email"|"sms"}}.{mandate_note}
 2. offer_discount — for friction/pricing drop-offs. Params: {{"discount_percent": int}} (max {POLICY['max_discount_percent']}%)
-3. send_reminder — for missed payments, nudges. Params: {{"channel": "email"|"sms"|"whatsapp"}}
-4. switch_rail — when payment rail failed, try alternative. Params: {{"target_rail": "upi"|"card"|"enach", "channel": "email"}}
-5. escalate_to_human — for disputes, hard declines, high-value, unknown/low-confidence
-6. stop — unrecoverable case (fraud confirmed)
+3. escalate_to_human — for disputes, hard declines, high-value, unknown/low-confidence
+4. stop — unrecoverable case (fraud confirmed)
 
 Output: recommended_action, action_parameters, confidence_score (0-1), reasoning (1-2 sentences)."""
 
@@ -176,7 +185,11 @@ Output: recommended_action, action_parameters, confidence_score (0-1), reasoning
 
 def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> DecisionResult:
     """Rule-based decision when no AI provider is available."""
+    from app.policy import POLICY
+
     cat = diagnosis.root_cause_category
+    rail = (case.payment_rail or "").lower()
+    is_mandate_rail = rail in ("enach", "nach", "emandate", "mandate")
 
     if cat == RootCauseCategory.HARD_DECLINE:
         return DecisionResult(
@@ -193,11 +206,17 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
         )
 
     if cat == RootCauseCategory.SOFT_DECLINE:
+        delay = POLICY["pre_debit_notice_hours"] if is_mandate_rail else 24
+        reasoning = (
+            f"Soft decline on {case.payment_rail} — using RBI-compliant {delay}h pre-debit delay."
+            if is_mandate_rail else
+            "Soft decline — creating payment link for customer-initiated retry."
+        )
         return DecisionResult(
             recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
-            action_parameters={"delay_hours": 24},
+            action_parameters={"delay_hours": delay},
             confidence_score=0.85,
-            reasoning="Soft decline — creating payment link for customer-initiated retry.",
+            reasoning=reasoning,
         )
 
     if cat == RootCauseCategory.FRICTION:
@@ -210,10 +229,10 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
 
     if cat == RootCauseCategory.MISSED_PAYMENT:
         return DecisionResult(
-            recommended_action=RecoveryActionType.SEND_REMINDER,
+            recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
             action_parameters={"channel": "email"},
             confidence_score=0.80,
-            reasoning="Invoice overdue — sending payment reminder.",
+            reasoning="Invoice overdue — sending payment link to recover funds.",
         )
 
     return DecisionResult(

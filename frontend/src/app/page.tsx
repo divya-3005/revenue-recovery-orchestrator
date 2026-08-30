@@ -581,6 +581,86 @@ export default function Dashboard() {
               </CardContent>
             </Card>
 
+            {/* Channel Breakdown */}
+            {analytics.breakdown_by_channel && Object.keys(analytics.breakdown_by_channel).length > 0 && (
+              <Card className="bg-white/[0.02] border-white/10">
+                <CardHeader className="p-5 border-b border-white/5">
+                  <CardTitle className="text-sm font-semibold text-white">Recovery Performance by Channel</CardTitle>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <Table>
+                    <TableHeader>
+                      <TableRow className="border-white/5 hover:bg-transparent">
+                        <TableHead className="text-slate-400 text-xs">Channel</TableHead>
+                        <TableHead className="text-slate-400 text-xs">Total</TableHead>
+                        <TableHead className="text-slate-400 text-xs">Recovered</TableHead>
+                        <TableHead className="text-slate-400 text-xs">At Risk</TableHead>
+                        <TableHead className="text-slate-400 text-xs">Recovered ₹</TableHead>
+                        <TableHead className="text-slate-400 text-xs">Rate</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {Object.entries(analytics.breakdown_by_channel).map(([channel, data]) => {
+                        const rate = data.total > 0 ? Math.round((data.recovered / data.total) * 100) : 0;
+                        return (
+                          <TableRow key={channel} className="border-white/5">
+                            <TableCell className="text-xs font-medium text-white uppercase">{channel}</TableCell>
+                            <TableCell className="text-xs font-mono text-slate-300">{data.total}</TableCell>
+                            <TableCell className="text-xs font-mono text-emerald-400">{data.recovered}</TableCell>
+                            <TableCell className="text-xs font-semibold text-rose-300">{formatINR(data.at_risk_paise)}</TableCell>
+                            <TableCell className="text-xs font-semibold text-emerald-300">{formatINR(data.recovered_paise)}</TableCell>
+                            <TableCell>
+                              <Badge variant="outline" className="bg-emerald-500/10 text-emerald-300 border-emerald-500/30 text-[10px]">
+                                {rate}%
+                              </Badge>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Exception List (Feature 12: Honest Exception Accounting) */}
+            {analytics.exceptions && analytics.exceptions.length > 0 && (
+              <Card className="bg-white/[0.02] border-white/10">
+                <CardHeader className="p-5 border-b border-white/5 flex flex-row items-center justify-between">
+                  <CardTitle className="text-sm font-semibold text-white">Exception List (Unresolved &amp; Escalated Cases)</CardTitle>
+                  <Badge variant="outline" className="bg-rose-500/10 text-rose-300 border-rose-500/30 text-xs">
+                    {analytics.exceptions.length} cases
+                  </Badge>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <Table>
+                    <TableHeader>
+                      <TableRow className="border-white/5 hover:bg-transparent">
+                        <TableHead className="text-slate-400 text-xs">Case ID</TableHead>
+                        <TableHead className="text-slate-400 text-xs">Type</TableHead>
+                        <TableHead className="text-slate-400 text-xs">Status</TableHead>
+                        <TableHead className="text-slate-400 text-xs text-right">Amount</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {analytics.exceptions.slice(0, 10).map((ex) => (
+                        <TableRow key={ex.case_id} className="border-white/5">
+                          <TableCell className="text-xs font-mono text-slate-400">{ex.case_id.slice(0, 8)}…</TableCell>
+                          <TableCell className="text-xs text-slate-300">{CASE_LABELS[ex.case_type] || ex.case_type}</TableCell>
+                          <TableCell>
+                            <Badge variant="outline" className={`${STATUS_BADGE_STYLES[ex.status] || ""} text-[10px] uppercase`}>
+                              {ex.status.replace(/_/g, " ")}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="text-xs font-semibold text-rose-300 text-right">{formatINR(ex.amount_paise)}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </CardContent>
+              </Card>
+            )}
+
             {/* Policy Configuration Box */}
             {policy && (
               <Card className="bg-white/[0.02] border-white/10 p-5 rounded-2xl">

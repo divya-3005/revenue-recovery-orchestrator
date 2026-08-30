@@ -459,6 +459,7 @@ def test_razorpay_webhook_ingestion_and_confirmation():
     """Feature 1 & 7: Webhook creates cases from failure events and confirms payments."""
     # Ingest a payment failure
     resp = client.post("/api/v1/webhooks/razorpay", json={
+        "id": "evt_test_failure_001",
         "event": "payment.failed",
         "payload": {
             "payment": {
@@ -477,6 +478,7 @@ def test_razorpay_webhook_ingestion_and_confirmation():
 
     # Confirm payment via webhook
     resp2 = client.post("/api/v1/webhooks/razorpay", json={
+        "id": "evt_test_success_001",
         "event": "payment.captured",
         "payload": {
             "payment": {"entity": {"id": "pay_test_002", "amount": 149900, "notes": {"case_id": case_id}}}
