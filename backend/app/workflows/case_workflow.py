@@ -72,7 +72,7 @@ async def inner_process_case_workflow(ctx, step):
     def _set_status(new_status, inc_retry=False):
         db = SessionLocal()
         try:
-            update_case_status(db, case_id, new_status, increment_retry=inc_retry)
+            return update_case_status(db, case_id, new_status, increment_retry=inc_retry)
         finally:
             db.close()
 
@@ -97,7 +97,9 @@ async def inner_process_case_workflow(ctx, step):
 
     # ── Mark case as in progress ─────────────────────────────────────
 
-    await step.run("mark_in_progress", lambda: _set_status(CaseStatus.IN_PROGRESS))
+    updated = await step.run("mark_in_progress", lambda: _set_status(CaseStatus.IN_PROGRESS))
+    if not updated:
+        return {"status": "skipped", "reason": "Case already in terminal state"}
 
     # ── Recovery loop ────────────────────────────────────────────────
 
@@ -169,7 +171,9 @@ async def inner_process_case_workflow(ctx, step):
                 return {"status": CaseStatus.CLOSED.value, "execution": exec_dict}
             else:
                 # Wait for payment confirmation via webhook
-                await step.run(f"awaiting_payment_{attempt}", lambda: _set_status(CaseStatus.AWAITING_PAYMENT))
+                updated = await step.run(f"awaiting_payment_{attempt}", lambda: _set_status(CaseStatus.AWAITING_PAYMENT))
+                if not updated:
+                    return {"status": "skipped", "reason": "Case already in terminal state before awaiting payment"}
                 
                 delay_hours = decision.action_parameters.get("delay_hours", 24)
                 delay_hours = max(1, min(delay_hours, 168))
@@ -186,8 +190,10 @@ async def inner_process_case_workflow(ctx, step):
 
         # 9. Execution failed — can we retry?
         if attempt < max_attempts - 1:
-            await step.run(f"retry_{attempt}",
-                           lambda: _set_status(CaseStatus.IN_PROGRESS, inc_retry=True))
+            updated = await step.run(f"retry_{attempt}",
+                                     lambda: _set_status(CaseStatus.IN_PROGRESS, inc_retry=True))
+            if not updated:
+                return {"status": "skipped", "reason": "Case already in terminal state before retry"}
             continue  # loop back to diagnose with updated state
 
         # 10. All attempts exhausted

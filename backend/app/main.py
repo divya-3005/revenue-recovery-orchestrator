@@ -232,6 +232,9 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         payment_rail = None
         priority_score = compute_priority_score(case_type, amount_paise, payload)
         
+    if amount_paise <= 0:
+        return {"status": "ignored", "reason": "invalid_amount"}
+        
     # Atomic INSERT ON CONFLICT DO NOTHING
     stmt = insert(models.RecoveryCase).values(
         id=models.generate_uuid(),
@@ -363,73 +366,78 @@ def _generate_synthetic_cases():
                     "processing_error", "temporary_hold"]
     for i in range(15):
         amount = random.choice([9900, 29900, 49900, 99900, 199900])
+        payload = {"reason": random.choice(soft_reasons)}
         cases.append({
             "case_type": CaseType.SUBSCRIPTION_FAILED.value,
             "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{i:03d}",
             "payment_rail": random.choice(["card", "upi", "enach"]),
-            "priority_score": int(amount * 0.8),
-            "raw_signal_payload": {"reason": random.choice(soft_reasons)}
+            "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
+            "raw_signal_payload": payload
         })
 
     # 8 subscription failures — hard declines (should NOT be retried)
     hard_reasons = ["lost_card_reported", "stolen_card", "account_closed", "fraud_suspected"]
     for i in range(8):
         amount = random.choice([9900, 29900, 49900])
+        payload = {"reason": random.choice(hard_reasons)}
         cases.append({
             "case_type": CaseType.SUBSCRIPTION_FAILED.value,
             "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{15 + i:03d}",
             "payment_rail": "card",
-            "priority_score": int(amount * 0.2), # hard declines have low priority (won't recover)
-            "raw_signal_payload": {"reason": random.choice(hard_reasons)}
+            "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
+            "raw_signal_payload": payload
         })
 
     # 12 checkout abandoned — friction signals
     for i in range(12):
         amount = random.choice([19900, 49900, 99900, 249900, 499900])
+        payload = {
+            "cart_items": random.randint(1, 5),
+            "time_on_page_sec": random.randint(30, 300)
+        }
         cases.append({
             "case_type": CaseType.CHECKOUT_ABANDONED.value,
             "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{23 + i:03d}",
             "payment_rail": random.choice(["card", "upi"]),
-            "priority_score": int(amount * 0.5), # moderate probability
-            "raw_signal_payload": {
-                "cart_items": random.randint(1, 5),
-                "time_on_page_sec": random.randint(30, 300)
-            }
+            "priority_score": compute_priority_score(CaseType.CHECKOUT_ABANDONED, amount, payload),
+            "raw_signal_payload": payload
         })
 
     # 10 invoice overdue — missed payments
     for i in range(10):
         amount = random.choice([100000, 250000, 500000, 1000000, 2500000])
+        payload = {
+            "days_overdue": random.randint(3, 30),
+            "invoice_number": f"INV-{1000 + i}"
+        }
         cases.append({
             "case_type": CaseType.INVOICE_OVERDUE.value,
             "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{35 + i:03d}",
             "payment_rail": None,
-            "priority_score": int(amount * 0.9), # B2B has high probability
-            "raw_signal_payload": {
-                "days_overdue": random.randint(3, 30),
-                "invoice_number": f"INV-{1000 + i}"
-            }
+            "priority_score": compute_priority_score(CaseType.INVOICE_OVERDUE, amount, payload),
+            "raw_signal_payload": payload
         })
 
     # 5 high-value cases (trigger human approval policy)
     for i in range(5):
         amount = random.choice([5500000, 7000000, 10000000])
+        payload = {"reason": "insufficient_funds"}
         cases.append({
             "case_type": CaseType.SUBSCRIPTION_FAILED.value,
             "amount_paise": amount,
             "currency": "INR",
             "customer_id": f"cust_batch_{45 + i:03d}",
             "payment_rail": "enach",
-            "priority_score": int(amount * 0.9),
-            "raw_signal_payload": {"reason": "insufficient_funds"}
+            "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
+            "raw_signal_payload": payload
         })
 
     return cases

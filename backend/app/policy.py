@@ -12,6 +12,7 @@ class PolicyConfig:
     # Value above which automatic financial actions are blocked (50,000 INR = 5000000 paise)
     REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE: int = 5000000 
     BLOCK_HARD_DECLINES: bool = True
+    MIN_CONFIDENCE_SCORE: float = 0.7
 
 def _generate_idempotency_key(case: RecoveryCaseContext, decision: DecisionResult) -> str:
     """Generates a deterministic idempotency key for the approved action."""
@@ -67,5 +68,12 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
     if proposed_action == RecoveryActionType.RETRY_CHARGE:
         if case.retry_count >= PolicyConfig.MAX_RETRIES:
             return reject(f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached.")
+
+    # Rule 6: Confidence score minimum threshold
+    if decision.confidence_score < PolicyConfig.MIN_CONFIDENCE_SCORE or diagnosis.confidence_score < PolicyConfig.MIN_CONFIDENCE_SCORE:
+        return reject(
+            f"Action blocked: AI confidence too low (Decision: {decision.confidence_score}, Diagnosis: {diagnosis.confidence_score}). Escalating to human.", 
+            requires_human_approval=True
+        )
 
     return approve("Action allowed by policy.")

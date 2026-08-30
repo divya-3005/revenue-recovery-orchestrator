@@ -190,6 +190,31 @@ def test_workflow_execution_retry_idempotency():
     finally:
         db.close()
 
+from app.db.audit_repository import update_case_status
+from app.models import CaseStatus
+
+def test_race_condition_guarding():
+    db = SessionLocal()
+    try:
+        db_case = get_db_case(db)
+        # Should succeed because it is OPEN
+        updated = update_case_status(db, db_case.id, CaseStatus.IN_PROGRESS)
+        assert updated is True
+        
+        # Now set it to a terminal state
+        updated = update_case_status(db, db_case.id, CaseStatus.RECOVERED)
+        assert updated is True
+        
+        # Now try to update it back to IN_PROGRESS (race condition)
+        updated = update_case_status(db, db_case.id, CaseStatus.IN_PROGRESS)
+        assert updated is False
+        
+        db.refresh(db_case)
+        assert db_case.status == CaseStatus.RECOVERED
+    finally:
+        db.close()
+
 if __name__ == "__main__":
     test_workflow_diagnosis()
     test_workflow_execution_retry_idempotency()
+    test_race_condition_guarding()

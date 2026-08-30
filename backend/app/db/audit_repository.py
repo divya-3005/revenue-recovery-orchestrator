@@ -9,7 +9,8 @@ via PostgreSQL ON CONFLICT DO NOTHING.
 import hashlib
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
-from app.models import AuditLog, RecoveryCase
+from sqlalchemy import update
+from app.models import AuditLog, RecoveryCase, CaseStatus
 from app.domain import RecoveryCaseContext, DiagnosisResult, ExecutionStatus, RecoveryActionType
 
 
@@ -107,11 +108,18 @@ def record_execution_checkpoint(session: Session, case: RecoveryCaseContext, exe
 
 # ── Case status helpers ──────────────────────────────────────────────────
 
-def update_case_status(session: Session, case_id: str, new_status, increment_retry: bool = False):
-    """Update the case status in the database. Optionally increment retry_count."""
-    db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
-    if db_case:
-        db_case.status = new_status
-        if increment_retry:
-            db_case.retry_count += 1
-        session.commit()
+def update_case_status(session: Session, case_id: str, new_status, increment_retry: bool = False) -> bool:
+    """Update the case status in the database. Optionally increment retry_count. Returns True if updated."""
+    values = {"status": new_status}
+    if increment_retry:
+        values["retry_count"] = RecoveryCase.retry_count + 1
+        
+    stmt = update(RecoveryCase).where(
+        RecoveryCase.id == case_id,
+        RecoveryCase.status.notin_([CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED])
+    ).values(**values).returning(RecoveryCase.id)
+    
+    result = session.execute(stmt)
+    updated_id = result.scalar()
+    session.commit()
+    return updated_id is not None

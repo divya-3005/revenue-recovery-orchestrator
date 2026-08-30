@@ -132,6 +132,29 @@ def test_policy_max_retries_capped():
     assert result.allowed is False
     assert "Max retries" in result.reason
 
+def test_policy_low_confidence_escalates():
+    case = create_mock_domain_case(amount_paise=10000)
+    
+    decision_low = create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24})
+    decision_low.confidence_score = PolicyConfig.MIN_CONFIDENCE_SCORE - 0.1
+    diag_high = create_mock_diagnosis()
+    diag_high.confidence_score = 0.9
+    
+    result = evaluate_policy(case, decision_low, diag_high)
+    assert result.allowed is False
+    assert result.requires_human_approval is True
+    assert "AI confidence too low" in result.reason
+    
+    decision_high = create_mock_decision(RecoveryActionType.RETRY_CHARGE, {"delay_hours": 24})
+    decision_high.confidence_score = 0.9
+    diag_low = create_mock_diagnosis()
+    diag_low.confidence_score = PolicyConfig.MIN_CONFIDENCE_SCORE - 0.1
+    
+    result = evaluate_policy(case, decision_high, diag_low)
+    assert result.allowed is False
+    assert result.requires_human_approval is True
+    assert "AI confidence too low" in result.reason
+
 def test_get_policy_endpoint():
     client = TestClient(app)
     response = client.get("/api/v1/policy")
