@@ -874,7 +874,11 @@ def get_policy():
         max_retries=PolicyConfig.MAX_RETRIES,
         max_discount_percent=PolicyConfig.MAX_DISCOUNT_PERCENT,
         require_human_approval_above_paise=PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE,
-        block_hard_declines=PolicyConfig.BLOCK_HARD_DECLINES
+        block_hard_declines=PolicyConfig.BLOCK_HARD_DECLINES,
+        min_confidence_score=PolicyConfig.MIN_CONFIDENCE_SCORE,
+        min_enach_delay_hours=PolicyConfig.MIN_ENACH_DELAY_HOURS,
+        pre_debit_notice_hours=PolicyConfig.PRE_DEBIT_NOTICE_HOURS,
+        max_days_pursued=PolicyConfig.MAX_DAYS_PURSUED
     )
 
 

@@ -81,14 +81,18 @@ def test_postgresql_atomic_payment_concurrency():
     for the same case result in EXACTLY ONE insertion and ONE status update.
     """
     # Connect to local postgres used in docker-compose
-    pg_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/razorpay_recovery")
+    pg_url = os.getenv("DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/revenue_recovery")
+    if "postgresql" not in pg_url:
+        pytest.skip("PostgreSQL concurrency test requires a PostgreSQL DATABASE_URL")
+
     try:
         engine = create_engine(pg_url)
+        with engine.connect() as conn:
+            pass
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    except OperationalError:
-        pytest.skip("PostgreSQL not running locally, skipping concurrency test")
-
-    db = SessionLocal()
+        db = SessionLocal()
+    except Exception as e:
+        pytest.skip(f"PostgreSQL not running or unreachable ({e}), skipping concurrency test")
     
     # Create test case
     import uuid

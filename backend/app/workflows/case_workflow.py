@@ -175,7 +175,7 @@ async def inner_process_case_workflow(ctx, step):
                 # Re-check case after waking — did payment come in?
                 woken_dict = await step.run(f"ptp_reload_{attempt}", _load_case)
                 woken = RecoveryCaseContext.model_validate(woken_dict)
-                if woken.status in [CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED]:
+                if woken.status in [CaseStatus.RECOVERED, CaseStatus.PARTIALLY_RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED]:
                     return {"status": woken.status.value, "reason": "Case resolved during promise-to-pay window."}
 
                 # Promise broken — escalate

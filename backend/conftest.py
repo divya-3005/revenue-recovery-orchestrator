@@ -23,15 +23,18 @@ def set_test_env_vars(monkeypatch):
 @pytest.fixture(autouse=True)
 def setup_test_db(monkeypatch):
     """Replace PostgreSQL with SQLite in memory for tests."""
-    # Ensure we use an in-memory SQLite database for tests
-    # We use shared cache so that multiple threads (e.g. TestClient and webhook workers)
-    # can share the same in-memory database instance.
-    TEST_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///file:testdb?mode=memory&cache=shared&uri=true")
+    # Default to SQLite in-memory unless explicit TEST_DATABASE_URL or sqlite DATABASE_URL is set
+    TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+    if not TEST_DATABASE_URL:
+        db_env = os.getenv("DATABASE_URL", "")
+        if "sqlite" in db_env:
+            TEST_DATABASE_URL = db_env
+        else:
+            TEST_DATABASE_URL = "sqlite://"
 
-    # We only override the database configuration if it's the test DB
     if "sqlite" in TEST_DATABASE_URL:
         engine = create_engine(
-            "sqlite://", 
+            TEST_DATABASE_URL, 
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )

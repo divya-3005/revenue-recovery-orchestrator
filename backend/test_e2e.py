@@ -723,3 +723,45 @@ def test_customer_opt_out_endpoint():
     finally:
         db.close()
 
+
+@pytest.mark.asyncio
+async def test_ptp_partially_recovered_resolves_workflow():
+    from datetime import date, timedelta
+    db = SessionLocal()
+    try:
+        case_id = f"case_ptp_{random.randint(1000, 9999)}"
+        case = models.RecoveryCase(
+            id=case_id,
+            case_type=CaseType.SUBSCRIPTION_FAILED,
+            amount_paise=200000,
+            currency="INR",
+            customer_id="cust_ptp_partial",
+            status=CaseStatus.IN_PROGRESS,
+            promise_to_pay_date=date.today() + timedelta(days=2),
+            raw_signal_payload={},
+        )
+        db.add(case)
+        db.commit()
+    finally:
+        db.close()
+
+    ctx = MockContext(event=Event(name="case.received", data={"case_id": case_id}))
+    
+    class PtpSleepStep(MockStep):
+        async def sleep(self, step_id, duration):
+            # Simulate a partial payment arriving while sleeping
+            db_sim = SessionLocal()
+            try:
+                db_c = db_sim.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+                db_c.status = CaseStatus.PARTIALLY_RECOVERED
+                db_c.recovered_amount_paise = 100000
+                db_sim.commit()
+            finally:
+                db_sim.close()
+
+    step = PtpSleepStep()
+    result = await inner_process_case_workflow(ctx, step)
+    assert result["status"] == CaseStatus.PARTIALLY_RECOVERED.value
+    assert "Case resolved during promise-to-pay window" in result["reason"]
+
+

@@ -879,13 +879,23 @@ export default function Dashboard() {
 }
 
 function PolicyConfigCard() {
-  const [policy, setPolicy] = useState<{ max_retries: number; max_discount_percent: number; require_human_approval_above_paise: number; block_hard_declines: boolean } | null>(null);
+  const [policy, setPolicy] = useState<{
+    max_retries: number;
+    max_discount_percent: number;
+    require_human_approval_above_paise: number;
+    block_hard_declines: boolean;
+    pre_debit_notice_hours?: number;
+    max_days_pursued?: number;
+  } | null>(null);
 
   useEffect(() => {
     fetch(`${API_BASE}/policy`).then(r => r.json()).then(setPolicy).catch(console.error);
   }, []);
 
   if (!policy) return null;
+
+  const pursuitDays = policy.max_days_pursued ?? 14;
+  const noticeHours = policy.pre_debit_notice_hours ?? 24;
 
   return (
     <Card className="bg-white/[0.02] border-white/5 rounded-2xl">
@@ -896,12 +906,14 @@ function PolicyConfigCard() {
         </CardTitle>
       </CardHeader>
       <CardContent className="p-6">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
           {[
             { label: "Max Retries", value: policy.max_retries },
             { label: "Max Discount", value: `${policy.max_discount_percent}%` },
             { label: "Human Approval Above", value: formatINR(policy.require_human_approval_above_paise) },
             { label: "Block Hard Declines", value: policy.block_hard_declines ? "Yes" : "No" },
+            { label: "Pre-Debit Notice", value: `${noticeHours}h` },
+            { label: "Pursuit Window", value: `${pursuitDays} Days` },
           ].map((item) => (
             <div key={item.label} className="bg-white/[0.03] rounded-xl p-4 border border-white/5">
               <p className="text-xs text-slate-500 uppercase tracking-wider mb-2">{item.label}</p>
@@ -910,7 +922,7 @@ function PolicyConfigCard() {
           ))}
         </div>
         <p className="text-xs text-slate-500 mt-4">
-          + RBI eNACH 72h pre-debit notice · Max 30-day pursuit window · Customer opt-out stops recovery
+          + RBI e-mandate/eNACH {noticeHours}h pre-debit notice · Max {pursuitDays}-day pursuit window · Customer opt-out stops recovery
         </p>
       </CardContent>
     </Card>

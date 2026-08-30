@@ -161,6 +161,9 @@ def test_idempotency_concurrency(client, mock_webhook_secret, mock_inngest_clien
     Assert exactly one row exists in recovery_cases for that event_id afterward.
     Run this test at least 20 times in a loop locally.
     """
+    if database.engine.dialect.name == "sqlite":
+        pytest.skip("True multi-threaded concurrent write idempotency requires PostgreSQL row-level locks")
+
     for i in range(20):
         event_id = f"evt_concurrent_{uuid.uuid4().hex}"
         payload = {

@@ -83,5 +83,9 @@ class PolicyConfigResponse(BaseModel):
     max_discount_percent: int
     require_human_approval_above_paise: int
     block_hard_declines: bool
+    min_confidence_score: float = 0.7
+    min_enach_delay_hours: int = 24
+    pre_debit_notice_hours: int = 24
+    max_days_pursued: int = 14
 
     model_config = ConfigDict(from_attributes=True)

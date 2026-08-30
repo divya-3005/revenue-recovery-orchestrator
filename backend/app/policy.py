@@ -107,15 +107,17 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
         )
     rules.append({"name": "min_confidence", "passed": True})
 
-    # Rule 7: RBI pre-debit notice — eNACH/NACH mandates require min 72h notice before charge
-    if proposed_action in (RecoveryActionType.RETRY_CHARGE, RecoveryActionType.CREATE_PAYMENT_LINK):
-        if case.payment_rail in ("enach", "nach", "mandate"):
+    # Rule 7: RBI pre-debit notice — emandate/eNACH/NACH mandates require min 24h notice before charge
+    if proposed_action in (RecoveryActionType.RETRY_CHARGE, RecoveryActionType.CREATE_PAYMENT_LINK, RecoveryActionType.SWITCH_RAIL):
+        rail = (case.payment_rail or "").lower()
+        if rail in ("emandate", "enach", "nach", "mandate"):
             delay_hours = proposed_parameters.get("delay_hours", 0)
-            if delay_hours < PolicyConfig.MIN_ENACH_DELAY_HOURS:
-                rules.append({"name": "rbi_pre_debit_notice", "passed": False, "delay_hours": delay_hours})
+            required_notice_hours = PolicyConfig.PRE_DEBIT_NOTICE_HOURS
+            if delay_hours < required_notice_hours:
+                rules.append({"name": "rbi_pre_debit_notice", "passed": False, "delay_hours": delay_hours, "required": required_notice_hours})
                 return reject(
-                    f"Action blocked: RBI mandate regulations require a minimum {PolicyConfig.MIN_ENACH_DELAY_HOURS}h "
-                    f"pre-debit notification for eNACH/NACH charges. Proposed delay: {delay_hours}h."
+                    f"Action blocked: RBI mandate regulations require a minimum {required_notice_hours}h "
+                    f"pre-debit notification for e-mandate/eNACH/NACH charges. Proposed delay: {delay_hours}h."
                 )
             rules.append({"name": "rbi_pre_debit_notice", "passed": True})
 
