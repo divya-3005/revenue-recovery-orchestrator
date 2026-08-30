@@ -91,10 +91,24 @@ def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amo
     if amount_paise <= 0:
         raise HTTPException(status_code=400, detail="INVALID_PAYMENT_AMOUNT")
 
-    # 1. Case retrieval & State Validation with row-level lock BEFORE payment insert
+    # 1. Check if this exact payment_id was already confirmed (idempotency check)
+    existing_conf = db.query(models.PaymentConfirmation).filter(models.PaymentConfirmation.payment_id == payment_id).first()
+    if existing_conf:
+        if existing_conf.case_id != case_id:
+            raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
+        return {"status": "idempotent", "reason": "payment_already_processed"}
+
+    # 2. Lock RecoveryCase with row-level lock
     case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).with_for_update().first()
     if not case:
         raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+
+    # Re-check idempotency in case another transaction committed while waiting for lock
+    existing_conf = db.query(models.PaymentConfirmation).filter(models.PaymentConfirmation.payment_id == payment_id).first()
+    if existing_conf:
+        if existing_conf.case_id != case_id:
+            raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
+        return {"status": "idempotent", "reason": "payment_already_processed"}
 
     if case.status not in (CaseStatus.PAYMENT_PENDING, CaseStatus.PARTIALLY_RECOVERED):
         raise HTTPException(status_code=409, detail="CASE_NOT_AWAITING_PAYMENT")
@@ -106,15 +120,9 @@ def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amo
         db.commit()
         return {"status": "escalated", "reason": "overpayment"}
 
-    # 2. Atomic Upsert for Idempotency
+    # 3. Atomic Insert for Idempotency
     now = datetime.now(timezone.utc)
     if db.bind.dialect.name == "sqlite":
-        # SQLite fallback for tests
-        existing_conf = db.query(models.PaymentConfirmation).filter(models.PaymentConfirmation.payment_id == payment_id).first()
-        if existing_conf:
-            if existing_conf.case_id != case_id:
-                raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
-            return {"status": "idempotent", "reason": "payment_already_processed"}
         conf = models.PaymentConfirmation(
             payment_id=payment_id,
             case_id=case_id,
@@ -147,7 +155,7 @@ def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amo
                 raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
             return {"status": "idempotent", "reason": "payment_already_processed"}
 
-    # 3. Update Case
+    # 4. Update Case
     case.recovered_amount_paise += amount_paise
     case.payment_confirmed_at = now
     
