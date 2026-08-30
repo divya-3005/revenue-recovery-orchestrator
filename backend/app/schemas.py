@@ -28,6 +28,9 @@ class RecoveryCaseResponse(RecoveryCaseBase):
     promise_to_pay_date: Optional[date] = None
     pending_decision_json: Optional[Dict[str, Any]] = None
     pending_diagnosis_json: Optional[Dict[str, Any]] = None
+    approval_status: Optional[str] = None
+    approved_decision_id: Optional[str] = None
+    approved_decision_hash: Optional[str] = None
     session_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime

@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 
 // --- Types ---
-type CaseStatus = "open" | "in_progress" | "awaiting_payment" | "recovered" | "failed" | "escalated" | "closed";
+type CaseStatus = "open" | "in_progress" | "awaiting_payment" | "recovered" | "failed" | "escalated" | "closed" | "payment_pending" | "partially_recovered" | "awaiting_approval";
 
 interface PendingDecision {
   recommended_action: string;
@@ -47,6 +47,7 @@ interface RecoveryCase {
   promise_to_pay_date: string | null;
   pending_decision_json: PendingDecision | null;
   pending_diagnosis_json: PendingDiagnosis | null;
+  approved_decision_hash: string | null;
   created_at: string;
 }
 
@@ -67,6 +68,7 @@ interface Analytics {
   recovery_rate_percent: number;
   net_recovery_rate_percent: number;
   breakdown_by_case_type: Record<string, ByTypeEntry>;
+  breakdown_by_channel: Record<string, ByTypeEntry>;
   breakdown_by_status: Record<string, number>;
   exceptions: { case_id: string; status: string; case_type: string; amount_paise: number }[];
 }
@@ -92,10 +94,13 @@ const CASE_TYPE_LABELS: Record<string, string> = {
 
 const STATUS_COLORS: Record<string, string> = {
   recovered: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+  partially_recovered: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
   in_progress: "bg-blue-500/10 text-blue-400 border-blue-500/20",
   failed: "bg-rose-500/10 text-rose-400 border-rose-500/20",
   escalated: "bg-amber-500/10 text-amber-400 border-amber-500/20",
+  awaiting_approval: "bg-amber-500/10 text-amber-400 border-amber-500/20",
   awaiting_payment: "bg-yellow-500/10 text-yellow-400 border-yellow-500/20",
+  payment_pending: "bg-yellow-500/10 text-yellow-400 border-yellow-500/20",
   closed: "bg-slate-500/10 text-slate-400 border-slate-500/20",
   open: "bg-white/5 text-slate-300 border-white/10",
 };
@@ -183,10 +188,15 @@ export default function Dashboard() {
     }
   };
 
-  const approveCase = async (caseId: string) => {
+  const approveCase = async (caseId: string, decisionHash: string) => {
     setApprovingId(caseId);
     try {
-      await fetch(`${API_BASE}/cases/${caseId}/approve`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/cases/${caseId}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision_hash: decisionHash }),
+      });
+      if (!res.ok) throw new Error(await res.text());
       await loadData();
     } catch {
       alert("Failed to approve case");
@@ -465,7 +475,7 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
-                      <Button variant="ghost" size="sm"
+            <Button variant="ghost" size="sm"
                         onClick={() => viewAudit(c.id)}
                         className="text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg text-xs">
                         <Search className="w-3.5 h-3.5 mr-1.5" />View Audit
@@ -474,7 +484,7 @@ export default function Dashboard() {
                       {c.pending_decision_json ? (
                         <div className="flex flex-col items-end gap-1">
                           <Button size="sm"
-                            onClick={() => approveCase(c.id)}
+                            onClick={() => approveCase(c.id, c.approved_decision_hash!)}
                             disabled={approvingId === c.id}
                             className="bg-emerald-600/80 hover:bg-emerald-500 text-white border border-emerald-500/50 shadow-md shadow-emerald-600/20 rounded-lg text-xs">
                             {approvingId === c.id ? (
@@ -582,6 +592,46 @@ export default function Dashboard() {
                       return (
                         <TableRow key={type} className="border-white/5 hover:bg-white/[0.03]">
                           <TableCell className="font-medium text-slate-200">{CASE_TYPE_LABELS[type] ?? type}</TableCell>
+                          <TableCell className="text-slate-300 font-mono">{data.total}</TableCell>
+                          <TableCell className="text-emerald-400 font-mono">{data.recovered}</TableCell>
+                          <TableCell>
+                            <div className="flex items-center gap-2">
+                              <div className="flex-1 bg-white/5 rounded-full h-1.5 max-w-[80px]">
+                                <div className="bg-emerald-500 h-1.5 rounded-full transition-all" style={{ width: `${rate}%` }} />
+                              </div>
+                              <span className="text-slate-300 text-xs font-mono w-8">{rate}%</span>
+                            </div>
+                          </TableCell>
+                          <TableCell className="text-rose-400">{formatINR(data.at_risk_paise)}</TableCell>
+                          <TableCell className="text-emerald-400">{formatINR(data.recovered_paise)}</TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </CardContent>
+            </Card>
+
+            {/* Breakdown by Channel */}
+            <Card className="bg-white/[0.02] border-white/5 rounded-2xl overflow-hidden mt-6">
+              <CardHeader className="bg-white/[0.02] border-b border-white/5 px-6 py-4">
+                <CardTitle className="text-base text-white font-medium">Breakdown by Channel</CardTitle>
+              </CardHeader>
+              <CardContent className="p-0">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="hover:bg-transparent border-white/5 bg-black/20">
+                      {["Channel", "Total Cases", "Recovered", "Recovery Rate", "At Risk", "Recovered ₹"].map(h => (
+                        <TableHead key={h} className="text-slate-400 font-semibold tracking-wider text-xs">{h}</TableHead>
+                      ))}
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {Object.entries(analytics.breakdown_by_channel).map(([channel, data]) => {
+                      const rate = data.total > 0 ? Math.round((data.recovered / data.total) * 100) : 0;
+                      return (
+                        <TableRow key={channel} className="border-white/5 hover:bg-white/[0.03]">
+                          <TableCell className="font-medium text-slate-200 capitalize">{channel}</TableCell>
                           <TableCell className="text-slate-300 font-mono">{data.total}</TableCell>
                           <TableCell className="text-emerald-400 font-mono">{data.recovered}</TableCell>
                           <TableCell>
@@ -767,14 +817,40 @@ export default function Dashboard() {
                         </span>
                       </div>
                       <p className="text-slate-300 text-sm leading-relaxed">{log.description}</p>
-                      {log.reasoning && (
-                        <div className="mt-4 bg-black/40 border-l-2 border-indigo-500 p-4 rounded-r-lg text-sm">
-                          <div className="flex gap-3">
-                            <ChevronRight className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
-                            <p className="text-slate-400 italic font-light">&quot;{log.reasoning}&quot;</p>
+                      {log.reasoning && (() => {
+                        if (log.action_type === "POLICY_EVALUATED") {
+                          try {
+                            const parsed = JSON.parse(log.reasoning);
+                            return (
+                              <div className="mt-4 bg-black/40 border-l-2 border-indigo-500 p-4 rounded-r-lg text-sm">
+                                <div className="flex items-center gap-2 mb-2">
+                                  <ShieldCheck className="w-4 h-4 text-indigo-400" />
+                                  <span className="font-semibold text-slate-300">Policy Evaluation: {parsed.allowed ? "Passed" : "Failed"}</span>
+                                </div>
+                                <ul className="space-y-1 ml-6">
+                                  {parsed.rules.map((r: { passed: boolean; rule_name: string }, i: number) => (
+                                    <li key={i} className="text-slate-400 text-xs flex items-center gap-2">
+                                      {r.passed ? <CheckCircle2 className="w-3 h-3 text-emerald-500" /> : <AlertCircle className="w-3 h-3 text-rose-500" />}
+                                      <span>{r.rule_name}</span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            );
+                          } catch {
+                            // Fallback
+                          }
+                        }
+                        
+                        return (
+                          <div className="mt-4 bg-black/40 border-l-2 border-indigo-500 p-4 rounded-r-lg text-sm">
+                            <div className="flex gap-3">
+                              <ChevronRight className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
+                              <p className="text-slate-400 italic font-light">&quot;{log.reasoning}&quot;</p>
+                            </div>
                           </div>
-                        </div>
-                      )}
+                        );
+                      })()}
                     </div>
                   </div>
                 ))}

@@ -74,4 +74,5 @@ def generate_message(case: RecoveryCaseContext, diagnosis: DiagnosisResult, atte
     }
 
     category_templates = templates.get(diagnosis.root_cause_category, default)
-    return category_templates.get(tone, default["gentle"])
+    base_msg = category_templates.get(tone, default["gentle"])
+    return f"{base_msg} [{length_instruction}]"

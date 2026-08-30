@@ -552,11 +552,29 @@ def _simulate_batch_pipeline(case_ids: List[str]):
     from app.database import SessionLocal
     db = SessionLocal()
     try:
-        from app.workflows.case_workflow import _step_diagnose, _step_decide, _step_policy, _step_execute, update_case_status
-        from app.domain import RecoveryCaseContext, ExecutionStatus
         from app.models import RecoveryCase, CaseStatus
+        from app.domain import RecoveryCaseContext, ExecutionStatus
+        from app.ai.provider import AIProvider
+        from app.ai.diagnosis import diagnose_failure
+        from app.ai.decision import decide_action
+        from app.policy import evaluate_policy
+        from app.execution.executor import RazorpayExecutor
+        from app.db.audit_repository import update_case_status
         import random
-        from app.main import process_payment_confirmation
+
+        import os
+        from app.ai.provider import GeminiProvider, GroqProvider, AnthropicProvider, FallbackProvider
+        
+        def get_prov(name):
+            if name == "groq": return GroqProvider()
+            if name == "anthropic": return AnthropicProvider()
+            return GeminiProvider()
+
+        provider = FallbackProvider(
+            get_prov(os.getenv("AI_PRIMARY_PROVIDER", "gemini").lower()),
+            get_prov(os.getenv("AI_FALLBACK_PROVIDER", "groq").lower())
+        )
+        executor = RazorpayExecutor()
         
         for cid in case_ids:
             try:
@@ -568,18 +586,27 @@ def _simulate_batch_pipeline(case_ids: List[str]):
                     status=c.status, priority_score=c.priority_score, raw_signal_payload=c.raw_signal_payload,
                     retry_count=c.retry_count, cumulative_discount_paise=c.cumulative_discount_paise
                 )
-                diag = _step_diagnose(ctx)
+                
+                # 1. Diagnose
+                diag = diagnose_failure(ctx, provider)
                 if not diag: continue
-                dec = _step_decide(ctx, diag)
+                
+                # 2. Decide
+                dec = decide_action(ctx, diag, provider)
                 if not dec: continue
-                pol = _step_policy(ctx, dec)
+                
+                # 3. Policy
+                pol = evaluate_policy(ctx, dec, diag)
+                
+                # 4. Execute or Wait
                 if not pol.requires_human_approval and pol.approved_decision:
-                    exec_res = _step_execute(ctx, pol.approved_decision)
+                    exec_res = executor.execute(ctx, pol.approved_decision, db)
                     if exec_res.status == ExecutionStatus.SUCCESS:
                         update_case_status(db, c.id, CaseStatus.PAYMENT_PENDING)
                         # Simulate the customer paying the generated link via the unified confirmation path
                         if random.random() < 0.6:
                             pay_id = f"pay_sim_{cid.replace('-', '')[:14]}"
+                            from app.main import process_payment_confirmation
                             process_payment_confirmation(db, pay_id, c.id, c.amount_paise, "batch_simulation")
                     else:
                         update_case_status(db, c.id, CaseStatus.FAILED)
@@ -588,7 +615,9 @@ def _simulate_batch_pipeline(case_ids: List[str]):
                     c.pending_decision_json = dec.model_dump()
                     db.commit()
             except Exception as e:
-                logger.error(f"Simulated batch error for {cid}: {e}")
+                import logging
+                logging.getLogger(__name__).error(f"Simulated batch error for {cid}: {e}")
+
     finally:
         db.close()
 
@@ -741,11 +770,11 @@ def get_analytics(db: Session = Depends(get_db)):
             # reasoning format: "Razorpay payment link created... Parameters: {'channel': 'sms'...}"
             # This is a bit fragile to parse from the string reasoning, but we can check if it contains 'sms' or 'whatsapp' or 'email'
             reasoning = latest_exec_per_case[c.id].reasoning or ""
-            if "'channel': 'whatsapp'" in reasoning:
+            if "'channel': 'whatsapp'" in reasoning or "whatsapp" in reasoning.lower():
                 channel = "whatsapp"
-            elif "'channel': 'sms'" in reasoning:
+            elif "'channel': 'sms'" in reasoning or "sms" in reasoning.lower():
                 channel = "sms"
-            elif "'channel': 'email'" in reasoning:
+            elif "'channel': 'email'" in reasoning or "email" in reasoning.lower():
                 channel = "email"
             elif c.payment_rail:
                 channel = c.payment_rail
