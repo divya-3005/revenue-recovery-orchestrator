@@ -197,3 +197,29 @@ def test_idempotency_concurrency(client, mock_webhook_secret, mock_inngest_clien
         ).all()
         assert len(cases) == 1, f"Iteration {i}: Expected 1 case in DB, got {len(cases)}"
         db.close()
+
+def test_webhook_zero_amount_ignored(client, mock_webhook_secret, mock_inngest_client):
+    payload = {
+        "event": "payment.failed",
+        "id": "evt_test_zero",
+        "payload": {
+            "payment": {
+                "entity": {
+                    "amount": 0,
+                    "currency": "INR",
+                    "customer_id": "cust_test_zero"
+                }
+            }
+        }
+    }
+    
+    signature = generate_signature(mock_webhook_secret, payload)
+    
+    response = client.post(
+        "/webhooks/razorpay",
+        content=json.dumps(payload),
+        headers={"X-Razorpay-Signature": signature}
+    )
+    
+    assert response.status_code == 200
+    assert response.json() == {"status": "ignored", "reason": "invalid_amount"}

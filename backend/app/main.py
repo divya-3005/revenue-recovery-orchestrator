@@ -126,6 +126,8 @@ def health_check():
 @app.post("/api/v1/demo/confirm-payment/{case_id}")
 def demo_confirm_payment(case_id: str, db: Session = Depends(get_db)):
     """Local demo only: mark a case as paid to test the AWAITING_PAYMENT -> RECOVERED transition."""
+    if os.getenv("ENVIRONMENT") == "production":
+        raise HTTPException(status_code=403, detail="Demo endpoint is disabled in production.")
     return _apply_payment_confirmed(db, case_id, "demo_endpoint")
 
 

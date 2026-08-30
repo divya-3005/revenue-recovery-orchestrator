@@ -197,7 +197,9 @@ async def inner_process_case_workflow(ctx, step):
             continue  # loop back to diagnose with updated state
 
         # 10. All attempts exhausted
-        await step.run("mark_failed", lambda: _set_status(CaseStatus.FAILED))
+        updated = await step.run("mark_failed", lambda: _set_status(CaseStatus.FAILED))
+        if not updated:
+            return {"status": "skipped", "reason": "Case already in terminal state before marking failed"}
         return {"status": "failed",
                 "reason": "All recovery attempts exhausted",
                 "execution": exec_dict}
