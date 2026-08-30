@@ -57,6 +57,7 @@ def setup_test_db(monkeypatch):
             pass
     else:
         # Explicit TEST_DATABASE_URL was provided for dedicated test DB
+        from sqlalchemy import text as sa_text
         engine = create_engine(TEST_DATABASE_URL)
         TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         
@@ -64,3 +65,11 @@ def setup_test_db(monkeypatch):
         monkeypatch.setattr(app.database, "engine", engine)
         
         yield
+        
+        # Clean data between test runs while preserving schema & alembic_version
+        try:
+            with engine.connect() as conn:
+                conn.execute(sa_text("TRUNCATE TABLE payment_confirmations, audit_logs, recovery_cases CASCADE;"))
+                conn.commit()
+        except Exception:
+            pass

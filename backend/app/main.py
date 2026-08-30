@@ -326,7 +326,14 @@ def receive_checkout_beacon(body: schemas.CheckoutBeaconRequest, db: Session = D
 
         return {"status": "created", "case_id": case_id}
     else:
-        existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.session_id == body.session_id).first()
+        import time
+        existing = None
+        for _ in range(10):
+            db.rollback()
+            existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.session_id == body.session_id).first()
+            if existing:
+                break
+            time.sleep(0.05)
         return {"status": "idempotent", "case_id": existing.id if existing else None}
 
 @app.post("/api/v1/signals/invoice-overdue")
@@ -506,10 +513,17 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         case_id = inserted_id
     else:
         inserted = False
-        # Retrieve the pre-existing case ID
-        existing_case = db.query(models.RecoveryCase).filter(
-            models.RecoveryCase.razorpay_event_id == event_id
-        ).first()
+        # Retrieve the pre-existing case ID (with short retry in case concurrent thread is committing)
+        import time
+        existing_case = None
+        for _ in range(10):
+            db.rollback()
+            existing_case = db.query(models.RecoveryCase).filter(
+                models.RecoveryCase.razorpay_event_id == event_id
+            ).first()
+            if existing_case:
+                break
+            time.sleep(0.05)
         if not existing_case:
             raise HTTPException(status_code=500, detail="Concurrency conflict, please retry")
         case_id = existing_case.id
