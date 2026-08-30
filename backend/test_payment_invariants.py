@@ -132,13 +132,17 @@ def test_postgresql_atomic_payment_concurrency():
     assert "recovered" in results
     assert "idempotent" in results
 
-    # Verify DB state
-    db.refresh(case)
-    assert case.recovered_amount_paise == 10000
-    assert case.status == CaseStatus.RECOVERED
-    
-    # Verify exact one payment confirmation record
-    confirms = db.query(PaymentConfirmation).filter(PaymentConfirmation.payment_id == payment_id).all()
-    assert len(confirms) == 1
-    
-    db.close()
+    try:
+        # Verify DB state
+        db.refresh(case)
+        assert case.recovered_amount_paise == 10000
+        assert case.status == CaseStatus.RECOVERED
+        
+        # Verify exact one payment confirmation record
+        confirms = db.query(PaymentConfirmation).filter(PaymentConfirmation.payment_id == payment_id).all()
+        assert len(confirms) == 1
+    finally:
+        db.query(PaymentConfirmation).filter(PaymentConfirmation.payment_id == payment_id).delete()
+        db.delete(case)
+        db.commit()
+        db.close()

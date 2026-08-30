@@ -22,20 +22,13 @@ def set_test_env_vars(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def setup_test_db(monkeypatch):
-    """Replace PostgreSQL with SQLite in memory for tests."""
-    # Use explicit TEST_DATABASE_URL or DATABASE_URL if available
-    TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL") or os.getenv("DATABASE_URL")
+    """
+    Replace PostgreSQL with in-memory SQLite for tests unless TEST_DATABASE_URL is explicitly set.
+    Never automatically drop or modify tables on the application's dev DATABASE_URL.
+    """
+    TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
     if not TEST_DATABASE_URL:
         TEST_DATABASE_URL = "sqlite://"
-    elif "postgresql" in TEST_DATABASE_URL:
-        # Check if Postgres is reachable; if not, fallback to sqlite
-        try:
-            probe_engine = create_engine(TEST_DATABASE_URL)
-            with probe_engine.connect() as conn:
-                pass
-            probe_engine.dispose()
-        except Exception:
-            TEST_DATABASE_URL = "sqlite://"
 
     if "sqlite" in TEST_DATABASE_URL:
         engine = create_engine(
@@ -49,18 +42,25 @@ def setup_test_db(monkeypatch):
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=OFF")
             cursor.close()
-    else:
-        engine = create_engine(TEST_DATABASE_URL)
 
-    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base.metadata.create_all(bind=engine)
-    
-    # Patch the global SessionLocal and engine
-    monkeypatch.setattr(app.database, "SessionLocal", TestingSessionLocal)
-    monkeypatch.setattr(app.database, "engine", engine)
-    
-    yield
-    try:
-        Base.metadata.drop_all(bind=engine)
-    except Exception:
-        pass
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        
+        # Patch the global SessionLocal and engine
+        monkeypatch.setattr(app.database, "SessionLocal", TestingSessionLocal)
+        monkeypatch.setattr(app.database, "engine", engine)
+        
+        yield
+        try:
+            Base.metadata.drop_all(bind=engine)
+        except Exception:
+            pass
+    else:
+        # Explicit TEST_DATABASE_URL was provided for dedicated test DB
+        engine = create_engine(TEST_DATABASE_URL)
+        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        
+        monkeypatch.setattr(app.database, "SessionLocal", TestingSessionLocal)
+        monkeypatch.setattr(app.database, "engine", engine)
+        
+        yield

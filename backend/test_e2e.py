@@ -850,6 +850,8 @@ def test_postgres_live_schema_smoke(monkeypatch):
         session.refresh(case)
         assert case.id == case_id
         assert case.opted_out is False
+        session.delete(case)
+        session.commit()
     finally:
         session.close()
 
