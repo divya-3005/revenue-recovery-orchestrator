@@ -39,6 +39,8 @@ class RecoveryCaseContext(BaseModel):
     # Pending AI State (Feature 15)
     pending_decision_json: Optional[Dict[str, Any]] = None
     pending_diagnosis_json: Optional[Dict[str, Any]] = None
+    pending_decision_id: Optional[str] = None
+    pending_decision_hash: Optional[str] = None
     session_id: Optional[str] = None
     
     # Human Approval Gate

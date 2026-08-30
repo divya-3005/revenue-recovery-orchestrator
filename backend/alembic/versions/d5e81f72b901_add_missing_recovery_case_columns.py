@@ -34,6 +34,10 @@ def upgrade() -> None:
         op.add_column('recovery_cases', sa.Column('latest_channel', sa.String(length=50), nullable=True))
     if 'last_notified_at' not in columns:
         op.add_column('recovery_cases', sa.Column('last_notified_at', sa.DateTime(timezone=True), nullable=True))
+    if 'pending_decision_id' not in columns:
+        op.add_column('recovery_cases', sa.Column('pending_decision_id', sa.String(length=255), nullable=True))
+    if 'pending_decision_hash' not in columns:
+        op.add_column('recovery_cases', sa.Column('pending_decision_hash', sa.String(length=255), nullable=True))
     if 'opted_out' not in columns:
         op.add_column('recovery_cases', sa.Column('opted_out', sa.Boolean(), nullable=False, server_default=sa.text('false')))
 
@@ -41,6 +45,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Downgrade schema."""
     op.drop_column('recovery_cases', 'opted_out')
+    op.drop_column('recovery_cases', 'pending_decision_hash')
+    op.drop_column('recovery_cases', 'pending_decision_id')
     op.drop_column('recovery_cases', 'last_notified_at')
     op.drop_column('recovery_cases', 'latest_channel')
     op.drop_column('recovery_cases', 'latest_diagnosis_confidence')

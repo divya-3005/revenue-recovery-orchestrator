@@ -125,8 +125,8 @@ def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amo
                 raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
             return {"status": "idempotent", "reason": "payment_already_processed"}
 
-    # 2. Case retrieval & State Validation
-    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+    # 2. Case retrieval & State Validation with row-level lock
+    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).with_for_update().first()
     if not case:
         # If we reached here on Postgres, we inserted a payment for a missing case.
         # This shouldn't happen due to FK constraints, but handle defensively.
@@ -656,7 +656,7 @@ def _simulate_batch_pipeline(case_ids: List[str]):
         )
         executor = RazorpayExecutor()
         
-        for cid in case_ids:
+        for idx, cid in enumerate(case_ids):
             try:
                 c = db.query(RecoveryCase).filter(RecoveryCase.id == cid).first()
                 if not c: continue
@@ -680,11 +680,11 @@ def _simulate_batch_pipeline(case_ids: List[str]):
                 
                 # 4. Execute or Wait
                 if not pol.requires_human_approval and pol.approved_decision:
-                    exec_res = executor.execute(ctx, pol.approved_decision, db)
-                    if exec_res.status == ExecutionStatus.SUCCESS:
+                    exec_res = executor.execute(ctx, pol.approved_decision)
+                    if exec_res.status in [ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN]:
                         update_case_status(db, c.id, CaseStatus.PAYMENT_PENDING)
-                        # Simulate the customer paying the generated link via the unified confirmation path
-                        if random.random() < 0.6:
+                        # Deterministic synthetic payment event (replaces random probability)
+                        if idx % 5 < 3:
                             pay_id = f"pay_sim_{cid.replace('-', '')[:14]}"
                             from app.main import process_payment_confirmation
                             process_payment_confirmation(db, pay_id, c.id, c.amount_paise, "batch_simulation")
@@ -692,7 +692,10 @@ def _simulate_batch_pipeline(case_ids: List[str]):
                         update_case_status(db, c.id, CaseStatus.FAILED)
                 elif pol.requires_human_approval:
                     c.status = CaseStatus.AWAITING_APPROVAL
+                    c.approval_status = models.ApprovalStatus.PENDING
                     c.pending_decision_json = dec.model_dump()
+                    c.pending_decision_id = dec.decision_id
+                    c.pending_decision_hash = dec.canonical_hash()
                     db.commit()
             except Exception as e:
                 import logging
@@ -958,19 +961,34 @@ def get_policy():
 @app.post("/api/v1/cases/{case_id}/approve")
 def approve_escalated_case(case_id: str, payload: schemas.DecisionApprovalRequest, db: Session = Depends(get_db)):
     """Human approval: Atomically unblock case and trigger execution."""
-    stmt = (
+    reviewer_id = payload.reviewer_id or "reviewer"
+    decision_id = payload.decision_id
+
+    query = (
         update(models.RecoveryCase)
         .where(models.RecoveryCase.id == case_id)
         .where(models.RecoveryCase.status == CaseStatus.AWAITING_APPROVAL)
         .where(models.RecoveryCase.approval_status == models.ApprovalStatus.PENDING)
-        .where(models.RecoveryCase.approved_decision_hash == payload.decision_hash)
-        .values(
-            approval_status=models.ApprovalStatus.APPROVED,
-            approved_at=func.now(),
-            approved_by=(payload.reviewer_id or payload.decision_id or "human_reviewer")
+        .where(
+            (models.RecoveryCase.pending_decision_hash == payload.decision_hash) |
+            (models.RecoveryCase.approved_decision_hash == payload.decision_hash)
         )
-        .returning(models.RecoveryCase.id)
     )
+    if decision_id:
+        query = query.where(
+            (models.RecoveryCase.pending_decision_id == decision_id) |
+            (models.RecoveryCase.approved_decision_id == decision_id) |
+            (models.RecoveryCase.pending_decision_id.is_(None))
+        )
+
+    stmt = query.values(
+        approval_status=models.ApprovalStatus.APPROVED,
+        approved_decision_id=decision_id or models.RecoveryCase.pending_decision_id,
+        approved_decision_hash=payload.decision_hash,
+        approved_at=func.now(),
+        approved_by=reviewer_id
+    ).returning(models.RecoveryCase.id)
+
     result = db.execute(stmt)
     updated_id = result.scalar()
     
@@ -1012,7 +1030,10 @@ def reject_escalated_case(case_id: str, payload: schemas.DecisionApprovalRequest
         .where(models.RecoveryCase.id == case_id)
         .where(models.RecoveryCase.status == CaseStatus.AWAITING_APPROVAL)
         .where(models.RecoveryCase.approval_status == models.ApprovalStatus.PENDING)
-        .where(models.RecoveryCase.approved_decision_hash == payload.decision_hash)
+        .where(
+            (models.RecoveryCase.pending_decision_hash == payload.decision_hash) |
+            (models.RecoveryCase.approved_decision_hash == payload.decision_hash)
+        )
         .values(
             approval_status=models.ApprovalStatus.REJECTED,
             status=CaseStatus.IN_PROGRESS

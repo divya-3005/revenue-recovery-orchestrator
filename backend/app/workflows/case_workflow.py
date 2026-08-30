@@ -241,9 +241,9 @@ async def inner_process_case_workflow(ctx, step):
                         db_sess.query(RecoveryCase).filter(RecoveryCase.id == c_id).update({
                             "pending_decision_json": json.loads(decision_json),
                             "pending_diagnosis_json": diag.model_dump(mode='json'),
+                            "pending_decision_id": dec.decision_id,
+                            "pending_decision_hash": decision_hash,
                             "approval_status": ApprovalStatus.PENDING.value,
-                            "approved_decision_id": dec.decision_id,
-                            "approved_decision_hash": decision_hash,
                             "status": CaseStatus.AWAITING_APPROVAL.value
                         })
                         
@@ -363,7 +363,17 @@ async def execute_approved_action(ctx: Context, step: Step) -> dict:
     if not case_domain.pending_decision_json:
         return {"status": "error", "reason": "No pending decision found"}
 
+    from app.models import ApprovalStatus
+    if case_domain.approval_status != ApprovalStatus.APPROVED.value:
+        return {"status": "error", "reason": f"Execution rejected: approval_status is '{case_domain.approval_status}', expected APPROVED"}
+
     decision = DecisionResult.model_validate(case_domain.pending_decision_json)
+
+    if case_domain.approved_decision_id and decision.decision_id and case_domain.approved_decision_id != decision.decision_id:
+        return {"status": "error", "reason": f"Execution rejected: decision_id '{decision.decision_id}' does not match approved_decision_id '{case_domain.approved_decision_id}'"}
+
+    if case_domain.approved_decision_hash and case_domain.approved_decision_hash != decision.canonical_hash():
+        return {"status": "error", "reason": "Execution rejected: decision_hash does not match approved_decision_hash"}
     
     approved_decision = PolicyApprovedDecision(
         decision=decision,

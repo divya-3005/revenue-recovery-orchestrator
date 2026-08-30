@@ -71,6 +71,8 @@ class RecoveryCase(Base):
     # Pending AI State (Feature 15)
     pending_decision_json = Column(JsonType, nullable=True)
     pending_diagnosis_json = Column(JsonType, nullable=True)
+    pending_decision_id = Column(String(255), nullable=True)
+    pending_decision_hash = Column(String(255), nullable=True)
 
     # Human Approval Gate (P0 Fix)
     approval_status = Column(Enum(ApprovalStatus), nullable=False, default=ApprovalStatus.NOT_REQUIRED)
