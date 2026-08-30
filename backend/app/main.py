@@ -91,8 +91,23 @@ def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amo
     if amount_paise <= 0:
         raise HTTPException(status_code=400, detail="INVALID_PAYMENT_AMOUNT")
 
-    # 1. Atomic Upsert for Idempotency
-    # For SQLite tests we use a simpler strategy but for Postgres this is the production mechanism
+    # 1. Case retrieval & State Validation with row-level lock BEFORE payment insert
+    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).with_for_update().first()
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+
+    if case.status not in (CaseStatus.PAYMENT_PENDING, CaseStatus.PARTIALLY_RECOVERED):
+        raise HTTPException(status_code=409, detail="CASE_NOT_AWAITING_PAYMENT")
+
+    outstanding = case.amount_paise - case.recovered_amount_paise
+    if amount_paise > outstanding:
+        # Overpayment quarantine
+        case.status = CaseStatus.ESCALATED
+        db.commit()
+        return {"status": "escalated", "reason": "overpayment"}
+
+    # 2. Atomic Upsert for Idempotency
+    now = datetime.now(timezone.utc)
     if db.bind.dialect.name == "sqlite":
         # SQLite fallback for tests
         existing_conf = db.query(models.PaymentConfirmation).filter(models.PaymentConfirmation.payment_id == payment_id).first()
@@ -100,10 +115,17 @@ def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amo
             if existing_conf.case_id != case_id:
                 raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
             return {"status": "idempotent", "reason": "payment_already_processed"}
+        conf = models.PaymentConfirmation(
+            payment_id=payment_id,
+            case_id=case_id,
+            amount_paise=amount_paise,
+            source=source,
+            confirmed_at=now
+        )
+        db.add(conf)
     else:
         # Postgres Production Path
         from sqlalchemy.dialects.postgresql import insert as pg_insert
-        now = datetime.now(timezone.utc)
         stmt = pg_insert(models.PaymentConfirmation).values(
             payment_id=payment_id,
             case_id=case_id,
@@ -125,38 +147,7 @@ def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amo
                 raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
             return {"status": "idempotent", "reason": "payment_already_processed"}
 
-    # 2. Case retrieval & State Validation with row-level lock
-    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).with_for_update().first()
-    if not case:
-        # If we reached here on Postgres, we inserted a payment for a missing case.
-        # This shouldn't happen due to FK constraints, but handle defensively.
-        db.rollback()
-        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-
-    if case.status not in (CaseStatus.PAYMENT_PENDING, CaseStatus.PARTIALLY_RECOVERED):
-        db.rollback()
-        raise HTTPException(status_code=409, detail="CASE_NOT_AWAITING_PAYMENT")
-
-    outstanding = case.amount_paise - case.recovered_amount_paise
-    if amount_paise > outstanding:
-        # Overpayment quarantine
-        case.status = CaseStatus.ESCALATED
-        db.commit()
-        return {"status": "escalated", "reason": "overpayment"}
-
-    # 3. SQLite explicit insert (since Postgres uses pg_insert above)
-    now = datetime.now(timezone.utc)
-    if db.bind.dialect.name == "sqlite":
-        conf = models.PaymentConfirmation(
-            payment_id=payment_id,
-            case_id=case_id,
-            amount_paise=amount_paise,
-            source=source,
-            confirmed_at=now
-        )
-        db.add(conf)
-
-    # 4. Update Case
+    # 3. Update Case
     case.recovered_amount_paise += amount_paise
     case.payment_confirmed_at = now
     
@@ -705,17 +696,19 @@ def _simulate_batch_pipeline(case_ids: List[str]):
         db.close()
 
 def _generate_synthetic_cases():
-    """Generate 50 synthetic cases with realistic distribution and customer contact details."""
+    """Generate 50 synthetic cases with deterministic distribution and customer contact details."""
     cases = []
 
     # 15 subscription failures — soft declines (retryable)
     soft_reasons = ["insufficient_funds", "bank_network_timeout", "card_limit_exceeded",
                     "processing_error", "temporary_hold"]
+    soft_amounts = [9900, 29900, 49900, 99900, 199900]
+    soft_rails = ["card", "upi", "enach"]
     for i in range(15):
-        amount = random.choice([9900, 29900, 49900, 99900, 199900])
+        amount = soft_amounts[i % len(soft_amounts)]
         cust_id = f"cust_batch_{i:03d}"
         payload = {
-            "reason": random.choice(soft_reasons),
+            "reason": soft_reasons[i % len(soft_reasons)],
             "email": f"{cust_id}@example.com",
             "contact": f"+9198765{i:05d}"
         }
@@ -726,18 +719,19 @@ def _generate_synthetic_cases():
             "customer_id": cust_id,
             "customer_email": f"{cust_id}@example.com",
             "customer_phone": f"+9198765{i:05d}",
-            "payment_rail": random.choice(["card", "upi", "enach"]),
+            "payment_rail": soft_rails[i % len(soft_rails)],
             "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
             "raw_signal_payload": payload
         })
 
     # 8 subscription failures — hard declines (should NOT be retried)
     hard_reasons = ["lost_card_reported", "stolen_card", "account_closed", "fraud_suspected"]
+    hard_amounts = [9900, 29900, 49900]
     for i in range(8):
-        amount = random.choice([9900, 29900, 49900])
+        amount = hard_amounts[i % len(hard_amounts)]
         cust_id = f"cust_batch_{15 + i:03d}"
         payload = {
-            "reason": random.choice(hard_reasons),
+            "reason": hard_reasons[i % len(hard_reasons)],
             "email": f"{cust_id}@example.com",
             "contact": f"+9198765{15 + i:05d}"
         }
@@ -754,14 +748,16 @@ def _generate_synthetic_cases():
         })
 
     # 12 checkout abandoned — friction signals
+    cart_amounts = [19900, 49900, 99900, 249900, 499900]
+    cart_rails = ["card", "upi"]
     for i in range(12):
-        amount = random.choice([19900, 49900, 99900, 249900, 499900])
-        abandoned_hour = random.randint(0, 23)
+        amount = cart_amounts[i % len(cart_amounts)]
+        abandoned_hour = (i * 7) % 24
         cust_id = f"cust_batch_{23 + i:03d}"
         payload = {
-            "cart_items": random.randint(1, 5),
-            "time_on_page_sec": random.randint(30, 300),
-            "is_repeat_customer": random.choice([True, False]),
+            "cart_items": 1 + (i % 5),
+            "time_on_page_sec": 30 + (i * 25) % 270,
+            "is_repeat_customer": (i % 2 == 0),
             "abandoned_hour": abandoned_hour,
             "time_of_day": "night" if abandoned_hour in [22, 23, 0, 1, 2, 3, 4, 5] else "day",
             "email": f"{cust_id}@example.com",
@@ -774,14 +770,15 @@ def _generate_synthetic_cases():
             "customer_id": cust_id,
             "customer_email": f"{cust_id}@example.com",
             "customer_phone": f"+9198765{23 + i:05d}",
-            "payment_rail": random.choice(["card", "upi"]),
+            "payment_rail": cart_rails[i % len(cart_rails)],
             "priority_score": compute_priority_score(CaseType.CHECKOUT_ABANDONED, amount, payload),
             "raw_signal_payload": payload
         })
 
     # 10 invoice overdue — missed payments & cash-flow delay / disputes
+    inv_amounts = [100000, 250000, 500000, 1000000, 2500000]
     for i in range(10):
-        amount = random.choice([100000, 250000, 500000, 1000000, 2500000])
+        amount = inv_amounts[i % len(inv_amounts)]
         cust_id = f"cust_batch_{35 + i:03d}"
         # Synthetic payment history: half are good past payers with cash-flow delay
         has_good_history = (i % 2 == 0)
@@ -792,7 +789,7 @@ def _generate_synthetic_cases():
             "history_classification": "cash_flow_delay" if has_good_history else "simply_missed"
         }
         payload = {
-            "days_overdue": random.randint(3, 30),
+            "days_overdue": 3 + (i * 3) % 28,
             "invoice_number": f"INV-{1000 + i}",
             "payment_history": payment_history,
             "email": f"{cust_id}@example.com",
@@ -811,8 +808,9 @@ def _generate_synthetic_cases():
         })
 
     # 5 high-value cases (trigger human approval policy)
+    high_amounts = [5500000, 7000000, 10000000]
     for i in range(5):
-        amount = random.choice([5500000, 7000000, 10000000])
+        amount = high_amounts[i % len(high_amounts)]
         cust_id = f"cust_batch_{45 + i:03d}"
         payload = {
             "reason": "insufficient_funds",
@@ -961,33 +959,27 @@ def get_policy():
 @app.post("/api/v1/cases/{case_id}/approve")
 def approve_escalated_case(case_id: str, payload: schemas.DecisionApprovalRequest, db: Session = Depends(get_db)):
     """Human approval: Atomically unblock case and trigger execution."""
-    reviewer_id = payload.reviewer_id or "reviewer"
-    decision_id = payload.decision_id
+    if not payload.reviewer_id:
+        raise HTTPException(status_code=400, detail="reviewer_id is required")
+    if not payload.decision_id:
+        raise HTTPException(status_code=400, detail="decision_id is required")
 
-    query = (
+    stmt = (
         update(models.RecoveryCase)
         .where(models.RecoveryCase.id == case_id)
         .where(models.RecoveryCase.status == CaseStatus.AWAITING_APPROVAL)
         .where(models.RecoveryCase.approval_status == models.ApprovalStatus.PENDING)
-        .where(
-            (models.RecoveryCase.pending_decision_hash == payload.decision_hash) |
-            (models.RecoveryCase.approved_decision_hash == payload.decision_hash)
+        .where(models.RecoveryCase.pending_decision_id == payload.decision_id)
+        .where(models.RecoveryCase.pending_decision_hash == payload.decision_hash)
+        .values(
+            approval_status=models.ApprovalStatus.APPROVED,
+            approved_decision_id=payload.decision_id,
+            approved_decision_hash=payload.decision_hash,
+            approved_at=func.now(),
+            approved_by=payload.reviewer_id
         )
+        .returning(models.RecoveryCase.id)
     )
-    if decision_id:
-        query = query.where(
-            (models.RecoveryCase.pending_decision_id == decision_id) |
-            (models.RecoveryCase.approved_decision_id == decision_id) |
-            (models.RecoveryCase.pending_decision_id.is_(None))
-        )
-
-    stmt = query.values(
-        approval_status=models.ApprovalStatus.APPROVED,
-        approved_decision_id=decision_id or models.RecoveryCase.pending_decision_id,
-        approved_decision_hash=payload.decision_hash,
-        approved_at=func.now(),
-        approved_by=reviewer_id
-    ).returning(models.RecoveryCase.id)
 
     result = db.execute(stmt)
     updated_id = result.scalar()

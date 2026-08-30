@@ -564,14 +564,23 @@ async def test_approve_concurrency_and_execution():
             )
             valid_hash = dec.canonical_hash()
 
-            # Update the mock DB case with the canonical hash
-            db_case.approved_decision_hash = valid_hash
+            # Update the mock DB case with the canonical ID and hash
+            db_case.pending_decision_id = dec.decision_id
+            db_case.pending_decision_hash = valid_hash
             db.commit()
 
-            response1 = client.post(f"/api/v1/cases/{case_id}/approve", json={"decision_hash": valid_hash})
+            response1 = client.post(f"/api/v1/cases/{case_id}/approve", json={
+                "decision_id": dec.decision_id,
+                "decision_hash": valid_hash,
+                "reviewer_id": "reviewer_admin_01"
+            })
             assert response1.status_code == 200
             
-            response2 = client.post(f"/api/v1/cases/{case_id}/approve", json={"decision_hash": valid_hash})
+            response2 = client.post(f"/api/v1/cases/{case_id}/approve", json={
+                "decision_id": dec.decision_id,
+                "decision_hash": valid_hash,
+                "reviewer_id": "reviewer_admin_01"
+            })
             assert response2.status_code == 409 # Already claimed/approved and no longer valid
 
             # Verify execute event triggered
