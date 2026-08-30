@@ -143,6 +143,17 @@ class RazorpayExecutor(ActionExecutor):
                 }
             }
 
+            # Set Razorpay notify field for actual channel dispatch
+            if action == RecoveryActionType.SEND_REMINDER:
+                channel = approved_decision.decision.action_parameters.get("channel", "email")
+                if channel == "sms":
+                    link_data["notify"] = {"sms": 1, "email": 0}
+                else:  # email (default)
+                    link_data["notify"] = {"email": 1, "sms": 0}
+            elif action == RecoveryActionType.OFFER_DISCOUNT:
+                # Discounts always notified via email so customer sees the offer details
+                link_data["notify"] = {"email": 1, "sms": 0}
+
             # SDK call: payment_link.create(data) — no headers kwarg
             payment_link = self.client.payment_link.create(data=link_data)
 

@@ -18,6 +18,8 @@ class RecoveryCaseResponse(RecoveryCaseBase):
     id: str
     status: CaseStatus
     priority_score: int
+    retry_count: int
+    cumulative_discount_paise: int
     created_at: datetime
     updated_at: datetime
 

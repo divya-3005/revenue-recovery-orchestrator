@@ -11,6 +11,8 @@ class PolicyConfig:
     REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE: int = 5000000 
     BLOCK_HARD_DECLINES: bool = True
     MIN_CONFIDENCE_SCORE: float = 0.7
+    # RBI mandate: eNACH/NACH charges require minimum 3 business-day (72h) pre-debit notification
+    MIN_ENACH_DELAY_HOURS: int = 72
 
 def _generate_idempotency_key(case: RecoveryCaseContext, decision: DecisionResult) -> str:
     """Generates a deterministic idempotency key for the approved action."""
@@ -73,5 +75,15 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
             f"Action blocked: AI confidence too low (Decision: {decision.confidence_score}, Diagnosis: {diagnosis.confidence_score}). Escalating to human.", 
             requires_human_approval=True
         )
+
+    # Rule 7: RBI pre-debit notice — eNACH/NACH mandates require min 72h notice before charge
+    if proposed_action == RecoveryActionType.RETRY_CHARGE:
+        if case.payment_rail in ("enach", "nach", "mandate"):
+            delay_hours = proposed_parameters.get("delay_hours", 0)
+            if delay_hours < PolicyConfig.MIN_ENACH_DELAY_HOURS:
+                return reject(
+                    f"Action blocked: RBI mandate regulations require a minimum {PolicyConfig.MIN_ENACH_DELAY_HOURS}h "
+                    f"pre-debit notification for eNACH/NACH charges. Proposed delay: {delay_hours}h."
+                )
 
     return approve("Action allowed by policy.")

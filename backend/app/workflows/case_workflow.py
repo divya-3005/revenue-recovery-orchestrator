@@ -109,6 +109,24 @@ async def inner_process_case_workflow(ctx, step):
         case_dict = await step.run(f"load_case_{attempt}", _load_case)
         case_domain = RecoveryCaseContext.model_validate(case_dict)
 
+        # Stopping Rule A: Max 30-day pursuit window
+        if case_domain.created_at:
+            from datetime import datetime, timezone
+            days_pursued = (datetime.now(timezone.utc) - case_domain.created_at.replace(tzinfo=timezone.utc if case_domain.created_at.tzinfo is None else case_domain.created_at.tzinfo)).days
+            if days_pursued > 30:
+                updated = await step.run(f"max_days_stop_{attempt}", lambda: _set_status(CaseStatus.CLOSED))
+                if not updated:
+                    return {"status": "skipped", "reason": "Case already in terminal state"}
+                return {"status": "closed", "reason": f"Max pursuit period (30 days) exceeded after {days_pursued} days."}
+
+        # Stopping Rule B: Customer opt-out
+        payload = case_domain.raw_signal_payload or {}
+        if payload.get("customer_opted_out") or payload.get("opt_out"):
+            updated = await step.run(f"opt_out_stop_{attempt}", lambda: _set_status(CaseStatus.CLOSED))
+            if not updated:
+                return {"status": "skipped", "reason": "Case already in terminal state"}
+            return {"status": "closed", "reason": "Customer has opted out of recovery communications."}
+
         # 2. Diagnose
         def _diagnose(case=case_domain):
             return run_diagnosis_step(case, _get_provider()).model_dump()

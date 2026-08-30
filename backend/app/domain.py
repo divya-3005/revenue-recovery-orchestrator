@@ -1,5 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Dict, Optional
+from datetime import datetime
 import enum
 from app.models import CaseType, CaseStatus
 
@@ -31,11 +32,12 @@ class RecoveryCaseContext(BaseModel):
     payment_rail: str | None = None
     priority_score: int = 0
     raw_signal_payload: Dict[str, Any]
-    
+    created_at: Optional[datetime] = None
+
     # Execution State
     retry_count: int
     cumulative_discount_paise: int
-    
+
     # We allow ORM mapping so we can easily convert from SQLAlchemy models
     model_config = ConfigDict(from_attributes=True)
 

@@ -464,6 +464,8 @@ def get_analytics(db: Session = Depends(get_db)):
     total_at_risk = sum(c.amount_paise for c in cases)
     recovered_cases = [c for c in cases if c.status == CaseStatus.RECOVERED]
     recovered_amount = sum(c.amount_paise for c in recovered_cases)
+    total_discount_cost = sum(c.cumulative_discount_paise for c in cases)
+    net_recovered_paise = max(0, recovered_amount - total_discount_cost)
 
     # Breakdown by case type
     by_type = {}
@@ -494,7 +496,10 @@ def get_analytics(db: Session = Depends(get_db)):
         "total_cases": len(cases),
         "total_at_risk_paise": total_at_risk,
         "total_recovered_paise": recovered_amount,
+        "total_discount_cost_paise": total_discount_cost,
+        "net_recovered_paise": net_recovered_paise,
         "recovery_rate_percent": round(recovered_amount / total_at_risk * 100, 2) if total_at_risk > 0 else 0.0,
+        "net_recovery_rate_percent": round(net_recovered_paise / total_at_risk * 100, 2) if total_at_risk > 0 else 0.0,
         "breakdown_by_case_type": by_type,
         "breakdown_by_status": by_status,
         "exceptions": exceptions,
@@ -511,3 +516,32 @@ def get_policy():
         require_human_approval_above_paise=PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE,
         block_hard_declines=PolicyConfig.BLOCK_HARD_DECLINES
     )
+
+
+# ── Human Approval Gate (Feature 15) ─────────────────────────────────────
+
+@app.post("/api/v1/cases/{case_id}/approve")
+def approve_escalated_case(case_id: str, db: Session = Depends(get_db)):
+    """Human approval: re-queue an escalated case for processing."""
+    existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+    if existing.status != CaseStatus.ESCALATED:
+        raise HTTPException(status_code=400, detail=f"Case is not in ESCALATED status (current: {existing.status.value})")
+
+    existing.status = CaseStatus.OPEN
+    audit_log = models.AuditLog(
+        case_id=case_id,
+        action_type="HUMAN_APPROVED",
+        description="Case manually approved by human reviewer for re-processing",
+        reasoning="Human override: policy-escalated case approved. Returned to OPEN for next workflow cycle."
+    )
+    db.add(audit_log)
+    db.commit()
+
+    try:
+        inngest_client.send_sync(Event(name="case.received", data={"case_id": case_id}))
+    except Exception as e:
+        logger.warning(f"Inngest dispatch failed for approved case {case_id}: {e}")
+
+    return {"status": "approved", "case_id": case_id}
