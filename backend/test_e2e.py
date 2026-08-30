@@ -765,3 +765,95 @@ async def test_ptp_partially_recovered_resolves_workflow():
     assert "Case resolved during promise-to-pay window" in result["reason"]
 
 
+def test_receive_checkout_beacon_endpoint():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+    from datetime import datetime, timezone, timedelta
+    past_time = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    session_id = f"sess_beacon_test_{random.randint(10000, 99999)}"
+
+    payload = {
+        "session_id": session_id,
+        "amount_paise": 49900,
+        "currency": "INR",
+        "customer_id": "cust_beacon_1",
+        "customer_email": "beacon_user@example.com",
+        "customer_phone": "+919876543210",
+        "cart_items": 3,
+        "last_interaction_at": past_time
+    }
+
+    # 1. First beacon call creates the case
+    res1 = client.post("/api/v1/cases/beacon", json=payload)
+    assert res1.status_code == 200
+    assert res1.json()["status"] == "created"
+    case_id = res1.json()["case_id"]
+
+    # 2. Repeated beacon call with same session_id returns idempotent status
+    res2 = client.post("/api/v1/cases/beacon", json=payload)
+    assert res2.status_code == 200
+    assert res2.json()["status"] == "idempotent"
+    assert res2.json()["case_id"] == case_id
+
+    # 3. Verify case in DB has all fields populated including contact details and opted_out default
+    db = SessionLocal()
+    try:
+        case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+        assert case is not None
+        assert case.customer_email == "beacon_user@example.com"
+        assert case.customer_phone == "+919876543210"
+        assert case.session_id == session_id
+        assert case.opted_out is False
+    finally:
+        db.close()
+
+
+def test_postgres_live_schema_smoke(monkeypatch):
+    """
+    If a real PostgreSQL instance is configured in DATABASE_URL,
+    verify that creating a RecoveryCase directly via SQLAlchemy succeeds
+    without UndefinedColumn error.
+    """
+    import os
+    pg_url = os.getenv("DATABASE_URL")
+    if not pg_url or "postgresql" not in pg_url:
+        pytest.skip("PostgreSQL live schema test requires PostgreSQL DATABASE_URL")
+
+    try:
+        engine = create_engine(pg_url)
+        with engine.connect() as conn:
+            pass
+    except Exception as e:
+        pytest.skip(f"PostgreSQL unreachable: {e}")
+
+    # Run alembic upgrade head to ensure all migrations are applied
+    from alembic.config import Config
+    from alembic import command
+    alembic_cfg = Config("alembic.ini")
+    command.upgrade(alembic_cfg, "head")
+
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        case_id = f"smoke_{random.randint(10000, 99999)}"
+        case = models.RecoveryCase(
+            id=case_id,
+            case_type=CaseType.CHECKOUT_ABANDONED,
+            amount_paise=50000,
+            currency="INR",
+            customer_id="cust_smoke",
+            customer_email="smoke@example.com",
+            customer_phone="+919876543210",
+            raw_signal_payload={"cart_items": 1},
+        )
+        session.add(case)
+        session.commit()
+        session.refresh(case)
+        assert case.id == case_id
+        assert case.opted_out is False
+    finally:
+        session.close()
+
+
+

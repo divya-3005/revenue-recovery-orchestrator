@@ -23,13 +23,18 @@ def set_test_env_vars(monkeypatch):
 @pytest.fixture(autouse=True)
 def setup_test_db(monkeypatch):
     """Replace PostgreSQL with SQLite in memory for tests."""
-    # Default to SQLite in-memory unless explicit TEST_DATABASE_URL or sqlite DATABASE_URL is set
-    TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+    # Use explicit TEST_DATABASE_URL or DATABASE_URL if available
+    TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL") or os.getenv("DATABASE_URL")
     if not TEST_DATABASE_URL:
-        db_env = os.getenv("DATABASE_URL", "")
-        if "sqlite" in db_env:
-            TEST_DATABASE_URL = db_env
-        else:
+        TEST_DATABASE_URL = "sqlite://"
+    elif "postgresql" in TEST_DATABASE_URL:
+        # Check if Postgres is reachable; if not, fallback to sqlite
+        try:
+            probe_engine = create_engine(TEST_DATABASE_URL)
+            with probe_engine.connect() as conn:
+                pass
+            probe_engine.dispose()
+        except Exception:
             TEST_DATABASE_URL = "sqlite://"
 
     if "sqlite" in TEST_DATABASE_URL:

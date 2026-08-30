@@ -283,6 +283,7 @@ def receive_checkout_beacon(body: schemas.CheckoutBeaconRequest, db: Session = D
     )
 
     stmt = pg_insert(models.RecoveryCase).values(
+        id=models.generate_uuid(),
         case_type=CaseType.CHECKOUT_ABANDONED,
         amount_paise=body.amount_paise,
         currency=body.currency,
@@ -297,7 +298,10 @@ def receive_checkout_beacon(body: schemas.CheckoutBeaconRequest, db: Session = D
             "customer_email": body.customer_email or f"{body.customer_id}@example.com",
             "customer_phone": body.customer_phone
         }
-    ).on_conflict_do_nothing(index_elements=['session_id'])
+    ).on_conflict_do_nothing(
+        index_elements=['session_id'],
+        index_where=models.RecoveryCase.session_id.isnot(None)
+    ).returning(models.RecoveryCase.id)
     
     result = db.execute(stmt)
     inserted_id = result.scalar()
