@@ -196,7 +196,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         raise HTTPException(status_code=400, detail="Invalid JSON")
         
     event_type = payload.get("event")
-    if event_type not in ("payment.failed", "subscription.pending", "payment_link.paid", "payment.captured"):
+    if event_type not in ("payment.failed", "subscription.pending", "payment_link.expired", "payment_link.paid", "payment.captured"):
         return {"status": "ignored", "reason": "unhandled_event_type"}
         
     event_id = payload.get("id", "unknown_event_id")
@@ -215,7 +215,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         return _apply_payment_confirmed(db, case_id, event_type)
     
     priority_score = 0
-    # Map payload to case fields for payment.failed and subscription.pending
+    # Map payload to case fields
     if event_type == "payment.failed":
         case_type = CaseType.SUBSCRIPTION_FAILED
         payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
@@ -232,6 +232,22 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         customer_id = sub.get("customer_id") or "unknown"
         payment_rail = None
         priority_score = compute_priority_score(case_type, amount_paise, {})
+    elif event_type == "payment_link.expired":
+        # Feature 1: invoice / payment link past due — Razorpay fires this when a link expires unpaid.
+        case_type = CaseType.INVOICE_OVERDUE
+        link = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+        amount_paise = link.get("amount", 0)
+        currency = link.get("currency", "INR")
+        customer_id = (
+            link.get("customer", {}).get("id")
+            or link.get("customer", {}).get("email")
+            or "unknown"
+        )
+        payment_rail = None
+        priority_score = compute_priority_score(
+            case_type, amount_paise,
+            {"days_overdue": 0, "invoice_number": link.get("reference_id", "")}
+        )
         
     if amount_paise <= 0:
         return {"status": "ignored", "reason": "invalid_amount"}

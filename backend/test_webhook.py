@@ -223,3 +223,54 @@ def test_webhook_zero_amount_ignored(client, mock_webhook_secret, mock_inngest_c
     
     assert response.status_code == 200
     assert response.json() == {"status": "ignored", "reason": "invalid_amount"}
+
+
+def test_payment_link_expired_creates_invoice_overdue_case(client, mock_webhook_secret, mock_inngest_client):
+    """payment_link.expired webhook should create an INVOICE_OVERDUE recovery case."""
+    from app.models import RecoveryCase
+    from app.models import CaseType
+    from app.database import SessionLocal
+
+    event_id = "evt_link_expired_001"
+    payload = {
+        "event": "payment_link.expired",
+        "id": event_id,
+        "payload": {
+            "payment_link": {
+                "entity": {
+                    "id": "plink_test001",
+                    "amount": 250000,
+                    "currency": "INR",
+                    "reference_id": "INV-2001",
+                    "customer": {
+                        "id": "cust_inv_001",
+                        "email": "merchant@example.com"
+                    }
+                }
+            }
+        }
+    }
+
+    signature = generate_signature(mock_webhook_secret, payload)
+
+    response = client.post(
+        "/webhooks/razorpay",
+        content=json.dumps(payload),
+        headers={"X-Razorpay-Signature": signature}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "created"
+
+    db = SessionLocal()
+    try:
+        case = db.query(RecoveryCase).filter(RecoveryCase.id == data["case_id"]).first()
+        assert case is not None
+        assert case.case_type == CaseType.INVOICE_OVERDUE
+        assert case.amount_paise == 250000
+        assert case.customer_id == "cust_inv_001"
+        assert case.razorpay_event_id == event_id
+    finally:
+        db.close()
+
