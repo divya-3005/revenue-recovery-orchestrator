@@ -56,9 +56,9 @@ def run_policy_step(case: RecoveryCaseContext, decision: DecisionResult, diagnos
     return policy_eval
 
 
-def run_communication_step(case: RecoveryCaseContext, diagnosis: DiagnosisResult, attempt_number: int) -> str:
+def run_communication_step(case: RecoveryCaseContext, diagnosis: DiagnosisResult, attempt_number: int, channel: str = "email") -> str:
     """Generate customer message → checkpoint."""
-    message = generate_message(case, diagnosis, attempt_number)
+    message = generate_message(case, diagnosis, attempt_number, channel)
     db = SessionLocal()
     try:
         record_communication_checkpoint(db, case, message)

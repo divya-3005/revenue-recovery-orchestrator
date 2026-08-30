@@ -20,7 +20,7 @@ import hashlib
 import os
 import json
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Header
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import update
@@ -34,7 +34,7 @@ from app.models import CaseType, CaseStatus
 from app.database import get_db
 from app.policy import PolicyConfig
 from app.inngest_client import inngest_client
-from app.workflows.case_workflow import process_case_workflow
+from app.workflows.case_workflow import process_case_workflow, execute_approved_action
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -63,7 +63,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-inngest.fast_api.serve(app, inngest_client, [process_case_workflow])
+inngest.fast_api.serve(app, inngest_client, [process_case_workflow, execute_approved_action])
 
 
 def compute_priority_score(case_type: CaseType, amount_paise: int, payload: dict) -> int:
@@ -83,34 +83,60 @@ def compute_priority_score(case_type: CaseType, amount_paise: int, payload: dict
     return int(amount_paise * 0.5)
 
 
-def _apply_payment_confirmed(db: Session, case_id: str, source: str) -> dict:
-    """Mark a case recovered only if it is still open. Never counts a payment-link create as recovered."""
-    existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
-    if not existing:
+def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amount_paise: int, source: str = "webhook") -> dict:
+    """Atomic, idempotent payment confirmation."""
+    # 1. Enforce Idempotency
+    existing_conf = db.query(models.PaymentConfirmation).filter(models.PaymentConfirmation.payment_id == payment_id).first()
+    if existing_conf:
+        return {"status": "idempotent", "reason": "payment_already_processed"}
+
+    # 2. Case retrieval
+    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+    if not case:
         raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
 
-    stmt = update(models.RecoveryCase).where(
-        models.RecoveryCase.id == case_id,
-        models.RecoveryCase.status.notin_([CaseStatus.RECOVERED, CaseStatus.FAILED, CaseStatus.CLOSED])
-    ).values(
-        status=CaseStatus.RECOVERED
-    ).returning(models.RecoveryCase.id)
+    if amount_paise <= 0:
+        return {"status": "ignored", "reason": "amount_zero_or_negative"}
 
-    result = db.execute(stmt)
-    updated_id = result.scalar()
+    outstanding = case.amount_paise - case.recovered_amount_paise
+    if amount_paise > outstanding:
+        # P0 rule: reject/quarantine for review
+        case.status = CaseStatus.ESCALATED
+        db.commit()
+        return {"status": "escalated", "reason": "overpayment"}
 
-    if not updated_id:
-        return {"status": "idempotent", "case_id": case_id}
+    # 3. Create PaymentConfirmation
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    conf = models.PaymentConfirmation(
+        payment_id=payment_id,
+        case_id=case_id,
+        amount_paise=amount_paise,
+        source=source,
+        confirmed_at=now
+    )
+    db.add(conf)
 
+    # 4. Update Case
+    case.recovered_amount_paise += amount_paise
+    case.payment_confirmed_at = now
+    
+    if case.recovered_amount_paise >= case.amount_paise:
+        case.status = CaseStatus.RECOVERED
+    else:
+        case.status = CaseStatus.PARTIALLY_RECOVERED
+
+    # 5. Write Audit Log
     audit_log = models.AuditLog(
         case_id=case_id,
         action_type="PAYMENT_CONFIRMED",
-        description=f"Payment confirmed via {source}",
-        reasoning="Recovered only after payment confirmation — creating a payment link does not count as recovered."
+        description=f"Payment {payment_id} confirmed via {source} for {amount_paise} paise",
+        reasoning=f"New status: {case.status.value}"
     )
     db.add(audit_log)
     db.commit()
-    return {"status": "recovered", "case_id": case_id}
+
+    return {"status": case.status.value, "case_id": case_id, "recovered": case.recovered_amount_paise}
 
 
 # ── Health ───────────────────────────────────────────────────────────────
@@ -127,7 +153,16 @@ def demo_confirm_payment(case_id: str, db: Session = Depends(get_db)):
     """Local demo only: mark a case as paid to test the AWAITING_PAYMENT -> RECOVERED transition."""
     if os.getenv("ENVIRONMENT") == "production":
         raise HTTPException(status_code=403, detail="Demo endpoint is disabled in production.")
-    return _apply_payment_confirmed(db, case_id, "demo_endpoint")
+    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    amount = case.amount_paise - case.recovered_amount_paise
+    if amount <= 0:
+        return {"status": "idempotent", "reason": "fully_recovered"}
+    # Generate fake payment_id
+    import uuid
+    payment_id = f"pay_demo_{uuid.uuid4().hex[:8]}"
+    return process_payment_confirmation(db, payment_id, case_id, amount, "demo_endpoint")
 
 
 # ── Case CRUD ────────────────────────────────────────────────────────────
@@ -148,12 +183,19 @@ def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_d
     )
 
     # Create the initial audit log atomically with the case
-    audit_log = models.AuditLog(
+    audit_log_1 = models.AuditLog(
         action_type="SIGNAL_RECEIVED",
         description=f"Case created for signal type: {case_in.case_type.value}",
         reasoning="Initial ingestion from external signal"
     )
-    db_case.audit_logs.append(audit_log)
+    db_case.audit_logs.append(audit_log_1)
+    
+    audit_log_2 = models.AuditLog(
+        action_type="SIGNAL_NORMALIZED",
+        description="Signal successfully normalized into Recovery Case format",
+        reasoning="Ready for AI recovery pipeline"
+    )
+    db_case.audit_logs.append(audit_log_2)
     db.add(db_case)
 
     # IMPORTANT: Commit the case FIRST, then fire the Inngest event.
@@ -261,23 +303,34 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         raise HTTPException(status_code=400, detail="Invalid JSON")
         
     event_type = payload.get("event")
-    if event_type not in ("payment.failed", "subscription.pending", "payment_link.expired", "payment_link.paid", "payment.captured"):
+    if event_type not in ("payment.failed", "subscription.pending", "payment_link.expired", "payment_link.paid", "payment.captured", "invoice.expired", "invoice.past_due", "invoice.paid"):
         return {"status": "ignored", "reason": "unhandled_event_type"}
         
     event_id = payload.get("id", "unknown_event_id")
     
     from sqlalchemy.dialects.postgresql import insert
     
-    if event_type in ("payment_link.paid", "payment.captured"):
+    if event_type in ("payment_link.paid", "payment.captured", "invoice.paid"):
         if event_type == "payment_link.paid":
-            case_id = payload.get("payload", {}).get("payment_link", {}).get("entity", {}).get("notes", {}).get("case_id")
+            entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+            case_id = entity.get("notes", {}).get("case_id")
+            payment_id = entity.get("id")
+            amount_paise = entity.get("amount_paid", 0)
+        elif event_type == "invoice.paid":
+            entity = payload.get("payload", {}).get("invoice", {}).get("entity", {})
+            case_id = entity.get("notes", {}).get("case_id")
+            payment_id = entity.get("payment_id") or entity.get("id")
+            amount_paise = entity.get("amount_paid", 0)
         else:
-            case_id = payload.get("payload", {}).get("payment", {}).get("entity", {}).get("notes", {}).get("case_id")
+            entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+            case_id = entity.get("notes", {}).get("case_id")
+            payment_id = entity.get("id")
+            amount_paise = entity.get("amount", 0)
             
-        if not case_id:
-            return {"status": "ignored", "reason": "missing_case_id"}
+        if not case_id or not payment_id:
+            return {"status": "ignored", "reason": "missing_case_id_or_payment_id"}
 
-        return _apply_payment_confirmed(db, case_id, event_type)
+        return process_payment_confirmation(db, payment_id, case_id, amount_paise, event_type)
     
     priority_score = 0
     # Map payload to case fields
@@ -297,10 +350,13 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
         customer_id = sub.get("customer_id") or "unknown"
         payment_rail = None
         priority_score = compute_priority_score(case_type, amount_paise, {})
-    elif event_type == "payment_link.expired":
+    elif event_type in ("payment_link.expired", "invoice.expired", "invoice.past_due"):
         # Feature 1: invoice / payment link past due — Razorpay fires this when a link expires unpaid.
         case_type = CaseType.INVOICE_OVERDUE
-        link = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+        if "payment_link" in payload.get("payload", {}):
+            link = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+        else:
+            link = payload.get("payload", {}).get("invoice", {}).get("entity", {})
         amount_paise = link.get("amount", 0)
         currency = link.get("currency", "INR")
         customer_id = (
@@ -403,9 +459,11 @@ def list_escalated_cases(db: Session = Depends(get_db)):
 # ── Batch Processing (Feature 11) ───────────────────────────────────────
 
 @app.post("/api/v1/batch")
-def run_batch(db: Session = Depends(get_db)):
+def run_batch(background_tasks: BackgroundTasks, simulate: bool = False, db: Session = Depends(get_db)):
     """Generate 50+ synthetic cases spanning all case types and process them."""
     synthetic = _generate_synthetic_cases()
+    # Bug 6 Fix: Sort synthetic cases by priority score descending to enforce UI queue ordering
+    synthetic.sort(key=lambda x: x.get("priority_score", 0), reverse=True)
     created_ids = []
 
     for case_data in synthetic:
@@ -430,14 +488,64 @@ def run_batch(db: Session = Depends(get_db)):
 
         # Fire workflow event
         try:
-            inngest_client.send_sync(Event(name="case.received", data={"case_id": db_case.id}))
+            if simulate:
+                pass # Event not sent to Inngest if simulating
+            else:
+                inngest_client.send_sync(Event(name="case.received", data={"case_id": db_case.id}))
         except Exception as e:
             logger.warning(f"Inngest dispatch failed for batch case {db_case.id}: {e}")
 
         created_ids.append(db_case.id)
 
+    if simulate:
+        background_tasks.add_task(_simulate_batch_pipeline, created_ids)
+
     return {"cases_created": len(created_ids), "case_ids": created_ids}
 
+def _simulate_batch_pipeline(case_ids: List[str]):
+    """Synchronously runs the core AI pipeline steps for demo purposes."""
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        from app.workflows.case_workflow import _step_diagnose, _step_decide, _step_policy, _step_execute, update_case_status
+        from app.domain import RecoveryCaseContext, ExecutionStatus
+        from app.models import RecoveryCase, CaseStatus
+        import random
+        from app.main import process_payment_confirmation
+        
+        for cid in case_ids:
+            try:
+                c = db.query(RecoveryCase).filter(RecoveryCase.id == cid).first()
+                if not c: continue
+                ctx = RecoveryCaseContext(
+                    id=c.id, case_type=c.case_type, amount_paise=c.amount_paise,
+                    currency=c.currency, customer_id=c.customer_id, payment_rail=c.payment_rail,
+                    status=c.status, priority_score=c.priority_score, raw_signal_payload=c.raw_signal_payload,
+                    retry_count=c.retry_count, cumulative_discount_paise=c.cumulative_discount_paise
+                )
+                diag = _step_diagnose(ctx)
+                if not diag: continue
+                dec = _step_decide(ctx, diag)
+                if not dec: continue
+                pol = _step_policy(ctx, dec)
+                if not pol.requires_human_approval and pol.approved_decision:
+                    exec_res = _step_execute(ctx, pol.approved_decision)
+                    if exec_res.status == ExecutionStatus.SUCCESS:
+                        update_case_status(db, c.id, CaseStatus.PAYMENT_PENDING)
+                        # Simulate the customer paying the generated link via the unified confirmation path
+                        if random.random() < 0.6:
+                            pay_id = f"pay_sim_{cid.replace('-', '')[:14]}"
+                            process_payment_confirmation(db, pay_id, c.id, c.amount_paise, "batch_simulation")
+                    else:
+                        update_case_status(db, c.id, CaseStatus.FAILED)
+                elif pol.requires_human_approval:
+                    c.status = CaseStatus.AWAITING_APPROVAL
+                    c.pending_decision_json = dec.model_dump()
+                    db.commit()
+            except Exception as e:
+                logger.error(f"Simulated batch error for {cid}: {e}")
+    finally:
+        db.close()
 
 def _generate_synthetic_cases():
     """Generate 50 synthetic cases with realistic distribution."""
@@ -543,10 +651,10 @@ def get_analytics(db: Session = Depends(get_db)):
         }
 
     total_at_risk = sum(c.amount_paise for c in cases)
-    recovered_cases = [c for c in cases if c.status == CaseStatus.RECOVERED]
-    recovered_amount = sum(c.amount_paise for c in recovered_cases)
+    recovered_amount = sum(c.recovered_amount_paise for c in cases)
     total_discount_cost = sum(c.cumulative_discount_paise for c in cases)
-    net_recovered_paise = max(0, recovered_amount - total_discount_cost)
+    total_comms_cost = sum(c.cumulative_comms_cost_paise for c in cases)
+    net_recovered_paise = max(0, recovered_amount - total_discount_cost - total_comms_cost)
 
     # Breakdown by case type
     by_type = {}
@@ -558,7 +666,7 @@ def get_analytics(db: Session = Depends(get_db)):
         by_type[t]["at_risk_paise"] += c.amount_paise
         if c.status == CaseStatus.RECOVERED:
             by_type[t]["recovered"] += 1
-            by_type[t]["recovered_paise"] += c.amount_paise
+        by_type[t]["recovered_paise"] += c.recovered_amount_paise
 
     # Breakdown by status
     by_status = {}
@@ -606,7 +714,7 @@ def get_analytics(db: Session = Depends(get_db)):
         by_channel[channel]["at_risk_paise"] += c.amount_paise
         if c.status == CaseStatus.RECOVERED:
             by_channel[channel]["recovered"] += 1
-            by_channel[channel]["recovered_paise"] += c.amount_paise
+        by_channel[channel]["recovered_paise"] += c.recovered_amount_paise
 
     # Exception list — cases that couldn't be recovered
     exceptions = [
@@ -620,6 +728,7 @@ def get_analytics(db: Session = Depends(get_db)):
         "total_at_risk_paise": total_at_risk,
         "total_recovered_paise": recovered_amount,
         "total_discount_cost_paise": total_discount_cost,
+        "total_comms_cost_paise": total_comms_cost,
         "net_recovered_paise": net_recovered_paise,
         "recovery_rate_percent": round(recovered_amount / total_at_risk * 100, 2) if total_at_risk > 0 else 0.0,
         "net_recovery_rate_percent": round(net_recovered_paise / total_at_risk * 100, 2) if total_at_risk > 0 else 0.0,
@@ -645,122 +754,70 @@ def get_policy():
 # ── Human Approval Gate (Feature 15) ─────────────────────────────────────
 
 @app.post("/api/v1/cases/{case_id}/approve")
-def approve_escalated_case(case_id: str, db: Session = Depends(get_db)):
-    """Human approval: execute pending action synchronously."""
-    # Atomic claim
+def approve_escalated_case(case_id: str, payload: schemas.DecisionApprovalRequest, db: Session = Depends(get_db)):
+    """Human approval: Atomically unblock case and trigger execution."""
     stmt = (
         update(models.RecoveryCase)
         .where(models.RecoveryCase.id == case_id)
-        .where(models.RecoveryCase.status == CaseStatus.ESCALATED)
-        .values(status=CaseStatus.IN_PROGRESS)
-        .returning(models.RecoveryCase)
+        .where(models.RecoveryCase.status == CaseStatus.AWAITING_APPROVAL)
+        .where(models.RecoveryCase.approval_status == models.ApprovalStatus.PENDING)
+        .where(models.RecoveryCase.approved_decision_hash == payload.decision_hash)
+        .values(
+            approval_status=models.ApprovalStatus.APPROVED,
+            approved_at=func.now(),
+            approved_by="human_reviewer"
+        )
+        .returning(models.RecoveryCase.id)
     )
     result = db.execute(stmt)
-    case_orm = result.scalar()
+    updated_id = result.scalar()
     
-    if not case_orm:
-        raise HTTPException(status_code=400, detail=f"Case {case_id} not found or not in ESCALATED status")
-    
-    # Require pending decision (Path A)
-    if not case_orm.pending_decision_json:
-        # Revert atomic claim
-        db.execute(update(models.RecoveryCase).where(models.RecoveryCase.id == case_id).values(status=CaseStatus.ESCALATED))
-        db.commit()
-        raise HTTPException(status_code=400, detail="Cannot approve case without a pending decision (use /close instead)")
-
-    # Execute synchronously
-    from app.domain import DecisionResult, PolicyApprovedDecision, RecoveryCaseContext, ExecutionStatus
-    from app.execution.executor import RazorpayExecutor
-    
-    try:
-        decision = DecisionResult.model_validate(case_orm.pending_decision_json)
-        approved_decision = PolicyApprovedDecision(
-            decision=decision,
-            policy_reason="Manually approved by human reviewer, bypassing policy constraints.",
-            idempotency_key=f"manual_approve_{case_id}_{decision.recommended_action.value}"
-        )
+    if not updated_id:
+        raise HTTPException(status_code=400, detail="Cannot approve case: not awaiting approval, already approved, or hash mismatch.")
         
-        context = RecoveryCaseContext(
-            id=case_orm.id,
-            case_type=case_orm.case_type,
-            amount_paise=case_orm.amount_paise,
-            currency=case_orm.currency,
-            customer_id=case_orm.customer_id,
-            payment_rail=case_orm.payment_rail,
-            status=case_orm.status,
-            priority_score=case_orm.priority_score,
-            raw_signal_payload=case_orm.raw_signal_payload,
-            retry_count=case_orm.retry_count,
-            cumulative_discount_paise=case_orm.cumulative_discount_paise
-        )
+    db.commit()
 
-        executor = RazorpayExecutor()
-        exec_result = executor.execute(context, approved_decision)
+    # Trigger execution workflow
+    inngest_client.send_sync(Event(name="case.execute_approved", data={"case_id": case_id}))
+    return {"status": "approved", "case_id": case_id}
 
-        new_status = CaseStatus.FAILED
-        if exec_result.status in [ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN]:
-            new_status = CaseStatus.AWAITING_PAYMENT
-            
-        case_orm.status = new_status
-        case_orm.pending_decision_json = None
-        case_orm.pending_diagnosis_json = None
-        
-        # Log execution
-        audit_log = models.AuditLog(
-            case_id=case_id,
-            action_type="ACTION_EXECUTED",
-            description=f"Executed manual approval: {decision.recommended_action.value}",
-            reasoning=f"Execution result: {exec_result.reason}. Parameters: {exec_result.action_parameters_used}"
-        )
-        db.add(audit_log)
-        db.commit()
 
-        if new_status == CaseStatus.AWAITING_PAYMENT:
-            inngest_client.send_sync(Event(name="case.monitor_payment", data={"case_id": case_id}))
-
-        return {"status": "approved", "execution_result": exec_result.model_dump(), "case_id": case_id}
-
-    except Exception as e:
-        logger.error(f"Execution failed during approve for case {case_id}: {e}")
-        # Revert status
-        db.execute(update(models.RecoveryCase).where(models.RecoveryCase.id == case_id).values(status=CaseStatus.ESCALATED))
-        audit_log = models.AuditLog(
-            case_id=case_id,
-            action_type="MANUAL_EXECUTION_FAILED",
-            description="Manual approval execution failed",
-            reasoning=f"Error: {str(e)}"
-        )
-        db.add(audit_log)
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"Execution failed: {e}")
-
-@app.post("/api/v1/cases/{case_id}/close")
-def close_escalated_case(case_id: str, db: Session = Depends(get_db)):
-    """Human closure of Path B escalation."""
-    # Atomic claim
+@app.post("/api/v1/cases/{case_id}/reject")
+def reject_escalated_case(case_id: str, payload: schemas.DecisionApprovalRequest, db: Session = Depends(get_db)):
+    """Human rejection: Atomically reject case and return to AI loop."""
     stmt = (
         update(models.RecoveryCase)
         .where(models.RecoveryCase.id == case_id)
-        .where(models.RecoveryCase.status == CaseStatus.ESCALATED)
-        .values(status=CaseStatus.CLOSED)
-        .returning(models.RecoveryCase)
+        .where(models.RecoveryCase.status == CaseStatus.AWAITING_APPROVAL)
+        .where(models.RecoveryCase.approval_status == models.ApprovalStatus.PENDING)
+        .where(models.RecoveryCase.approved_decision_hash == payload.decision_hash)
+        .values(
+            approval_status=models.ApprovalStatus.REJECTED,
+            status=CaseStatus.IN_PROGRESS
+        )
+        .returning(models.RecoveryCase.id)
     )
     result = db.execute(stmt)
-    case_orm = result.scalar()
+    updated_id = result.scalar()
     
-    if not case_orm:
-        raise HTTPException(status_code=400, detail=f"Case {case_id} not found or not in ESCALATED status")
+    if not updated_id:
+        raise HTTPException(status_code=400, detail="Cannot reject case: not awaiting approval, already processed, or hash mismatch.")
         
+    db.commit()
+
+    # Log rejection
     audit_log = models.AuditLog(
         case_id=case_id,
-        action_type="MANUAL_CLOSE",
-        description="Manual case closure by human reviewer",
-        reasoning="Reviewer determined no further action can be taken."
+        action_type="MANUAL_REJECT",
+        description="Human reviewer rejected AI proposed action",
+        reasoning="Returned to AI loop."
     )
     db.add(audit_log)
     db.commit()
 
-    return {"status": "closed", "case_id": case_id}
+    # Restart workflow
+    inngest_client.send_sync(Event(name="case.received", data={"case_id": case_id}))
+    return {"status": "rejected", "case_id": case_id}
 
 
 # ── Promise-to-Pay Capture (Feature 14) ─────────────────────────────────

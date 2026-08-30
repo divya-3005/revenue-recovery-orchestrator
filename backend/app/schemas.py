@@ -20,6 +20,11 @@ class RecoveryCaseResponse(RecoveryCaseBase):
     priority_score: int
     retry_count: int
     cumulative_discount_paise: int
+    cumulative_comms_cost_paise: int
+    latest_diagnosis_category: Optional[str] = None
+    latest_diagnosis_reasoning: Optional[str] = None
+    latest_action_recommended: Optional[str] = None
+    latest_comms_preview: Optional[str] = None
     promise_to_pay_date: Optional[date] = None
     pending_decision_json: Optional[Dict[str, Any]] = None
     pending_diagnosis_json: Optional[Dict[str, Any]] = None
@@ -33,6 +38,10 @@ class RecoveryCaseResponse(RecoveryCaseBase):
 class PromiseToPayRequest(BaseModel):
     date: date
     note: Optional[str] = None
+
+class DecisionApprovalRequest(BaseModel):
+    decision_hash: str
+
 
 class CheckoutBeaconRequest(BaseModel):
     session_id: str

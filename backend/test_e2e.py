@@ -323,7 +323,7 @@ async def test_e2e_communication():
         )).scalars().all()
         comms_logs = [l for l in logs if l.action_type == "COMMUNICATION_SENT"]
         assert len(comms_logs) == 1
-        assert "Funds issue." in comms_logs[0].reasoning  # the generated message
+        assert "insufficient funds" in comms_logs[0].reasoning  # the generated message
 
     finally:
         db.close()

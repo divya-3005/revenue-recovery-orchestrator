@@ -27,8 +27,10 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
     proposed_action = decision.recommended_action
     proposed_parameters = decision.action_parameters
 
+    rules = []
+
     def reject(reason: str, requires_human_approval: bool = False) -> PolicyEvaluationResult:
-        return PolicyEvaluationResult(allowed=False, reason=reason, approved_decision=None, requires_human_approval=requires_human_approval)
+        return PolicyEvaluationResult(allowed=False, reason=reason, approved_decision=None, requires_human_approval=requires_human_approval, rules=rules)
 
     def approve(reason: str) -> PolicyEvaluationResult:
         approved = PolicyApprovedDecision(
@@ -36,54 +38,71 @@ def evaluate_policy(case: RecoveryCaseContext, decision: DecisionResult, diagnos
             policy_reason=reason,
             idempotency_key=_generate_idempotency_key(case, decision)
         )
-        return PolicyEvaluationResult(allowed=True, reason=reason, approved_decision=approved, requires_human_approval=False)
+        return PolicyEvaluationResult(allowed=True, reason=reason, approved_decision=approved, requires_human_approval=False, rules=rules)
 
     # Rule 1: Escalation and stopping are always allowed
     if proposed_action in [RecoveryActionType.ESCALATE_TO_HUMAN, RecoveryActionType.STOP]:
+        rules.append({"name": "always_allowed", "passed": True, "action": proposed_action.value})
         return approve(f"Action {proposed_action.value} is always permitted.")
 
     # Rule 2: High value cases require human approval for financial actions
     if case.amount_paise > PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE:
         if proposed_action != RecoveryActionType.SEND_REMINDER: 
+            rules.append({"name": "high_value_financial", "passed": False, "amount": case.amount_paise})
             return reject(f"Action blocked: Case value ({case.amount_paise} paise) exceeds automatic threshold. Human approval required.", requires_human_approval=True)
+        else:
+            rules.append({"name": "high_value_financial", "passed": True, "amount": case.amount_paise})
+    else:
+        rules.append({"name": "high_value_financial", "passed": True, "amount": case.amount_paise})
 
     # Rule 3: Cap discount percentage cumulatively
     if proposed_action == RecoveryActionType.OFFER_DISCOUNT:
         discount_pct = proposed_parameters.get("discount_percent", 0)
         if discount_pct <= 0:
+            rules.append({"name": "discount_cap", "passed": False, "discount_pct": discount_pct})
             return reject("Action blocked: Discount percentage must be greater than zero.")
             
         proposed_discount_paise = case.amount_paise * (discount_pct / 100)
         max_discount_paise = case.amount_paise * (PolicyConfig.MAX_DISCOUNT_PERCENT / 100)
         
         if case.cumulative_discount_paise + proposed_discount_paise > max_discount_paise:
+            rules.append({"name": "discount_cap", "passed": False, "cumulative": case.cumulative_discount_paise, "proposed": proposed_discount_paise, "limit": max_discount_paise})
             return reject(f"Action blocked: Cumulative discount exceeds policy maximum ({PolicyConfig.MAX_DISCOUNT_PERCENT}%).")
+        rules.append({"name": "discount_cap", "passed": True})
 
     # Rule 4: Block retries on hard declines
     if proposed_action == RecoveryActionType.RETRY_CHARGE and PolicyConfig.BLOCK_HARD_DECLINES:
         if diagnosis.root_cause_category == RootCauseCategory.HARD_DECLINE:
+            rules.append({"name": "block_hard_declines", "passed": False})
             return reject("Action blocked: Policy forbids retrying hard declines.")
+        rules.append({"name": "block_hard_declines", "passed": True})
 
     # Rule 5: Max retries cap
     if proposed_action == RecoveryActionType.RETRY_CHARGE:
         if case.retry_count >= PolicyConfig.MAX_RETRIES:
+            rules.append({"name": "max_retries", "passed": False, "observed": case.retry_count, "limit": PolicyConfig.MAX_RETRIES})
             return reject(f"Action blocked: Max retries ({PolicyConfig.MAX_RETRIES}) reached.")
+        rules.append({"name": "max_retries", "passed": True})
 
     # Rule 6: Confidence score minimum threshold
     if decision.confidence_score < PolicyConfig.MIN_CONFIDENCE_SCORE or diagnosis.confidence_score < PolicyConfig.MIN_CONFIDENCE_SCORE:
+        rules.append({"name": "min_confidence", "passed": False, "decision_score": decision.confidence_score, "diagnosis_score": diagnosis.confidence_score})
         return reject(
             f"Action blocked: AI confidence too low (Decision: {decision.confidence_score}, Diagnosis: {diagnosis.confidence_score}). Escalating to human.", 
             requires_human_approval=True
         )
+    rules.append({"name": "min_confidence", "passed": True})
 
     # Rule 7: RBI pre-debit notice — eNACH/NACH mandates require min 72h notice before charge
     if proposed_action == RecoveryActionType.RETRY_CHARGE:
         if case.payment_rail in ("enach", "nach", "mandate"):
             delay_hours = proposed_parameters.get("delay_hours", 0)
             if delay_hours < PolicyConfig.MIN_ENACH_DELAY_HOURS:
+                rules.append({"name": "rbi_pre_debit_notice", "passed": False, "delay_hours": delay_hours})
                 return reject(
                     f"Action blocked: RBI mandate regulations require a minimum {PolicyConfig.MIN_ENACH_DELAY_HOURS}h "
                     f"pre-debit notification for eNACH/NACH charges. Proposed delay: {delay_hours}h."
                 )
+            rules.append({"name": "rbi_pre_debit_notice", "passed": True})
 
     return approve("Action allowed by policy.")

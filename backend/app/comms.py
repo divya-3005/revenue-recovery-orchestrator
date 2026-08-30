@@ -22,7 +22,7 @@ def generate_message(case: RecoveryCaseContext, diagnosis: DiagnosisResult, atte
             1 → gentle, 2 → firm, 3+ → final
     """
     amount_inr = case.amount_paise / 100
-    reason = diagnosis.reasoning.replace("_", " ")
+    reason = diagnosis.specific_reason.replace("_", " ")
 
     if channel in ["sms", "whatsapp"]:
         length_instruction = "Keep it extremely short and concise, suitable for an SMS or WhatsApp message (under 160 characters)."

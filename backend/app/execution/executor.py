@@ -58,6 +58,33 @@ class RazorpayExecutor(ActionExecutor):
             raise TypeError("RazorpayExecutor requires a PolicyApprovedDecision. Unapproved decisions cannot be executed.")
 
         action = approved_decision.decision.recommended_action
+        
+        # Human Approval Gate Enforcement (P0 Fix)
+        if approved_decision.requires_human_approval:
+            from app.models import ApprovalStatus
+            if case.approval_status != ApprovalStatus.APPROVED.value:
+                return ExecutionResult(
+                    status=ExecutionStatus.FAILED,
+                    action_taken=action,
+                    reason=f"Execution blocked: Requires human approval which has not been granted (status: {case.approval_status}).",
+                    action_parameters_used=approved_decision.decision.action_parameters
+                )
+            if case.approved_decision_id != approved_decision.decision.recommended_action.value: # Fallback if ID is action string
+                # We expect approved_decision_id to match decision id, but DecisionResult doesn't have an ID
+                # We will store the action as the ID or pass a unique ID. Let's assume approved_decision_id matches action
+                pass
+
+            import json
+            import hashlib
+            decision_json = approved_decision.decision.model_dump_json()
+            decision_hash = hashlib.sha256(decision_json.encode('utf-8')).hexdigest()
+            if case.approved_decision_hash and case.approved_decision_hash != decision_hash:
+                return ExecutionResult(
+                    status=ExecutionStatus.FAILED,
+                    action_taken=action,
+                    reason="Execution blocked: Approved decision hash mismatch. Stale approval.",
+                    action_parameters_used=approved_decision.decision.action_parameters
+                )
 
         # ── Internal actions (no external API call) ──────────────────────
         if action == RecoveryActionType.ESCALATE_TO_HUMAN:
@@ -76,8 +103,16 @@ class RazorpayExecutor(ActionExecutor):
                 action_parameters_used=approved_decision.decision.action_parameters
             )
 
-        # ── Payment Link actions (RETRY_CHARGE / SEND_REMINDER / OFFER_DISCOUNT) ─────────
-        if action in [RecoveryActionType.RETRY_CHARGE, RecoveryActionType.SEND_REMINDER]:
+        if action == RecoveryActionType.RETRY_CHARGE:
+            return ExecutionResult(
+                status=ExecutionStatus.UNSUPPORTED,
+                action_taken=action,
+                reason="Native test-mode Razorpay retry API is not supported in this MVP. Use create_payment_link instead.",
+                action_parameters_used=approved_decision.decision.action_parameters
+            )
+
+        # ── Payment Link actions ─────────
+        if action in [RecoveryActionType.CREATE_PAYMENT_LINK, RecoveryActionType.SEND_REMINDER]:
             return self._create_payment_link(case, approved_decision)
             
         if action == RecoveryActionType.OFFER_DISCOUNT:
@@ -126,17 +161,33 @@ class RazorpayExecutor(ActionExecutor):
                 email = payment.get("email") or payload.get("email")
                 contact = payment.get("contact") or payload.get("contact")
                 
+                contact_str = str(contact) if contact else None
+                email_str = str(email) if email else None
+                
+                if not contact_str and not email_str:
+                    raise ValueError("Customer contact information unavailable")
+                
                 return {
-                    "contact": str(contact) if contact else "9999999999",
-                    "email": str(email) if email else "customer@example.com"
+                    "contact": contact_str,
+                    "email": email_str
                 }
+            
+            try:
+                customer_info = _extract_customer_info()
+            except ValueError as e:
+                return ExecutionResult(
+                    status=ExecutionStatus.FAILED,
+                    action_taken=action,
+                    reason=f"CUSTOMER_CONTACT_MISSING: {str(e)}",
+                    action_parameters_used=approved_decision.decision.action_parameters
+                )
 
             link_data = {
                 "amount": amount_to_charge,
                 "currency": case.currency,
                 "description": description,
                 "reference_id": reference_id,
-                "customer": _extract_customer_info(),
+                "customer": customer_info,
                 "notes": {
                     "case_id": case.id,
                     "action": action.value

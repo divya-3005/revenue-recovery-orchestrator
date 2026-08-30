@@ -1,5 +1,8 @@
-from sqlalchemy import Column, String, Integer, DateTime, Date, Enum, ForeignKey
+from sqlalchemy import Column, String, Integer, DateTime, Date, Enum, ForeignKey, JSON
 from sqlalchemy.dialects.postgresql import JSONB
+
+# Use JSONB for Postgres, fallback to JSON for SQLite (tests)
+JsonType = JSON().with_variant(JSONB, 'postgresql')
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -14,11 +17,20 @@ class CaseType(str, enum.Enum):
 class CaseStatus(str, enum.Enum):
     OPEN = "open"
     IN_PROGRESS = "in_progress"
-    AWAITING_PAYMENT = "awaiting_payment"
+    AWAITING_APPROVAL = "awaiting_approval"
+    AWAITING_PAYMENT = "awaiting_payment"  # Deprecating conceptually, keeping for backward compat during migration
+    PAYMENT_PENDING = "payment_pending"
+    PARTIALLY_RECOVERED = "partially_recovered"
     RECOVERED = "recovered"
     FAILED = "failed"
     ESCALATED = "escalated"
     CLOSED = "closed"
+
+class ApprovalStatus(str, enum.Enum):
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
 
 def generate_uuid():
     return str(uuid.uuid4())
@@ -52,11 +64,28 @@ class RecoveryCase(Base):
     payment_rail = Column(String, nullable=True) # e.g., 'card', 'upi', 'enach'
     priority_score = Column(Integer, nullable=False, default=0, index=True) # Expected Value = amount x probability
     
-    raw_signal_payload = Column(JSONB, nullable=False) # Retain source data for auditability
+    raw_signal_payload = Column(JsonType, nullable=False) # Retain source data for auditability
 
     # Pending AI State (Feature 15)
-    pending_decision_json = Column(JSONB, nullable=True)
-    pending_diagnosis_json = Column(JSONB, nullable=True)
+    pending_decision_json = Column(JsonType, nullable=True)
+    pending_diagnosis_json = Column(JsonType, nullable=True)
+
+    # Human Approval Gate (P0 Fix)
+    approval_status = Column(Enum(ApprovalStatus), nullable=False, default=ApprovalStatus.NOT_REQUIRED)
+    approved_decision_id = Column(String(255), nullable=True)
+    approved_decision_hash = Column(String(255), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    approved_by = Column(String(255), nullable=True)
+
+    # Recovery Analytics (P0 Fix)
+    recovered_amount_paise = Column(Integer, nullable=False, default=0)
+    payment_confirmed_at = Column(DateTime(timezone=True), nullable=True)
+
+    # UI Visibility Cache (Latest AI Pipeline Outputs)
+    latest_diagnosis_category = Column(String(50), nullable=True)
+    latest_diagnosis_reasoning = Column(String(500), nullable=True)
+    latest_action_recommended = Column(String(50), nullable=True)
+    latest_comms_preview = Column(String(500), nullable=True)
 
     # Idempotency for Checkouts (Feature 1)
     session_id = Column(String(255), nullable=True)
@@ -64,6 +93,7 @@ class RecoveryCase(Base):
     # Execution State
     retry_count = Column(Integer, nullable=False, default=0)
     cumulative_discount_paise = Column(Integer, nullable=False, default=0)
+    cumulative_comms_cost_paise = Column(Integer, nullable=False, default=0)
 
     # Promise-to-Pay (Feature 14)
     promise_to_pay_date = Column(Date, nullable=True)
@@ -86,3 +116,15 @@ class AuditLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
     case = relationship("RecoveryCase", back_populates="audit_logs")
+
+class PaymentConfirmation(Base):
+    __tablename__ = "payment_confirmations"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    payment_id = Column(String, nullable=False, unique=True, index=True)
+    case_id = Column(String, ForeignKey("recovery_cases.id"), nullable=False, index=True)
+    amount_paise = Column(Integer, nullable=False)
+    source = Column(String, nullable=False, default="webhook")
+    confirmed_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    case = relationship("RecoveryCase")

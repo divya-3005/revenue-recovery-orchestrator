@@ -24,14 +24,15 @@ def decide_action(case: RecoveryCaseContext, diagnosis: DiagnosisResult, provide
     
     [INSTRUCTIONS]
     Propose the single best recovery action from the following list:
-    1. retry_charge: Use if the diagnosis is a temporary 'soft_decline'. Provide parameter: {{"delay_hours": <int>}}. Do NOT use if max retries reached.
-    2. offer_discount: Use for 'friction' or pricing-related drop-offs. Provide parameter: {{"discount_percent": <int>}}. Do NOT exceed {PolicyConfig.MAX_DISCOUNT_PERCENT}%.
-    3. send_reminder: Use for 'missed_payment' or if the user simply needs a nudge. Provide parameter: {{"channel": "email" | "sms" | "whatsapp"}}.
-    4. escalate_to_human: Use for 'dispute', 'hard_decline', high-value cases over {int(PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE / 100):,} INR, or if the diagnosis is 'unknown'/'low confidence'.
-    5. stop: Use if the case is unrecoverable and should be closed (e.g., fraud confirmed).
+    1. retry_charge: Invoke the appropriate Razorpay native retry API for a subscription/mandate. Use if the diagnosis is a temporary 'soft_decline' on a subscription. Provide parameter: {{"delay_hours": <int>}}. Do NOT use if max retries reached.
+    2. create_payment_link: Generate a new payment link for a customer-driven payment. Use for abandoned checkouts or overdue invoices. Provide parameter: {{"delay_hours": <int>}}.
+    3. offer_discount: Use for 'friction' or pricing-related drop-offs. Provide parameter: {{"discount_percent": <int>}}. Do NOT exceed {PolicyConfig.MAX_DISCOUNT_PERCENT}%.
+    4. send_reminder: Use for 'missed_payment' or if the user simply needs a nudge. Provide parameter: {{"channel": "email" | "sms" | "whatsapp"}}.
+    5. escalate_to_human: Use for 'dispute', 'hard_decline', high-value cases over {int(PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE / 100):,} INR, or if the diagnosis is 'unknown'/'low confidence'.
+    6. stop: Use if the case is unrecoverable and should be closed (e.g., fraud confirmed).
     
     You MUST output your decision with:
-    - recommended_action (must exactly match one of the 5 options above)
+    - recommended_action (must exactly match one of the 6 options above)
     - action_parameters (as defined above)
     - confidence_score (0.0 to 1.0, based on how strongly you believe this action will succeed)
     - reasoning (1-2 sentences explaining why this action is optimal given the diagnosis and case state)

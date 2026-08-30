@@ -35,32 +35,49 @@ def record_diagnosis_checkpoint(session: Session, case: RecoveryCaseContext, dia
         reasoning=diagnosis.reasoning
     ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
+    inserted_id = result.scalar()
+    
+    if inserted_id is not None:
+        db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case.id).first()
+        if db_case:
+            db_case.latest_diagnosis_category = diagnosis.root_cause_category.value
+            db_case.latest_diagnosis_reasoning = diagnosis.reasoning
+
     session.commit()
-    return result.scalar() is not None
+    return inserted_id is not None
 
 
 def record_decision_checkpoint(session: Session, case: RecoveryCaseContext, decision) -> bool:
     audit_id = _generate_audit_id(case.id, "DECISION_PROPOSED", case.retry_count)
+    import json
     stmt = insert(AuditLog).values(
         id=audit_id,
         case_id=case.id,
         action_type="DECISION_PROPOSED",
         description=f"AI proposed action: {decision.recommended_action.value}",
-        reasoning=decision.reasoning
+        reasoning=json.dumps(decision.model_dump(mode='json'))
     ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
+    inserted_id = result.scalar()
+    
+    if inserted_id is not None:
+        db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case.id).first()
+        if db_case:
+            db_case.latest_action_recommended = decision.recommended_action.value
+
     session.commit()
-    return result.scalar() is not None
+    return inserted_id is not None
 
 
 def record_policy_checkpoint(session: Session, case: RecoveryCaseContext, policy_eval) -> bool:
     audit_id = _generate_audit_id(case.id, "POLICY_EVALUATED", case.retry_count)
+    import json
     stmt = insert(AuditLog).values(
         id=audit_id,
         case_id=case.id,
         action_type="POLICY_EVALUATED",
         description=f"Policy {'APPROVED' if policy_eval.allowed else 'REJECTED'}: {policy_eval.reason}",
-        reasoning=None
+        reasoning=json.dumps({"allowed": policy_eval.allowed, "rules": policy_eval.rules})
     ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
     session.commit()
@@ -77,8 +94,17 @@ def record_communication_checkpoint(session: Session, case: RecoveryCaseContext,
         reasoning=message
     ).on_conflict_do_nothing().returning(AuditLog.id)
     result = session.execute(stmt)
+    inserted_id = result.scalar()
+    
+    if inserted_id is not None:
+        db_case = session.query(RecoveryCase).filter(RecoveryCase.id == case.id).first()
+        if db_case:
+            db_case.latest_comms_preview = message
+            # Assuming a standard comms cost of ₹0.25 (25 paise) per message
+            db_case.cumulative_comms_cost_paise += 25
+
     session.commit()
-    return result.scalar() is not None
+    return inserted_id is not None
 
 
 def record_execution_checkpoint(session: Session, case: RecoveryCaseContext, exec_result) -> bool:

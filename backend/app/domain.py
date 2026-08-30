@@ -34,9 +34,16 @@ class RecoveryCaseContext(BaseModel):
     raw_signal_payload: Dict[str, Any]
     created_at: Optional[datetime] = None
     promise_to_pay_date: Optional[date] = None
+    # Pending AI State (Feature 15)
     pending_decision_json: Optional[Dict[str, Any]] = None
     pending_diagnosis_json: Optional[Dict[str, Any]] = None
     session_id: Optional[str] = None
+    
+    # Human Approval Gate
+    approval_status: str = "not_required"
+    approved_decision_id: Optional[str] = None
+    approved_decision_hash: Optional[str] = None
+
 
     # Execution State
     retry_count: int
@@ -47,6 +54,7 @@ class RecoveryCaseContext(BaseModel):
 
 class RecoveryActionType(str, enum.Enum):
     RETRY_CHARGE = "retry_charge"
+    CREATE_PAYMENT_LINK = "create_payment_link"
     SEND_REMINDER = "send_reminder"
     OFFER_DISCOUNT = "offer_discount"
     ESCALATE_TO_HUMAN = "escalate_to_human"
@@ -70,6 +78,9 @@ class DecisionResult(BaseModel):
                 raise ValueError("RETRY_CHARGE requires 'delay_hours' parameter")
             if not isinstance(self.action_parameters["delay_hours"], int):
                 raise ValueError("'delay_hours' must be an integer")
+        elif self.recommended_action == RecoveryActionType.CREATE_PAYMENT_LINK:
+            if "delay_hours" not in self.action_parameters:
+                self.action_parameters["delay_hours"] = 0
         elif self.recommended_action == RecoveryActionType.SEND_REMINDER:
             if "channel" not in self.action_parameters:
                 raise ValueError("SEND_REMINDER requires 'channel' parameter")
@@ -80,6 +91,7 @@ class ExecutionStatus(str, enum.Enum):
     DRY_RUN = "dry_run"
     SUCCESS = "success"
     FAILED = "failed"
+    UNSUPPORTED = "unsupported"
 
 class ExecutionResult(BaseModel):
     status: ExecutionStatus
@@ -92,12 +104,16 @@ class PolicyApprovedDecision(BaseModel):
     decision: DecisionResult
     policy_reason: str
     idempotency_key: str
+    requires_human_approval: bool = False
+
 
 class PolicyEvaluationResult(BaseModel):
     allowed: bool
     reason: str
     approved_decision: Optional[PolicyApprovedDecision] = None
     requires_human_approval: bool = False
+    rules: list[Dict[str, Any]] = Field(default_factory=list)
+
 
 class PipelineResult(BaseModel):
     diagnosis: DiagnosisResult

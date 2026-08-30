@@ -24,7 +24,7 @@ interface PendingDecision {
 }
 
 interface PendingDiagnosis {
-  category: string;
+  root_cause_category: string;
   specific_reason: string;
   confidence_score: number;
   reasoning: string;
@@ -39,6 +39,11 @@ interface RecoveryCase {
   status: CaseStatus;
   retry_count: number;
   cumulative_discount_paise: number;
+  cumulative_comms_cost_paise: number;
+  latest_diagnosis_category: string | null;
+  latest_diagnosis_reasoning: string | null;
+  latest_action_recommended: string | null;
+  latest_comms_preview: string | null;
   promise_to_pay_date: string | null;
   pending_decision_json: PendingDecision | null;
   pending_diagnosis_json: PendingDiagnosis | null;
@@ -57,6 +62,7 @@ interface Analytics {
   total_at_risk_paise: number;
   total_recovered_paise: number;
   total_discount_cost_paise: number;
+  total_comms_cost_paise: number;
   net_recovered_paise: number;
   recovery_rate_percent: number;
   net_recovery_rate_percent: number;
@@ -124,6 +130,9 @@ export default function Dashboard() {
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
 
+  const [commsModalOpen, setCommsModalOpen] = useState(false);
+  const [commsMsg, setCommsMsg] = useState("");
+
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
@@ -151,7 +160,7 @@ export default function Dashboard() {
   const runBatch = async () => {
     setBatchLoading(true);
     try {
-      await fetch(`${API_BASE}/batch`, { method: "POST" });
+      await fetch(`${API_BASE}/batch?simulate=true`, { method: "POST" });
       await loadData();
     } catch (err) {
       console.error("Failed to run batch:", err);
@@ -334,7 +343,7 @@ export default function Dashboard() {
                 <Table>
                   <TableHeader>
                     <TableRow className="hover:bg-transparent border-white/5 bg-black/20">
-                      {["Case ID", "Customer", "Type", "Diagnosis", "Amount", "Exp. Recovery", "Status", "Attempts", "Discount", "Actions"].map((h) => (
+                      {["Case ID", "Customer", "Type", "Diagnosis", "Next Action", "Amount", "Exp. Recovery", "Status", "Attempts", "Discount", "Actions"].map((h) => (
                         <TableHead key={h} className="text-slate-400 font-semibold tracking-wider text-xs">{h}</TableHead>
                       ))}
                     </TableRow>
@@ -342,7 +351,7 @@ export default function Dashboard() {
                   <TableBody>
                     {cases.length === 0 && !loading && (
                       <TableRow className="border-white/5 hover:bg-transparent">
-                        <TableCell colSpan={9} className="text-center py-16 text-slate-500">
+                        <TableCell colSpan={10} className="text-center py-16 text-slate-500">
                           <div className="flex flex-col items-center gap-3">
                             <AlertCircle className="w-8 h-8 opacity-50" />
                             <p>No cases found. Run a batch to ingest test cases.</p>
@@ -355,8 +364,11 @@ export default function Dashboard() {
                         <TableCell className="font-mono text-xs text-slate-500 group-hover:text-slate-300">{c.id.split("-")[0]}</TableCell>
                         <TableCell className="font-medium text-slate-200">{c.customer_id}</TableCell>
                         <TableCell className="text-slate-400 text-sm">{CASE_TYPE_LABELS[c.case_type] ?? c.case_type}</TableCell>
-                        <TableCell className="text-slate-400 text-xs truncate max-w-[150px]" title={c.pending_diagnosis_json ? c.pending_diagnosis_json.reasoning : "Diagnosis runs on workflow execution"}>
-                          {c.pending_diagnosis_json ? c.pending_diagnosis_json.category.replace(/_/g, " ") : "—"}
+                        <TableCell className="text-slate-400 text-xs truncate max-w-[150px]" title={c.latest_diagnosis_reasoning || "Diagnosis runs on workflow execution"}>
+                          {c.latest_diagnosis_category ? c.latest_diagnosis_category.replace(/_/g, " ") : "—"}
+                        </TableCell>
+                        <TableCell className="text-slate-400 text-xs truncate max-w-[150px]" title={c.latest_action_recommended || ""}>
+                          {c.latest_action_recommended ? c.latest_action_recommended.replace(/_/g, " ") : "—"}
                         </TableCell>
                         <TableCell className="text-right font-medium text-slate-200">{formatINR(c.amount_paise)}</TableCell>
                         <TableCell className="text-right text-indigo-400 font-medium">{formatINR(c.priority_score)}</TableCell>
@@ -384,10 +396,18 @@ export default function Dashboard() {
                               className="text-teal-500/60 hover:text-teal-300 hover:bg-teal-500/10 rounded-lg">
                               <CalendarClock className="w-4 h-4" />
                             </Button>
+                            {c.latest_comms_preview && (
+                              <Button variant="ghost" size="sm"
+                                onClick={(e) => { e.stopPropagation(); setCommsModalOpen(true); setCommsMsg(c.latest_comms_preview!); }}
+                                title="View Sent Comms"
+                                className="text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg">
+                                <Inbox className="w-4 h-4" />
+                              </Button>
+                            )}
                             <Button variant="ghost" size="sm"
-                              onClick={(e) => { e.stopPropagation(); viewAudit(c.id); }}
-                              className="text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg">
-                              <Search className="w-4 h-4" />
+                                onClick={(e) => { e.stopPropagation(); viewAudit(c.id); }}
+                                className="text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg">
+                                <Search className="w-4 h-4" />
                             </Button>
                           </div>
                         </TableCell>
@@ -494,7 +514,7 @@ export default function Dashboard() {
           <div className="space-y-6">
 
             {/* Net Economics Banner */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
               <Card className="bg-white/[0.02] border-white/5 hover:border-emerald-500/20 transition-all group">
                 <CardHeader className="pb-1 pt-4 px-4">
                   <CardTitle className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-2">
@@ -515,6 +535,17 @@ export default function Dashboard() {
                 <CardContent className="px-4 pb-4">
                   <p className="text-3xl font-bold text-amber-400">{formatINR(analytics.total_discount_cost_paise)}</p>
                   <p className="text-xs text-slate-500 mt-1">Cumulative across all cases</p>
+                </CardContent>
+              </Card>
+              <Card className="bg-white/[0.02] border-white/5 hover:border-rose-500/20 transition-all group">
+                <CardHeader className="pb-1 pt-4 px-4">
+                  <CardTitle className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                    <Minus className="w-4 h-4 text-slate-500 group-hover:text-rose-400 transition-colors" />Comms Cost
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="px-4 pb-4">
+                  <p className="text-3xl font-bold text-rose-400">{formatINR(analytics.total_comms_cost_paise)}</p>
+                  <p className="text-xs text-slate-500 mt-1">₹0.25 per message</p>
                 </CardContent>
               </Card>
               <Card className="bg-indigo-900/20 border-indigo-500/20 hover:border-indigo-500/40 transition-all group relative overflow-hidden">
@@ -749,6 +780,21 @@ export default function Dashboard() {
                 ))}
               </div>
             )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Comms Preview Modal */}
+      <Dialog open={commsModalOpen} onOpenChange={setCommsModalOpen}>
+        <DialogContent className="max-w-md bg-[#0F1523] border-white/10 shadow-2xl shadow-black p-6">
+          <DialogHeader className="pb-4 border-b border-white/5">
+            <DialogTitle className="flex items-center text-lg text-white font-medium">
+              <Inbox className="w-5 h-5 mr-3 text-indigo-400" />
+              Communication Preview
+            </DialogTitle>
+          </DialogHeader>
+          <div className="pt-4 text-slate-300 whitespace-pre-wrap text-sm leading-relaxed">
+            {commsMsg}
           </div>
         </DialogContent>
       </Dialog>
