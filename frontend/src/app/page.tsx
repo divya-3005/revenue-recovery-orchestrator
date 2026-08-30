@@ -16,6 +16,20 @@ import {
 // --- Types ---
 type CaseStatus = "open" | "in_progress" | "awaiting_payment" | "recovered" | "failed" | "escalated" | "closed";
 
+interface PendingDecision {
+  recommended_action: string;
+  action_parameters?: Record<string, unknown>;
+  confidence_score: number;
+  reasoning: string;
+}
+
+interface PendingDiagnosis {
+  category: string;
+  specific_reason: string;
+  confidence_score: number;
+  reasoning: string;
+}
+
 interface RecoveryCase {
   id: string;
   customer_id: string;
@@ -26,8 +40,8 @@ interface RecoveryCase {
   retry_count: number;
   cumulative_discount_paise: number;
   promise_to_pay_date: string | null;
-  pending_decision_json: any | null;
-  pending_diagnosis_json: any | null;
+  pending_decision_json: PendingDecision | null;
+  pending_diagnosis_json: PendingDiagnosis | null;
   created_at: string;
 }
 
