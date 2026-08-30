@@ -18,7 +18,7 @@ Each step.run() is memoized by Inngest — if the process crashes and restarts,
 completed steps are skipped automatically.
 """
 
-from inngest import Context, TriggerEvent
+from inngest import Context, TriggerEvent, Step
 from sqlalchemy import select
 import os
 
@@ -306,7 +306,7 @@ async def inner_process_case_workflow(ctx, step):
     name="Monitor Awaiting Payment",
     trigger=TriggerEvent(event="case.monitor_payment"),
 )
-async def monitor_awaiting_payment(ctx: Context, step: Context.step_api) -> dict:
+async def monitor_awaiting_payment(ctx: Context, step: Step) -> dict:
     """
     Monitors a case that was placed into AWAITING_PAYMENT by a manual approval.
     Unlike the standard loop, if payment is not received after the delay, this
