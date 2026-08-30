@@ -44,6 +44,7 @@ jobs:
       - name: Run Pytest
         env:
           DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/revenue_recovery
+          TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/revenue_recovery
           GEMINI_API_KEY: mock
           GROQ_API_KEY: mock
           ANTHROPIC_API_KEY: mock

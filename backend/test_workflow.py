@@ -255,6 +255,73 @@ def test_comms_channel_formatting():
     assert "Dear Customer" in email_msg
     assert len(email_msg) > len(sms_msg)
 
+
+import pytest
+from inngest import Event
+
+@pytest.mark.asyncio
+async def test_max_pursuit_window_stopping_rule():
+    """
+    Assert that an aged case (>14 days) entering the recovery loop
+    is halted immediately by Stopping Rule A (MAX_DAYS) and closed.
+    """
+    from datetime import datetime, timezone, timedelta
+    from app.workflows.case_workflow import inner_process_case_workflow
+    from app.policy import PolicyConfig
+
+    db = SessionLocal()
+    try:
+        case_id = f"case_aged_{uuid.uuid4().hex[:8]}"
+        # Create case created 15 days ago (exceeding 14-day limit)
+        aged_date = datetime.now(timezone.utc) - timedelta(days=15)
+        case = models.RecoveryCase(
+            id=case_id,
+            case_type=models.CaseType.SUBSCRIPTION_FAILED,
+            amount_paise=100000,
+            currency="INR",
+            customer_id="cust_aged_1",
+            status=CaseStatus.OPEN,
+            created_at=aged_date,
+            raw_signal_payload={}
+        )
+        db.add(case)
+        db.commit()
+    finally:
+        db.close()
+
+    class MockWorkflowStep:
+        async def run(self, step_id, fn, **kwargs):
+            return fn()
+        async def sleep(self, step_id, duration):
+            pass
+
+    class MockEventContext:
+        def __init__(self, event):
+            self.event = event
+
+    ctx = MockEventContext(event=Event(name="case.received", data={"case_id": case_id}))
+    step = MockWorkflowStep()
+
+    result = await inner_process_case_workflow(ctx, step)
+    assert result["status"] == "closed"
+    assert "Max pursuit period (14 days) reached" in result["reason"]
+
+    # Verify DB status updated to CLOSED and audit log recorded
+    db = SessionLocal()
+    try:
+        updated_case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
+        assert updated_case.status == CaseStatus.CLOSED
+
+        audit = db.query(models.AuditLog).filter(
+            models.AuditLog.case_id == case_id,
+            models.AuditLog.action_type == "STOPPING_RULE_TRIGGERED"
+        ).first()
+        assert audit is not None
+        assert "MAX_DAYS" in audit.description
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     test_workflow_diagnosis()
     test_workflow_execution_retry_idempotency()
