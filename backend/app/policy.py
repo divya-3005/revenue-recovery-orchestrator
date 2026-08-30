@@ -101,7 +101,14 @@ def evaluate_policy(
     rules.append({"rule": "block_hard_decline", "passed": True})
 
     # Rule 6: Max retry attempts
-    if action in financial_actions and case.retry_count >= POLICY["max_retries"]:
+    # NOTE: max_attempts in pipeline.py is POLICY["max_retries"] + 1 ("initial
+    # try + retries"). retry_count is incremented AFTER each failed attempt,
+    # so on the loop's final allowed iteration retry_count == max_retries
+    # exactly — that attempt must still be allowed to execute. Using >= here
+    # blocks it one iteration early, short-circuiting the case to FAILED via
+    # a policy rejection that never calls the executor, instead of letting it
+    # exhaust its full attempt budget and reach ESCALATED (Feature 9).
+    if action in financial_actions and case.retry_count > POLICY["max_retries"]:
         rules.append({"rule": "max_retries", "passed": False})
         return reject(f"Blocked: max retries ({POLICY['max_retries']}) reached.")
 

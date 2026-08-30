@@ -220,6 +220,19 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
         )
 
     if cat == RootCauseCategory.FRICTION:
+        payload = case.raw_signal_payload or {}
+        # Mirror the real prompt's guidance ("offer_discount — for
+        # friction/pricing drop-offs"): a repeat customer or high-value
+        # cart is worth a discount; otherwise a plain nudge link is enough.
+        cart_value = payload.get("cart_value", case.amount_paise)
+        is_repeat = payload.get("is_repeat_customer", False)
+        if is_repeat or cart_value >= 500_00:  # >= ₹500
+            return DecisionResult(
+                recommended_action=RecoveryActionType.OFFER_DISCOUNT,
+                action_parameters={"discount_percent": min(10, POLICY["max_discount_percent"])},
+                confidence_score=0.80,
+                reasoning="Repeat customer / high-value cart abandoned — offering a bounded discount to recover it.",
+            )
         return DecisionResult(
             recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
             action_parameters={"delay_hours": 1},

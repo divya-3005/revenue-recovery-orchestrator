@@ -373,7 +373,7 @@ def opt_out(case_id: str, body: OptOutRequest = OptOutRequest(), db: Session = D
 # ── Batch Processing (Feature 11) ───────────────────────────────────────
 
 @app.post("/api/v1/batch")
-def run_batch(simulate: bool = True, db: Session = Depends(get_db)):
+def run_batch(db: Session = Depends(get_db)):
     """Generate 50+ synthetic cases and process them through the full pipeline."""
     synthetic = generate_batch()
     created_ids = []
@@ -475,7 +475,13 @@ def get_analytics(db: Session = Depends(get_db)):
     recovered_paise = sum(c.recovered_amount_paise for c in cases)
     discounts = sum(c.cumulative_discount_paise for c in cases)
     comms_cost = sum(c.cumulative_comms_cost_paise for c in cases)
-    net = recovered_paise - discounts - comms_cost
+    # recovered_amount_paise is already net of any discount applied
+    # (_simulate_payment stores amount_paise - cumulative_discount_paise),
+    # so net recovery only needs to subtract comms cost on top of that.
+    # total_discount_cost_paise is still returned below as an informational
+    # figure — it must NOT be subtracted again here or every discounted,
+    # recovered case gets double-counted against net.
+    net = recovered_paise - comms_cost
 
     # Breakdown by case type
     by_type = {}
