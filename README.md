@@ -1,152 +1,98 @@
 # Revenue Recovery Orchestrator
 
-An autonomous, AI-driven Revenue Recovery Orchestrator that intercepts failed subscription payments, checkout drop-offs, and overdue invoices to recover lost revenue automatically with strict deterministic safety guardrails.
+AI-powered recovery system for three types of revenue at risk:
+- **Failed subscription/mandate charges** (soft & hard declines)
+- **Abandoned checkouts** (friction signals)
+- **Overdue invoices/payment links** (missed payments)
 
----
+One orchestrator, one decision engine, one policy layer — not three separate scripts.
 
-## 1. What It Does
+## Architecture
 
-When a transaction or checkout fails, the orchestrator:
-1. Ingests the revenue-risk signal into a single canonical `RecoveryCase`.
-2. Runs **AI Diagnosis** to categorize the root cause without hallucinating customer history.
-3. Proposes the **Next Best Action** (e.g., `SEND_REMINDER`, `OFFER_DISCOUNT`, `ESCALATE`, `STOP`).
-4. Evaluates strict **Deterministic Safety Guardrails** (hard declines blocked from retries, max 3 attempts, discount caps <= 15%, human approval for amounts > ₹50,000).
-5. Generates **Diagnosis-Specific Customer Communication** across Email, SMS, and WhatsApp.
-6. Executes recovery via **Razorpay Test Mode** payment links (or mock channels).
-7. Transitions state upon verified **Payment Confirmation** while maintaining an append-only **Audit Trail**.
-
----
-
-## 2. Architecture & Pipeline
-
-```text
-Revenue Risk Signal (Webhook / Beacon / Ingest)
-                    ↓
-        Canonical RecoveryCase
-                    ↓
-        AI Diagnosis (LLM Agent)
-                    ↓
-    Next Best Action Recommendation
-                    ↓
-      Deterministic Policy Check ──[Violated / High-Value]──→ Human Approval Gate (AWAITING_APPROVAL)
-                    ↓ [Passed]                                       ↓ [Approved]
-      Customer Message Generation                                    ↓
-                    ↓                                                ↓
-     Execution (Razorpay / Link) ←────────────────────────────────────┘
-                    ↓
-    Awaiting Payment (PAYMENT_PENDING)
-                    ↓
-  Verified Payment Confirmation (Webhook)
-                    ↓
-               RECOVERED
+```
+Signal → Case Creation → AI Diagnosis → AI Decision → Policy Check → Comms → Execute → Track
+              ↑                                              ↓
+              └──────────────── Retry Loop ←─────────────────┘
 ```
 
----
+**Key files:**
 
-## 3. Supported Input Signals
+| File | Purpose |
+|------|---------|
+| `app/main.py` | FastAPI routes — all API endpoints |
+| `app/pipeline.py` | The recovery pipeline (diagnosis → decision → policy → execute) |
+| `app/models.py` | Database tables + Pydantic domain types |
+| `app/ai.py` | Gemini AI provider (with rule-based fallback) |
+| `app/policy.py` | Deterministic guardrail rules |
+| `app/comms.py` | Customer message templates |
+| `app/executor.py` | Razorpay SDK executor (payment links) |
+| `app/synthetic.py` | Batch synthetic case generation |
 
-All three signals are normalized into the same canonical `RecoveryCase` model:
+## Quick Start
 
-1. **Subscription / Mandate Failure** (`subscription_failed`):
-   - Ingested via Razorpay webhook (`payment.failed` / `subscription.pending`) or direct API.
-   - Example: Insufficient funds, expired card, bank timeouts.
-2. **Abandoned Checkout** (`checkout_abandoned`):
-   - Ingested via idle beacon ping or checkout drop-off event.
-   - Example: High cart friction, exit intent, repeat visitor cart retention.
-3. **Overdue Invoice** (`invoice_overdue`):
-   - Ingested via payment link expiration webhook or billing signal.
-   - Example: Unpaid milestone invoices, cash-flow delays.
-
----
-
-## 4. AI Diagnosis & Next-Best Action
-
-- **AI Diagnosis**: Produces structured JSON classification (`category`, `reason`, `confidence`, `explanation`).
-- **Next Best Action Enum**:
-  - `SEND_REMINDER` (creates Razorpay payment link + delivers tailored message)
-  - `OFFER_DISCOUNT` (creates Razorpay payment link with capped discount applied)
-  - `ESCALATE` (routes case to human review queue)
-  - `STOP` (halts recovery when unrecoverable or opted out)
-- **AI Safety Rule**: The AI *never* directly executes financial transactions or moves funds. Its recommendations must pass deterministic policy validation first.
-
----
-
-## 5. Deterministic Policy Guardrails
-
-Policy checks are written in pure Python code and executed before every action:
-- **No Hard Decline Retries**: Stolen cards, closed accounts, and fraud flags are never retried.
-- **Max Retries Capped**: Maximum 3 automated recovery attempts per case.
-- **Discount Limit**: Maximum 15% discount cap.
-- **High-Value Gate**: Transactions exceeding ₹50,000 require human review and cannot be executed automatically.
-- **Low-Confidence Safeguard**: Confidence below 0.60 automatically routes to human escalation.
-- **Strict Approval Token**: Human approval cryptographically verifies `pending_decision_id` and `pending_decision_hash` and cannot bypass hard safety rules.
-
----
-
-## 6. Customer Communication
-
-- Tailors messaging tone based on attempt count (Gentle → Firm → Final).
-- Diagnosis-specific copy for Insufficient Funds, Expired Card, Cart Drop-Off, and Overdue Invoice.
-- **Honest Delivery Reporting**: Real external SMS and WhatsApp gateways are marked as `Simulated Delivery` in development mode, clearly identified in the UI and audit logs.
-
----
-
-## 7. Setup & Running Locally
-
-### Prerequisites
-- Python 3.11+
-- Node.js 20+
-- Docker & Docker Compose (optional, for Postgres)
-
-### Backend Setup
 ```bash
 cd backend
-python -m pip install -r requirements.txt
-
-# Run migrations
-alembic upgrade head
-
-# Start backend server
-uvicorn app.main:app --reload --port 8000
+pip install -r requirements.txt
+uvicorn app.main:app --reload
 ```
 
-### Frontend Setup
-```bash
-cd frontend
-npm install
-npm run dev
-```
-Open `http://localhost:3000` to access the dashboard.
+The app starts immediately with SQLite — no database setup needed.
 
----
+## API Endpoints
 
-## 8. Running Automated Tests
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Health check |
+| POST | `/api/v1/cases` | Ingest a new recovery case |
+| GET | `/api/v1/cases` | List all cases (sorted by priority) |
+| GET | `/api/v1/cases/{id}/audit` | Full audit trail for a case |
+| GET | `/api/v1/cases/escalated` | Cases needing human review |
+| POST | `/api/v1/cases/{id}/approve` | Approve an escalated action |
+| POST | `/api/v1/cases/{id}/reject` | Reject and re-evaluate |
+| POST | `/api/v1/cases/{id}/close` | Close an escalated case |
+| POST | `/api/v1/cases/{id}/promise-to-pay` | Capture promise-to-pay |
+| POST | `/api/v1/cases/{id}/opt-out` | Customer opt-out |
+| POST | `/api/v1/batch` | Run 50+ synthetic cases |
+| GET | `/api/v1/analytics` | Recovery analytics |
+| GET | `/api/v1/policy` | Policy configuration |
+| POST | `/api/v1/demo/seed` | Seed 5 demo scenarios |
+| POST | `/api/v1/demo/confirm-payment/{id}` | Simulate payment |
 
-Run the complete test suite:
+## Running Tests
+
 ```bash
 cd backend
-pytest -v
-```
-All 73 unit, integration, invariant, and workflow tests will run and pass cleanly.
-
----
-
-## 9. Demo Scenarios
-
-You can seed and test the 5 canonical demo scenarios by clicking **"Seed 5 Demo Scenarios"** on the dashboard or calling:
-```bash
-curl -X POST http://localhost:8000/api/v1/demo/seed
+python -m pytest tests/ -v
 ```
 
-1. **Scenario 1 — Recoverable Soft Decline**: ₹4,999 insufficient funds → soft decline diagnosis → reminder with payment link → policy allows → payment confirmed → `RECOVERED`.
-2. **Scenario 2 — Hard Decline**: ₹2,999 stolen/lost card → hard decline diagnosis → policy blocks retry → `STOPPED`.
-3. **Scenario 3 — Abandoned Checkout**: ₹2,999 cart with repeat visitor → checkout friction diagnosis → reminder with payment link.
-4. **Scenario 4 — High-Value Human Approval**: ₹75,000 subscription failure → policy requires human approval → moves to `AWAITING_APPROVAL` → human approves via UI → execution triggered.
-5. **Scenario 5 — Overdue Invoice**: ₹15,000 overdue invoice (7 days past due) → missed payment diagnosis → reminder with payment link.
+## Configuration
 
----
+Set these environment variables for production features (optional for local dev):
 
-## 10. Known Limitations
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `GEMINI_API_KEY` | Gemini AI for diagnosis/decisions | Rule-based fallback |
+| `RAZORPAY_KEY_ID` | Razorpay test-mode key | Dry-run mode |
+| `RAZORPAY_KEY_SECRET` | Razorpay test-mode secret | Dry-run mode |
+| `DATABASE_URL` | Database connection string | `sqlite:///recovery.db` |
 
-- **Simulated Comms**: SMS and WhatsApp delivery modes are simulated for development; in production, SMS/WhatsApp gateways (e.g. Twilio/Gupshup) can be plugged into `comms.py`.
-- **Native Charge Retry**: Direct server-to-server card auto-retry without customer redirection is restricted in Razorpay Test Mode; the orchestrator issues test-mode Razorpay Payment Links for customer-authorized settlement.
+## Features
+
+1. **Revenue-at-Risk Detection** — Three signal types normalized into one case format
+2. **AI Root-Cause Diagnosis** — Structured classification with confidence scores
+3. **Guardrail & Policy System** — Deterministic rules bounding every action
+4. **Next-Best-Action Decision** — AI-driven recovery action selection
+5. **Multi-Channel Execution** — Razorpay payment links via real test-mode APIs
+6. **Customer Communications** — Personalized messages with tone escalation
+7. **Case Tracking & Re-loop** — Retry logic with memory
+8. **Stopping Rules** — Max retries, max days, opt-out, hard-decline blocks
+9. **Escalation to Human** — Full-context handoff queue
+10. **Audit Trail** — Complete timestamped log per case
+11. **Batch Processing** — 50+ cases processed end-to-end
+12. **Recovery Analytics** — Dashboard with recovery rates and economics
+13. **Recovery Prioritization** — Expected-value ranking
+14. **Promise-to-Pay** — Capture commitment, suppress reminders, auto-escalate
+15. **Human Approval Gate** — Click-to-approve for high-risk actions
+16. **Unified Orchestrator** — One engine for subscriptions, checkouts, and invoices
+17. **Net Recovery Economics** — Revenue minus discounts and comms costs
+18. **Explainable Decisions** — Full reasoning trace per case

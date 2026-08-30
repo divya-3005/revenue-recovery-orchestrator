@@ -1,59 +1,56 @@
 """
-Revenue Recovery Orchestrator — FastAPI application.
+Revenue Recovery Orchestrator — FastAPI Application.
+
+One orchestrator for three revenue-at-risk types:
+  - Failed subscription/mandate charges
+  - Abandoned checkouts
+  - Overdue invoices/payment links
 
 Endpoints:
-  POST /api/v1/cases          — Ingest a new recovery case
-  GET  /api/v1/cases          — List all cases
-  GET  /api/v1/cases/{id}/audit — Full audit trail for one case
-  GET  /api/v1/cases/escalated — Cases needing human review
-  POST /api/v1/batch          — Generate & process 50+ synthetic cases
-  GET  /api/v1/analytics      — Recovery analytics dashboard data
-  GET  /api/v1/policy         — Current policy configuration
-  POST /api/v1/demo/confirm-payment/{id} — Local demo: mark paid (not production)
-  GET  /health                — Health check
+  POST /api/v1/cases              — Ingest a new recovery case
+  GET  /api/v1/cases              — List all cases (sorted by priority)
+  GET  /api/v1/cases/{id}/audit   — Full audit trail for one case
+  GET  /api/v1/cases/escalated    — Cases needing human review
+  POST /api/v1/cases/{id}/approve — Human approval gate
+  POST /api/v1/cases/{id}/reject  — Reject an escalated action
+  POST /api/v1/cases/{id}/close   — Close an escalated case
+  POST /api/v1/cases/{id}/promise-to-pay — Capture promise-to-pay date
+  POST /api/v1/cases/{id}/opt-out — Customer opt-out
+  POST /api/v1/batch              — Generate & process 50+ synthetic cases
+  GET  /api/v1/analytics          — Recovery analytics dashboard
+  GET  /api/v1/policy             — Current policy configuration
+  POST /api/v1/demo/seed          — Seed 5 demo scenarios
+  POST /api/v1/demo/confirm-payment/{id} — Simulate payment
+  GET  /health                    — Health check
 """
 
-import logging
-import random
-import hmac
-import hashlib
-import os
 import json
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Header, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from sqlalchemy import update, func
+import logging
+from datetime import date
 from typing import List
 
-import inngest.fast_api
-from inngest import Event
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
-from app import models, schemas
-from app.models import CaseType, CaseStatus
-from app.database import get_db
-from app.policy import PolicyConfig
-from app.inngest_client import inngest_client
-from app.workflows.case_workflow import process_case_workflow, execute_approved_action
+from app.database import Base, engine, get_db
+from app.models import RecoveryCase, AuditLog, CaseType, CaseStatus, ApprovalStatus, DecisionResult
+from app.schemas import (
+    CaseCreateRequest, CaseResponse, AuditLogResponse, PolicyConfigResponse,
+    PromiseToPayRequest, ApprovalRequest, OptOutRequest,
+)
+from app.policy import POLICY
+from app.pipeline import run_pipeline, _audit
+from app.synthetic import generate_batch, generate_demo_scenarios, compute_priority_score
+from app.executor import Executor
 
-# Configure logging
+# Create all tables on startup (no Alembic needed for a hackathon project)
+Base.metadata.create_all(bind=engine)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Application starting up (skipping automatic table creation, using Alembic)...")
-    yield
-    logger.info("Shutting down application...")
-
-
-app = FastAPI(
-    title="Revenue Recovery Orchestrator API",
-    description="API for ingesting and managing revenue recovery cases.",
-    version="0.1.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="Revenue Recovery Orchestrator", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,810 +60,395 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-inngest.fast_api.serve(app, inngest_client, [process_case_workflow, execute_approved_action])
-
-
-def compute_priority_score(case_type: CaseType, amount_paise: int, payload: dict) -> int:
-    """Compute Expected Value heuristic for the UI priority column."""
-    if case_type == CaseType.SUBSCRIPTION_FAILED:
-        reason = payload.get("reason", "")
-        # Hard declines have low expected recovery
-        if reason in ["lost_card_reported", "stolen_card", "account_closed", "fraud_suspected"]:
-            return int(amount_paise * 0.2)
-        # Soft declines have high expected recovery
-        return int(amount_paise * 0.8)
-    elif case_type == CaseType.CHECKOUT_ABANDONED:
-        return int(amount_paise * 0.5)
-    elif case_type == CaseType.INVOICE_OVERDUE:
-        # B2B invoice generally high expected recovery
-        return int(amount_paise * 0.9)
-    return int(amount_paise * 0.5)
-
-
-def process_payment_confirmation(db: Session, payment_id: str, case_id: str, amount_paise: int, source: str = "webhook") -> dict:
-    """Atomic, idempotent payment confirmation."""
-    from datetime import datetime, timezone
-    from fastapi import HTTPException
-    
-    if amount_paise <= 0:
-        raise HTTPException(status_code=400, detail="INVALID_PAYMENT_AMOUNT")
-
-    # 1. Check if this exact payment_id was already confirmed (idempotency check)
-    existing_conf = db.query(models.PaymentConfirmation).filter(models.PaymentConfirmation.payment_id == payment_id).first()
-    if existing_conf:
-        if existing_conf.case_id != case_id:
-            raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
-        return {"status": "idempotent", "reason": "payment_already_processed"}
-
-    # 2. Lock RecoveryCase with row-level lock
-    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).with_for_update().first()
-    if not case:
-        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-
-    # Re-check idempotency in case another transaction committed while waiting for lock
-    existing_conf = db.query(models.PaymentConfirmation).filter(models.PaymentConfirmation.payment_id == payment_id).first()
-    if existing_conf:
-        if existing_conf.case_id != case_id:
-            raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
-        return {"status": "idempotent", "reason": "payment_already_processed"}
-
-    if case.status not in (CaseStatus.PAYMENT_PENDING, CaseStatus.PARTIALLY_RECOVERED):
-        raise HTTPException(status_code=409, detail="CASE_NOT_AWAITING_PAYMENT")
-
-    outstanding = case.amount_paise - case.recovered_amount_paise
-    if amount_paise > outstanding:
-        # Overpayment quarantine
-        case.status = CaseStatus.ESCALATED
-        db.commit()
-        return {"status": "escalated", "reason": "overpayment"}
-
-    # 3. Atomic Insert for Idempotency
-    now = datetime.now(timezone.utc)
-    if db.bind.dialect.name == "sqlite":
-        conf = models.PaymentConfirmation(
-            payment_id=payment_id,
-            case_id=case_id,
-            amount_paise=amount_paise,
-            source=source,
-            confirmed_at=now
-        )
-        db.add(conf)
-    else:
-        # Postgres Production Path
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-        stmt = pg_insert(models.PaymentConfirmation).values(
-            payment_id=payment_id,
-            case_id=case_id,
-            amount_paise=amount_paise,
-            source=source,
-            confirmed_at=now
-        ).on_conflict_do_nothing(index_elements=['payment_id']).returning(models.PaymentConfirmation.payment_id)
-        
-        result = db.execute(stmt)
-        inserted_row = result.fetchone()
-        
-        if not inserted_row:
-            existing = (
-                db.query(models.PaymentConfirmation)
-                .filter(models.PaymentConfirmation.payment_id == payment_id)
-                .one()
-            )
-            if existing.case_id != case_id:
-                raise HTTPException(status_code=409, detail="PAYMENT_ID_ALREADY_BOUND_TO_DIFFERENT_CASE")
-            return {"status": "idempotent", "reason": "payment_already_processed"}
-
-    # 4. Update Case
-    case.recovered_amount_paise += amount_paise
-    case.payment_confirmed_at = now
-    
-    if case.recovered_amount_paise >= case.amount_paise:
-        case.status = CaseStatus.RECOVERED
-    else:
-        case.status = CaseStatus.PARTIALLY_RECOVERED
-
-    # 5. Write Audit Log
-    import hashlib
-    audit_id = hashlib.sha256(f"{case_id}-PAYMENT_CONFIRMED-{payment_id}".encode('utf-8')).hexdigest()
-    
-    audit_log = models.AuditLog(
-        id=audit_id,
-        case_id=case_id,
-        action_type="PAYMENT_CONFIRMED",
-        description=f"Payment {payment_id} confirmed via {source} for {amount_paise} paise",
-        reasoning=f"New status: {case.status.value}"
-    )
-    db.add(audit_log)
-    
-    # Commit everything together
-    db.commit()
-
-    return {"status": case.status.value, "case_id": case_id, "recovered": case.recovered_amount_paise}
-
 
 # ── Health ───────────────────────────────────────────────────────────────
 
-@app.get("/health", status_code=status.HTTP_200_OK)
+@app.get("/health")
 def health_check():
     return {"status": "healthy"}
 
 
-# ── Demo ─────────────────────────────────────────────────────────────────
+# ── Case Ingestion (Feature 1) ──────────────────────────────────────────
 
-@app.post("/api/v1/demo/confirm-payment/{case_id}")
-def demo_confirm_payment(case_id: str, db: Session = Depends(get_db)):
-    """Local demo only: mark a case as paid to test the AWAITING_PAYMENT -> RECOVERED transition."""
-    if os.getenv("ENVIRONMENT") == "production":
-        raise HTTPException(status_code=403, detail="Demo endpoint is disabled in production.")
-    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
-    if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
-    amount = case.amount_paise - case.recovered_amount_paise
-    if amount <= 0:
-        return {"status": "idempotent", "reason": "fully_recovered"}
-    # Generate fake payment_id
-    import uuid
-    payment_id = f"pay_demo_{uuid.uuid4().hex[:8]}"
-    return process_payment_confirmation(db, payment_id, case_id, amount, "demo_endpoint")
-
-
-# ── Case CRUD ────────────────────────────────────────────────────────────
-
-@app.post("/api/v1/cases", response_model=schemas.RecoveryCaseResponse, status_code=status.HTTP_201_CREATED)
-def create_case(case_in: schemas.RecoveryCaseCreate, db: Session = Depends(get_db)):
+@app.post("/api/v1/cases", response_model=CaseResponse, status_code=status.HTTP_201_CREATED)
+def create_case(
+    body: CaseCreateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """Ingest a new risk signal and normalize it into a Recovery Case."""
-    priority_score = compute_priority_score(case_in.case_type, case_in.amount_paise, case_in.raw_signal_payload)
-    
-    db_case = models.RecoveryCase(
-        case_type=case_in.case_type,
-        amount_paise=case_in.amount_paise,
-        currency=case_in.currency,
-        customer_id=case_in.customer_id,
-        customer_email=case_in.customer_email or (case_in.raw_signal_payload or {}).get("email") or f"{case_in.customer_id}@example.com",
-        customer_phone=case_in.customer_phone or (case_in.raw_signal_payload or {}).get("contact"),
-        payment_rail=case_in.payment_rail,
-        priority_score=priority_score,
-        raw_signal_payload=case_in.raw_signal_payload,
-    )
+    priority = compute_priority_score(body.case_type.value, body.amount_paise, body.raw_signal_payload)
 
-    db.add(db_case)
-    db.commit()
-    db.refresh(db_case)
-
-    audit_log_1 = models.AuditLog(
-        case_id=db_case.id,
-        action_type="SIGNAL_RECEIVED",
-        description=f"Case created for signal type: {case_in.case_type.value}",
-        reasoning="Initial ingestion from external signal"
-    )
-    audit_log_2 = models.AuditLog(
-        case_id=db_case.id,
-        action_type="SIGNAL_NORMALIZED",
-        description="Signal successfully normalized into Recovery Case format",
-        reasoning="Ready for AI recovery pipeline"
-    )
-    db.add_all([audit_log_1, audit_log_2])
-    db.commit()
-
-    try:
-        inngest_client.send_sync(Event(name="case.received", data={"case_id": db_case.id}))
-    except Exception as e:
-        logger.warning(f"Inngest event dispatch failed for case {db_case.id}: {e}. Case exists in DB — can be retried.")
-
-    logger.info(f"Created RecoveryCase {db_case.id} for customer {db_case.customer_id}")
-    return db_case
-
-@app.post("/api/v1/cases/beacon")
-def receive_checkout_beacon(body: schemas.CheckoutBeaconRequest, db: Session = Depends(get_db)):
-    """
-    Ingests CHECKOUT_ABANDONED signals from the frontend.
-    Enforces a 15-minute idle threshold before accepting the beacon and uses session_id for idempotency.
-    """
-    from datetime import datetime, timezone, timedelta
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-    # Enforce 15-minute idle threshold
-    now = datetime.now(timezone.utc)
-    # Ensure last_interaction_at is timezone-aware for comparison
-    last_interaction = body.last_interaction_at
-    if last_interaction.tzinfo is None:
-        last_interaction = last_interaction.replace(tzinfo=timezone.utc)
-        
-    idle_time = now - last_interaction
-    if idle_time < timedelta(minutes=15):
-        return {"status": "ignored", "reason": "idle_threshold_not_met", "idle_minutes": idle_time.total_seconds() / 60}
-
-    priority_score = compute_priority_score(
-        CaseType.CHECKOUT_ABANDONED, 
-        body.amount_paise, 
-        {"cart_items": body.cart_items}
-    )
-
-    stmt = pg_insert(models.RecoveryCase).values(
-        id=models.generate_uuid(),
-        case_type=CaseType.CHECKOUT_ABANDONED,
+    case = RecoveryCase(
+        case_type=body.case_type,
         amount_paise=body.amount_paise,
         currency=body.currency,
         customer_id=body.customer_id,
-        customer_email=body.customer_email or f"{body.customer_id}@example.com",
-        customer_phone=body.customer_phone,
-        session_id=body.session_id,
-        priority_score=priority_score,
-        raw_signal_payload={
-            "cart_items": body.cart_items,
-            "last_interaction_at": body.last_interaction_at.isoformat(),
-            "customer_email": body.customer_email or f"{body.customer_id}@example.com",
-            "customer_phone": body.customer_phone
-        }
-    ).on_conflict_do_nothing(
-        index_elements=['session_id'],
-        index_where=models.RecoveryCase.session_id.isnot(None)
-    ).returning(models.RecoveryCase.id)
-    
-    result = db.execute(stmt)
-    inserted_id = result.scalar()
+        customer_email=body.customer_email or body.raw_signal_payload.get("email", f"{body.customer_id}@example.com"),
+        customer_phone=body.customer_phone or body.raw_signal_payload.get("contact"),
+        payment_rail=body.payment_rail,
+        priority_score=priority,
+        raw_signal_payload=body.raw_signal_payload,
+    )
+    db.add(case)
+    db.commit()
+    db.refresh(case)
+
+    # Audit: signal received + normalized
+    _audit(db, case.id, "SIGNAL_RECEIVED",
+           f"Case created: {body.case_type.value}", "New recovery case ingested")
     db.commit()
 
-    if inserted_id:
-        case_id = inserted_id
-        
-        audit_log = models.AuditLog(
-            case_id=case_id,
-            action_type="SIGNAL_RECEIVED",
-            description="Checkout abandoned beacon received",
-            reasoning="Automated ingestion via client-side beacon"
-        )
-        db.add(audit_log)
-        db.commit()
+    # Run the recovery pipeline in the background
+    background_tasks.add_task(_run_pipeline_safe, case.id)
 
-        try:
-            inngest_client.send_sync(Event(name="case.received", data={"case_id": case_id}))
-        except Exception as e:
-            logger.warning(f"Inngest event dispatch failed for beacon case {case_id}: {e}.")
+    logger.info(f"Created case {case.id} for {case.customer_id}")
+    return case
 
-        return {"status": "created", "case_id": case_id}
-    else:
-        import time
-        existing = None
-        for _ in range(10):
-            db.rollback()
-            existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.session_id == body.session_id).first()
-            if existing:
-                break
-            time.sleep(0.05)
-        return {"status": "idempotent", "case_id": existing.id if existing else None}
 
-@app.post("/api/v1/signals/invoice-overdue")
-def receive_invoice_overdue_signal(body: schemas.InvoiceOverdueSignalRequest, db: Session = Depends(get_db)):
+# ── Webhook Ingestion (Feature 1 — real signal listeners) ───────────────
+
+@app.post("/api/v1/webhooks/razorpay", status_code=status.HTTP_200_OK)
+def razorpay_webhook(
+    event_payload: dict,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     """
-    Ingests INVOICE_OVERDUE signals from external billing/invoice tracking systems.
+    Webhook listener for Razorpay events.
+    Handles payment failures → new cases, and payment success → recovery confirmation.
     """
-    priority_score = compute_priority_score(
-        CaseType.INVOICE_OVERDUE,
-        body.amount_paise,
-        {"days_overdue": body.days_overdue, "invoice_number": body.invoice_number}
-    )
+    event_name = event_payload.get("event", "")
+    data = event_payload.get("payload", {})
 
-    customer_email = body.customer_email or f"{body.customer_id}@example.com"
+    # ── Payment success → close the linked case ──
+    if event_name in ("payment.captured", "order.paid", "invoice.paid", "payment_link.paid"):
+        payment_entity = data.get("payment", {}).get("entity", {}) or data.get("payment_link", {}).get("entity", {})
+        notes = payment_entity.get("notes", {})
+        case_id = notes.get("case_id")
+        if case_id:
+            _simulate_payment(db, case_id)
+            return {"status": "payment_confirmed", "case_id": case_id}
+        return {"status": "ignored", "reason": "no case_id in notes"}
 
-    db_case = models.RecoveryCase(
-        case_type=CaseType.INVOICE_OVERDUE,
-        amount_paise=body.amount_paise,
-        currency=body.currency,
-        customer_id=body.customer_id,
-        customer_email=customer_email,
-        customer_phone=body.customer_phone,
-        priority_score=priority_score,
-        raw_signal_payload={
-            "invoice_id": body.invoice_id,
-            "days_overdue": body.days_overdue,
-            "due_date": body.due_date,
-            "invoice_number": body.invoice_number or body.invoice_id,
-            "customer_email": customer_email,
-            "customer_phone": body.customer_phone
+    # ── Payment failure / subscription failure → create case ──
+    case_type = None
+    amount = 0
+    customer_id = "unknown"
+    payment_rail = None
+    raw_payload = event_payload
+
+    if "subscription" in event_name or event_name == "payment.failed":
+        case_type = CaseType.SUBSCRIPTION_FAILED
+        pe = data.get("payment", {}).get("entity", {})
+        amount = pe.get("amount", 0)
+        customer_id = pe.get("customer_id") or pe.get("email") or "cust_webhook"
+        payment_rail = pe.get("method", "card")
+        raw_payload = {
+            "reason": pe.get("error_code") or pe.get("error_reason") or "payment_failed",
+            "email": pe.get("email"),
+            "contact": pe.get("contact"),
+            "error_description": pe.get("error_description"),
         }
-    )
-
-    audit_log = models.AuditLog(
-        action_type="SIGNAL_RECEIVED",
-        description=f"Invoice overdue signal received for {body.invoice_id} ({body.days_overdue} days past due)",
-        reasoning="Automated detection via external billing signal"
-    )
-    db_case.audit_logs.append(audit_log)
-    db.add(db_case)
-    db.commit()
-    db.refresh(db_case)
-
-    try:
-        inngest_client.send_sync(Event(name="case.received", data={"case_id": db_case.id}))
-    except Exception as e:
-        logger.warning(f"Inngest event dispatch failed for invoice case {db_case.id}: {e}.")
-
-    return {"status": "created", "case_id": db_case.id}
-
-@app.post("/webhooks/razorpay")
-async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(None), db: Session = Depends(get_db)):
-    raw_body = await request.body()
-    webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
-    
-    if not webhook_secret:
-        logger.error("RAZORPAY_WEBHOOK_SECRET is not configured")
-        raise HTTPException(status_code=500, detail="Webhook configuration error")
-        
-    if not x_razorpay_signature:
-        raise HTTPException(status_code=400, detail="Missing signature")
-        
-    # Verify signature
-    expected_sig = hmac.new(
-        key=webhook_secret.encode('utf-8'),
-        msg=raw_body,
-        digestmod=hashlib.sha256
-    ).hexdigest()
-    
-    if not hmac.compare_digest(expected_sig, x_razorpay_signature):
-        raise HTTPException(status_code=400, detail="Invalid signature")
-        
-    try:
-        payload = json.loads(raw_body)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-        
-    event_type = payload.get("event")
-    if event_type not in ("payment.failed", "subscription.pending", "payment_link.expired", "payment_link.paid", "payment.captured", "invoice.expired", "invoice.past_due", "invoice.paid"):
-        return {"status": "ignored", "reason": "unhandled_event_type"}
-        
-    event_id = payload.get("id", "unknown_event_id")
-    
-    from sqlalchemy.dialects.postgresql import insert
-    
-    if event_type in ("payment_link.paid", "payment.captured", "invoice.paid"):
-        if event_type == "payment_link.paid":
-            entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
-            case_id = entity.get("notes", {}).get("case_id")
-            payment_id = entity.get("id")
-            amount_paise = entity.get("amount_paid", 0)
-        elif event_type == "invoice.paid":
-            entity = payload.get("payload", {}).get("invoice", {}).get("entity", {})
-            case_id = entity.get("notes", {}).get("case_id")
-            payment_id = entity.get("payment_id") or entity.get("id")
-            amount_paise = entity.get("amount_paid", 0)
-        else:
-            entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
-            case_id = entity.get("notes", {}).get("case_id")
-            payment_id = entity.get("id")
-            amount_paise = entity.get("amount", 0)
-            
-        if not case_id or not payment_id:
-            return {"status": "ignored", "reason": "missing_case_id_or_payment_id"}
-
-        return process_payment_confirmation(db, payment_id, case_id, amount_paise, event_type)
-    
-    priority_score = 0
-    # Map payload to case fields
-    if event_type == "payment.failed":
-        case_type = CaseType.SUBSCRIPTION_FAILED
-        payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
-        amount_paise = payment.get("amount", 0)
-        currency = payment.get("currency", "INR")
-        customer_id = payment.get("customer_id") or payment.get("email") or "unknown"
-        payment_rail = payment.get("method")
-        priority_score = compute_priority_score(case_type, amount_paise, {"reason": payment.get("error_reason", "")})
-    elif event_type == "subscription.pending":
-        case_type = CaseType.SUBSCRIPTION_FAILED
-        sub = payload.get("payload", {}).get("subscription", {}).get("entity", {})
-        amount_paise = sub.get("charge_at_mrr", 0)  # best effort fallback
-        currency = "INR"
-        customer_id = sub.get("customer_id") or "unknown"
-        payment_rail = None
-        priority_score = compute_priority_score(case_type, amount_paise, {})
-    elif event_type in ("payment_link.expired", "invoice.expired", "invoice.past_due"):
-        # Feature 1: invoice / payment link past due — Razorpay fires this when a link expires unpaid.
+    elif "invoice" in event_name:
         case_type = CaseType.INVOICE_OVERDUE
-        if "payment_link" in payload.get("payload", {}):
-            link = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
-            if link.get("notes", {}).get("case_id"):
-                return {"status": "ignored", "reason": "internal_payment_link_expired"}
-        else:
-            link = payload.get("payload", {}).get("invoice", {}).get("entity", {})
-            if link.get("notes", {}).get("case_id"):
-                return {"status": "ignored", "reason": "internal_invoice_expired"}
-        
-        amount_paise = link.get("amount", 0)
-        currency = link.get("currency", "INR")
-        customer = link.get("customer") or {}
-        customer_id = (
-            customer.get("id")
-            or customer.get("email")
-            or "unknown"
-        )
-        payment_rail = None
-        priority_score = compute_priority_score(
-            case_type, amount_paise,
-            {"days_overdue": 0, "invoice_number": link.get("reference_id", "")}
-        )
-        
-    if amount_paise <= 0:
-        return {"status": "ignored", "reason": "invalid_amount"}
-        
-    # Atomic INSERT ON CONFLICT DO NOTHING
-    stmt = insert(models.RecoveryCase).values(
-        id=models.generate_uuid(),
-        case_type=case_type,
-        amount_paise=amount_paise,
-        currency=currency,
-        customer_id=customer_id,
-        payment_rail=payment_rail,
-        priority_score=priority_score,
-        raw_signal_payload=payload,
-        razorpay_event_id=event_id
-    ).on_conflict_do_nothing(
-        index_elements=['razorpay_event_id'],
-        index_where=models.RecoveryCase.razorpay_event_id.isnot(None)
-    ).returning(models.RecoveryCase.id)
-    
-    result = db.execute(stmt)
-    inserted_id = result.scalar()
-    db.commit()
-    
-    if inserted_id:
-        inserted = True
-        case_id = inserted_id
-    else:
-        inserted = False
-        # Retrieve the pre-existing case ID (with short retry in case concurrent thread is committing)
-        import time
-        existing_case = None
-        for _ in range(10):
-            db.rollback()
-            existing_case = db.query(models.RecoveryCase).filter(
-                models.RecoveryCase.razorpay_event_id == event_id
-            ).first()
-            if existing_case:
-                break
-            time.sleep(0.05)
-        if not existing_case:
-            raise HTTPException(status_code=500, detail="Concurrency conflict, please retry")
-        case_id = existing_case.id
-    
-    if not inserted:
-        return {"status": "idempotent", "case_id": case_id}
+        ie = data.get("invoice", {}).get("entity", {})
+        amount = ie.get("amount", 0)
+        customer_id = ie.get("customer_id") or ie.get("customer_email") or "cust_invoice"
+        raw_payload = {
+            "invoice_number": ie.get("invoice_number", "INV-WH"),
+            "days_overdue": 1,
+            "email": ie.get("customer_email"),
+            "contact": ie.get("customer_phone"),
+        }
 
-    # Only create audit log and fire event if it was actually created
-    audit_log = models.AuditLog(
-        case_id=case_id,
-        action_type="SIGNAL_RECEIVED",
-        description=f"Webhook case created for event: {event_type}",
-        reasoning="Automated ingestion via Razorpay webhook"
+    if not case_type or amount <= 0:
+        return {"status": "ignored", "event": event_name}
+
+    priority = compute_priority_score(case_type.value, amount, raw_payload)
+    case = RecoveryCase(
+        case_type=case_type, amount_paise=amount, customer_id=customer_id,
+        customer_email=raw_payload.get("email"), customer_phone=raw_payload.get("contact"),
+        payment_rail=payment_rail, priority_score=priority, raw_signal_payload=raw_payload,
     )
-    db.add(audit_log)
+    db.add(case)
     db.commit()
-
-    try:
-        inngest_client.send_sync(Event(name="case.received", data={"case_id": case_id}))
-    except Exception as e:
-        logger.warning(f"Inngest event dispatch failed for webhook case {case_id}: {e}.")
-
-    return {"status": "created", "case_id": case_id}
+    db.refresh(case)
+    _audit(db, case.id, "SIGNAL_RECEIVED", f"Webhook: {event_name}", f"Razorpay webhook: {event_name}")
+    db.commit()
+    background_tasks.add_task(_run_pipeline_safe, case.id)
+    return {"status": "created", "case_id": case.id}
 
 
-@app.get("/api/v1/cases", response_model=List[schemas.RecoveryCaseResponse])
+@app.post("/api/v1/beacon/checkout-abandoned", status_code=status.HTTP_201_CREATED)
+def checkout_abandoned_beacon(
+    payload: dict,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Beacon endpoint for abandoned checkout signals from the frontend."""
+    amount = payload.get("amount_paise", 0)
+    customer_id = payload.get("customer_id", "cust_checkout")
+    priority = compute_priority_score(CaseType.CHECKOUT_ABANDONED.value, amount, payload)
+    case = RecoveryCase(
+        case_type=CaseType.CHECKOUT_ABANDONED, amount_paise=amount, customer_id=customer_id,
+        customer_email=payload.get("email"), customer_phone=payload.get("contact"),
+        payment_rail=payload.get("payment_rail", "upi"), priority_score=priority,
+        raw_signal_payload=payload,
+    )
+    db.add(case)
+    db.commit()
+    db.refresh(case)
+    _audit(db, case.id, "SIGNAL_RECEIVED", "Checkout drop-off beacon", "Frontend abandonment beacon")
+    db.commit()
+    background_tasks.add_task(_run_pipeline_safe, case.id)
+    return {"status": "created", "case_id": case.id}
+
+
+# ── Case Listing ─────────────────────────────────────────────────────────
+
+@app.get("/api/v1/cases", response_model=List[CaseResponse])
 def list_cases(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    cases = db.query(models.RecoveryCase).order_by(models.RecoveryCase.priority_score.desc(), models.RecoveryCase.created_at.desc()).offset(skip).limit(limit).all()
-    return cases
+    """List all cases, sorted by priority score (Feature 13: Recovery Prioritization)."""
+    return db.query(RecoveryCase).order_by(
+        RecoveryCase.priority_score.desc(),
+        RecoveryCase.created_at.desc(),
+    ).offset(skip).limit(limit).all()
 
 
 # ── Audit Trail (Feature 10) ────────────────────────────────────────────
 
-@app.get("/api/v1/cases/{case_id}/audit", response_model=List[schemas.AuditLogResponse])
-def get_case_audit_trail(case_id: str, db: Session = Depends(get_db)):
-    """Full audit trail for a single case — signal → diagnosis → decision → policy → execution."""
-    db_case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
-    if not db_case:
-        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-    logs = db.query(models.AuditLog).filter(
-        models.AuditLog.case_id == case_id
-    ).order_by(models.AuditLog.created_at).all()
-    return logs
+@app.get("/api/v1/cases/{case_id}/audit", response_model=List[AuditLogResponse])
+def get_audit_trail(case_id: str, db: Session = Depends(get_db)):
+    """Full audit trail: signal → diagnosis → decision → policy → execution."""
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(404, f"Case {case_id} not found")
+    return db.query(AuditLog).filter(AuditLog.case_id == case_id).order_by(AuditLog.created_at).all()
 
 
 # ── Escalation Queue (Feature 9) ────────────────────────────────────────
 
-@app.get("/api/v1/cases/escalated", response_model=List[schemas.RecoveryCaseResponse])
-def list_escalated_cases(db: Session = Depends(get_db)):
+@app.get("/api/v1/cases/escalated", response_model=List[CaseResponse])
+def list_escalated(db: Session = Depends(get_db)):
     """Cases needing human review — full context attached."""
-    cases = db.query(models.RecoveryCase).filter(
-        models.RecoveryCase.status.in_([CaseStatus.ESCALATED, CaseStatus.AWAITING_APPROVAL])
-    ).all()
-    return cases
+    return db.query(RecoveryCase).filter(
+        RecoveryCase.status.in_([CaseStatus.ESCALATED, CaseStatus.AWAITING_APPROVAL])
+    ).order_by(RecoveryCase.priority_score.desc()).all()
+
+
+# ── Human Approval Gate (Feature 15) ────────────────────────────────────
+
+@app.post("/api/v1/cases/{case_id}/approve")
+def approve_case(
+    case_id: str,
+    body: ApprovalRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Approve an escalated action — triggers execution."""
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+    if case.status != CaseStatus.AWAITING_APPROVAL or case.approval_status != ApprovalStatus.PENDING:
+        raise HTTPException(409, "Case is not awaiting approval")
+    if case.pending_decision_id != body.decision_id or case.pending_decision_hash != body.decision_hash:
+        raise HTTPException(409, "Decision ID/hash mismatch — stale approval")
+
+    case.approval_status = ApprovalStatus.APPROVED
+    case.approved_decision_id = body.decision_id
+    case.approved_decision_hash = body.decision_hash
+    _audit(db, case.id, "APPROVED", f"Approved by {body.reviewer_id}",
+           f"Decision {body.decision_id} approved for execution.")
+    db.commit()
+
+    # Execute the approved action in background
+    background_tasks.add_task(_execute_approved, case_id)
+    return {"status": "approved", "case_id": case_id}
+
+
+@app.post("/api/v1/cases/{case_id}/reject")
+def reject_case(
+    case_id: str,
+    body: ApprovalRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Reject an escalated action — re-runs the AI pipeline."""
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+    if case.status != CaseStatus.AWAITING_APPROVAL:
+        raise HTTPException(409, "Case is not awaiting approval")
+
+    case.approval_status = ApprovalStatus.REJECTED
+    case.status = CaseStatus.IN_PROGRESS
+    _audit(db, case.id, "REJECTED", f"Rejected by {body.reviewer_id}",
+           "Returned to AI pipeline for re-evaluation.")
+    db.commit()
+
+    background_tasks.add_task(_run_pipeline_safe, case_id)
+    return {"status": "rejected", "case_id": case_id}
+
+
+@app.post("/api/v1/cases/{case_id}/close")
+def close_case(case_id: str, db: Session = Depends(get_db)):
+    """Manually close an escalated/approval-pending case."""
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+    if case.status not in (CaseStatus.ESCALATED, CaseStatus.AWAITING_APPROVAL):
+        raise HTTPException(400, "Can only close escalated or approval-pending cases")
+
+    case.status = CaseStatus.CLOSED
+    _audit(db, case.id, "MANUAL_CLOSE", "Case closed by human reviewer.", "")
+    db.commit()
+    return {"status": "closed", "case_id": case_id}
+
+
+# ── Promise-to-Pay (Feature 14) ─────────────────────────────────────────
+
+@app.post("/api/v1/cases/{case_id}/promise-to-pay")
+def capture_promise_to_pay(case_id: str, body: PromiseToPayRequest, db: Session = Depends(get_db)):
+    """Record a customer's commitment to pay by a specific date."""
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+    if case.status in (CaseStatus.RECOVERED, CaseStatus.CLOSED):
+        raise HTTPException(400, f"Case already resolved ({case.status.value})")
+    if body.date < date.today():
+        raise HTTPException(400, "Promise date must be today or in the future")
+
+    case.promise_to_pay_date = body.date
+    _audit(db, case.id, "PTP_CAPTURED",
+           f"Promise-to-pay: customer committed to pay by {body.date}",
+           f"{body.note or 'No note provided.'} Reminders suppressed until {body.date}.")
+    db.commit()
+    return {"status": "captured", "case_id": case_id, "promise_to_pay_date": str(body.date)}
+
+
+# ── Customer Opt-Out (Feature 8) ────────────────────────────────────────
+
+@app.post("/api/v1/cases/{case_id}/opt-out")
+def opt_out(case_id: str, body: OptOutRequest = OptOutRequest(), db: Session = Depends(get_db)):
+    """Customer opt-out — immediately stops recovery and closes the case."""
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "Case not found")
+
+    case.opted_out = True
+    case.status = CaseStatus.CLOSED
+    _audit(db, case.id, "OPT_OUT", "Customer opted out of recovery.", body.reason or "")
+    db.commit()
+    return {"status": "opted_out", "case_id": case_id}
 
 
 # ── Batch Processing (Feature 11) ───────────────────────────────────────
 
 @app.post("/api/v1/batch")
-def run_batch(background_tasks: BackgroundTasks, simulate: bool = False, db: Session = Depends(get_db)):
-    """Generate 50+ synthetic cases spanning all case types and process them."""
-    synthetic = _generate_synthetic_cases()
-    # Bug 6 Fix: Sort synthetic cases by priority score descending to enforce UI queue ordering
-    synthetic.sort(key=lambda x: x.get("priority_score", 0), reverse=True)
+def run_batch(simulate: bool = True, db: Session = Depends(get_db)):
+    """Generate 50+ synthetic cases and process them through the full pipeline."""
+    synthetic = generate_batch()
     created_ids = []
 
-    for case_data in synthetic:
-        db_case = models.RecoveryCase(
-            case_type=case_data["case_type"],
-            amount_paise=case_data["amount_paise"],
-            currency=case_data["currency"],
-            customer_id=case_data["customer_id"],
-            customer_email=case_data.get("customer_email") or f"{case_data['customer_id']}@example.com",
-            customer_phone=case_data.get("customer_phone"),
-            payment_rail=case_data.get("payment_rail"),
-            priority_score=case_data.get("priority_score", 0),
-            raw_signal_payload=case_data["raw_signal_payload"],
+    for data in synthetic:
+        case = RecoveryCase(
+            case_type=data["case_type"],
+            amount_paise=data["amount_paise"],
+            currency=data["currency"],
+            customer_id=data["customer_id"],
+            customer_email=data.get("customer_email"),
+            customer_phone=data.get("customer_phone"),
+            payment_rail=data.get("payment_rail"),
+            priority_score=data.get("priority_score", 0),
+            raw_signal_payload=data["raw_signal_payload"],
         )
-        audit_log = models.AuditLog(
-            action_type="SIGNAL_RECEIVED",
-            description=f"Batch case created: {case_data['case_type']}",
-            reasoning="Synthetic batch case"
-        )
-        db_case.audit_logs.append(audit_log)
-        db.add(db_case)
+        db.add(case)
         db.commit()
-        db.refresh(db_case)
+        db.refresh(case)
+        _audit(db, case.id, "SIGNAL_RECEIVED",
+               f"Batch case: {data['case_type']}", "Synthetic batch case")
+        db.commit()
+        created_ids.append(case.id)
 
-        # Fire workflow event
+    # Run the pipeline for each case
+    results = []
+    for idx, cid in enumerate(created_ids):
         try:
-            if simulate:
-                pass # Event not sent to Inngest if simulating
-            else:
-                inngest_client.send_sync(Event(name="case.received", data={"case_id": db_case.id}))
+            result = run_pipeline(db, cid)
+            # Simulate payment for ~60% of payment_pending cases
+            if result.get("status") == "payment_pending" and idx % 5 < 3:
+                _simulate_payment(db, cid)
+            results.append(result)
         except Exception as e:
-            logger.warning(f"Inngest dispatch failed for batch case {db_case.id}: {e}")
-
-        created_ids.append(db_case.id)
-
-    if simulate:
-        background_tasks.add_task(_simulate_batch_pipeline, created_ids)
+            logger.error(f"Batch pipeline error for {cid}: {e}")
+            results.append({"status": "error", "case_id": cid, "reason": str(e)})
 
     return {"cases_created": len(created_ids), "case_ids": created_ids}
 
-def _simulate_batch_pipeline(case_ids: List[str]):
-    """Synchronously runs the core AI pipeline steps for demo purposes."""
-    from app.database import SessionLocal
-    db = SessionLocal()
-    try:
-        from app.models import RecoveryCase, CaseStatus
-        from app.domain import RecoveryCaseContext, ExecutionStatus
-        from app.ai.diagnosis import diagnose_failure
-        from app.ai.decision import decide_action
-        from app.policy import evaluate_policy
-        from app.execution.executor import RazorpayExecutor
-        from app.db.audit_repository import update_case_status
-        import random
 
-        import os
-        from app.ai.provider import GeminiProvider, GroqProvider, AnthropicProvider, FallbackProvider
-        
-        def get_prov(name):
-            if name == "groq": return GroqProvider()
-            if name == "anthropic": return AnthropicProvider()
-            return GeminiProvider()
+# ── Demo Endpoints ──────────────────────────────────────────────────────
 
-        provider = FallbackProvider(
-            get_prov(os.getenv("AI_PRIMARY_PROVIDER", "gemini").lower()),
-            get_prov(os.getenv("AI_FALLBACK_PROVIDER", "groq").lower())
+@app.post("/api/v1/demo/seed")
+def seed_demo(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Seed 5 canonical demo scenarios."""
+    scenarios = generate_demo_scenarios()
+    created_ids = []
+
+    for data in scenarios:
+        case = RecoveryCase(
+            case_type=data["case_type"],
+            amount_paise=data["amount_paise"],
+            currency=data["currency"],
+            customer_id=data["customer_id"],
+            customer_email=data.get("customer_email"),
+            customer_phone=data.get("customer_phone"),
+            payment_rail=data.get("payment_rail"),
+            priority_score=data.get("priority_score", 0),
+            raw_signal_payload=data["raw_signal_payload"],
         )
-        executor = RazorpayExecutor()
-        
-        for idx, cid in enumerate(case_ids):
-            try:
-                c = db.query(RecoveryCase).filter(RecoveryCase.id == cid).first()
-                if not c: continue
-                ctx = RecoveryCaseContext(
-                    id=c.id, case_type=c.case_type, amount_paise=c.amount_paise,
-                    currency=c.currency, customer_id=c.customer_id, payment_rail=c.payment_rail,
-                    status=c.status, priority_score=c.priority_score, raw_signal_payload=c.raw_signal_payload,
-                    retry_count=c.retry_count, cumulative_discount_paise=c.cumulative_discount_paise
-                )
-                
-                # 1. Diagnose
-                diag = diagnose_failure(ctx, provider)
-                if not diag: continue
-                
-                # 2. Decide
-                dec = decide_action(ctx, diag, provider)
-                if not dec: continue
-                
-                # 3. Policy
-                pol = evaluate_policy(ctx, dec, diag)
-                
-                # 4. Execute or Wait
-                if not pol.requires_human_approval and pol.approved_decision:
-                    exec_res = executor.execute(ctx, pol.approved_decision)
-                    if exec_res.status in [ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN]:
-                        update_case_status(db, c.id, CaseStatus.PAYMENT_PENDING)
-                        # Deterministic synthetic payment event (replaces random probability)
-                        if idx % 5 < 3:
-                            pay_id = f"pay_sim_{cid.replace('-', '')[:14]}"
-                            from app.main import process_payment_confirmation
-                            process_payment_confirmation(db, pay_id, c.id, c.amount_paise, "batch_simulation")
-                    else:
-                        update_case_status(db, c.id, CaseStatus.FAILED)
-                elif pol.requires_human_approval:
-                    c.status = CaseStatus.AWAITING_APPROVAL
-                    c.approval_status = models.ApprovalStatus.PENDING
-                    c.pending_decision_json = dec.model_dump()
-                    c.pending_decision_id = dec.decision_id
-                    c.pending_decision_hash = dec.canonical_hash()
-                    db.commit()
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).error(f"Simulated batch error for {cid}: {e}")
+        db.add(case)
+        db.commit()
+        db.refresh(case)
+        _audit(db, case.id, "SIGNAL_RECEIVED", f"Demo: {data['case_type']}", "Demo scenario")
+        db.commit()
+        created_ids.append(case.id)
 
-    finally:
-        db.close()
+    # Process each demo case in background
+    for cid in created_ids:
+        background_tasks.add_task(_run_pipeline_safe, cid)
 
-def _generate_synthetic_cases():
-    """Generate 50 synthetic cases with deterministic distribution and customer contact details."""
-    cases = []
-
-    # 15 subscription failures — soft declines (retryable)
-    soft_reasons = ["insufficient_funds", "bank_network_timeout", "card_limit_exceeded",
-                    "processing_error", "temporary_hold"]
-    soft_amounts = [9900, 29900, 49900, 99900, 199900]
-    soft_rails = ["card", "upi", "enach"]
-    for i in range(15):
-        amount = soft_amounts[i % len(soft_amounts)]
-        cust_id = f"cust_batch_{i:03d}"
-        payload = {
-            "reason": soft_reasons[i % len(soft_reasons)],
-            "email": f"{cust_id}@example.com",
-            "contact": f"+9198765{i:05d}"
-        }
-        cases.append({
-            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-            "amount_paise": amount,
-            "currency": "INR",
-            "customer_id": cust_id,
-            "customer_email": f"{cust_id}@example.com",
-            "customer_phone": f"+9198765{i:05d}",
-            "payment_rail": soft_rails[i % len(soft_rails)],
-            "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
-            "raw_signal_payload": payload
-        })
-
-    # 8 subscription failures — hard declines (should NOT be retried)
-    hard_reasons = ["lost_card_reported", "stolen_card", "account_closed", "fraud_suspected"]
-    hard_amounts = [9900, 29900, 49900]
-    for i in range(8):
-        amount = hard_amounts[i % len(hard_amounts)]
-        cust_id = f"cust_batch_{15 + i:03d}"
-        payload = {
-            "reason": hard_reasons[i % len(hard_reasons)],
-            "email": f"{cust_id}@example.com",
-            "contact": f"+9198765{15 + i:05d}"
-        }
-        cases.append({
-            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-            "amount_paise": amount,
-            "currency": "INR",
-            "customer_id": cust_id,
-            "customer_email": f"{cust_id}@example.com",
-            "customer_phone": f"+9198765{15 + i:05d}",
-            "payment_rail": "card",
-            "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
-            "raw_signal_payload": payload
-        })
-
-    # 12 checkout abandoned — friction signals
-    cart_amounts = [19900, 49900, 99900, 249900, 499900]
-    cart_rails = ["card", "upi"]
-    for i in range(12):
-        amount = cart_amounts[i % len(cart_amounts)]
-        abandoned_hour = (i * 7) % 24
-        cust_id = f"cust_batch_{23 + i:03d}"
-        payload = {
-            "cart_items": 1 + (i % 5),
-            "time_on_page_sec": 30 + (i * 25) % 270,
-            "is_repeat_customer": (i % 2 == 0),
-            "abandoned_hour": abandoned_hour,
-            "time_of_day": "night" if abandoned_hour in [22, 23, 0, 1, 2, 3, 4, 5] else "day",
-            "email": f"{cust_id}@example.com",
-            "contact": f"+9198765{23 + i:05d}"
-        }
-        cases.append({
-            "case_type": CaseType.CHECKOUT_ABANDONED.value,
-            "amount_paise": amount,
-            "currency": "INR",
-            "customer_id": cust_id,
-            "customer_email": f"{cust_id}@example.com",
-            "customer_phone": f"+9198765{23 + i:05d}",
-            "payment_rail": cart_rails[i % len(cart_rails)],
-            "priority_score": compute_priority_score(CaseType.CHECKOUT_ABANDONED, amount, payload),
-            "raw_signal_payload": payload
-        })
-
-    # 10 invoice overdue — missed payments & cash-flow delay / disputes
-    inv_amounts = [100000, 250000, 500000, 1000000, 2500000]
-    for i in range(10):
-        amount = inv_amounts[i % len(inv_amounts)]
-        cust_id = f"cust_batch_{35 + i:03d}"
-        # Synthetic payment history: half are good past payers with cash-flow delay
-        has_good_history = (i % 2 == 0)
-        payment_history = {
-            "past_invoices_count": 8,
-            "on_time_ratio": 0.88 if has_good_history else 0.40,
-            "average_delay_days": 2 if has_good_history else 18,
-            "history_classification": "cash_flow_delay" if has_good_history else "simply_missed"
-        }
-        payload = {
-            "days_overdue": 3 + (i * 3) % 28,
-            "invoice_number": f"INV-{1000 + i}",
-            "payment_history": payment_history,
-            "email": f"{cust_id}@example.com",
-            "contact": f"+9198765{35 + i:05d}"
-        }
-        cases.append({
-            "case_type": CaseType.INVOICE_OVERDUE.value,
-            "amount_paise": amount,
-            "currency": "INR",
-            "customer_id": cust_id,
-            "customer_email": f"{cust_id}@example.com",
-            "customer_phone": f"+9198765{35 + i:05d}",
-            "payment_rail": None,
-            "priority_score": compute_priority_score(CaseType.INVOICE_OVERDUE, amount, payload),
-            "raw_signal_payload": payload
-        })
-
-    # 5 high-value cases (trigger human approval policy)
-    high_amounts = [5500000, 7000000, 10000000]
-    for i in range(5):
-        amount = high_amounts[i % len(high_amounts)]
-        cust_id = f"cust_batch_{45 + i:03d}"
-        payload = {
-            "reason": "insufficient_funds",
-            "email": f"{cust_id}@example.com",
-            "contact": f"+9198765{45 + i:05d}"
-        }
-        cases.append({
-            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-            "amount_paise": amount,
-            "currency": "INR",
-            "customer_id": cust_id,
-            "customer_email": f"{cust_id}@example.com",
-            "customer_phone": f"+9198765{45 + i:05d}",
-            "payment_rail": "enach",
-            "priority_score": compute_priority_score(CaseType.SUBSCRIPTION_FAILED, amount, payload),
-            "raw_signal_payload": payload
-        })
-
-    return cases
+    return {"status": "seeded", "count": len(created_ids), "case_ids": created_ids}
 
 
-# ── Recovery Analytics (Feature 12) ─────────────────────────────────────
+@app.post("/api/v1/demo/confirm-payment/{case_id}")
+def demo_confirm_payment(case_id: str, db: Session = Depends(get_db)):
+    """Demo-only: simulate a customer payment."""
+    _simulate_payment(db, case_id)
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    return {"status": case.status.value if case else "not_found", "case_id": case_id}
+
+
+# ── Recovery Analytics (Feature 12 + 17) ────────────────────────────────
 
 @app.get("/api/v1/analytics")
 def get_analytics(db: Session = Depends(get_db)):
-    """
-    Computes recovery analytics over all processed cases.
-    """
-    cases = db.query(models.RecoveryCase).all()
+    """Aggregated recovery metrics including net economics (Feature 17)."""
+    cases = db.query(RecoveryCase).all()
+    total = len(cases)
+    if total == 0:
+        return {"total_cases": 0, "total_at_risk_paise": 0, "total_recovered_paise": 0,
+                "net_recovered_paise": 0, "recovery_rate_percent": 0.0,
+                "net_recovery_rate_percent": 0.0, "total_discount_cost_paise": 0,
+                "total_comms_cost_paise": 0, "breakdown_by_case_type": {},
+                "breakdown_by_status": {}, "breakdown_by_channel": {}, "exceptions": []}
 
-    total_cases = len(cases)
-    total_at_risk_paise = sum(c.amount_paise for c in cases)
-    recovered_cases = sum(1 for c in cases if c.status == CaseStatus.RECOVERED)
-    total_recovered_paise = sum(c.recovered_amount_paise for c in cases)
-    total_discounts_paise = sum(c.cumulative_discount_paise for c in cases)
-    total_comms_cost_paise = sum(c.cumulative_comms_cost_paise for c in cases)
-
-    recovery_rate_pct = (
-        round((recovered_cases / total_cases) * 100, 1)
-        if total_cases > 0 else 0.0
-    )
-    revenue_recovery_rate_pct = (
-        round((total_recovered_paise / total_at_risk_paise) * 100, 1)
-        if total_at_risk_paise > 0 else 0.0
-    )
-
-    # Net Recovery Economics (Feature 17): Recovered Revenue minus discounts and communications cost
-    net_recovered_paise = total_recovered_paise - total_discounts_paise - total_comms_cost_paise
+    at_risk = sum(c.amount_paise for c in cases)
+    recovered_count = sum(1 for c in cases if c.status == CaseStatus.RECOVERED)
+    recovered_paise = sum(c.recovered_amount_paise for c in cases)
+    discounts = sum(c.cumulative_discount_paise for c in cases)
+    comms_cost = sum(c.cumulative_comms_cost_paise for c in cases)
+    net = recovered_paise - discounts - comms_cost
 
     # Breakdown by case type
     by_type = {}
@@ -888,57 +470,32 @@ def get_analytics(db: Session = Depends(get_db)):
 
     # Breakdown by channel
     by_channel = {}
-    
-    # Get latest EXECUTION audit log for each case to determine channel
-    execution_logs = db.query(models.AuditLog).filter(
-        models.AuditLog.action_type == "ACTION_EXECUTED"
-    ).order_by(models.AuditLog.created_at.desc()).all()
-    
-    # We only care about the latest execution per case
-    latest_exec_per_case = {}
-    for log in execution_logs:
-        if log.case_id not in latest_exec_per_case:
-            latest_exec_per_case[log.case_id] = log
-
-    import json
     for c in cases:
-        channel = c.latest_channel
-        if not channel and c.id in latest_exec_per_case:
-            try:
-                data = json.loads(latest_exec_per_case[c.id].reasoning or "{}")
-                if isinstance(data, dict):
-                    channel = data.get("action_parameters_used", {}).get("channel")
-            except Exception:
-                pass
-        
-        if not channel:
-            channel = c.payment_rail or "email"
-
-        if channel not in by_channel:
-            by_channel[channel] = {"total": 0, "recovered": 0, "at_risk_paise": 0, "recovered_paise": 0}
-        
-        by_channel[channel]["total"] += 1
-        by_channel[channel]["at_risk_paise"] += c.amount_paise
+        ch = c.latest_channel or c.payment_rail or "email"
+        if ch not in by_channel:
+            by_channel[ch] = {"total": 0, "recovered": 0, "at_risk_paise": 0, "recovered_paise": 0}
+        by_channel[ch]["total"] += 1
+        by_channel[ch]["at_risk_paise"] += c.amount_paise
         if c.status == CaseStatus.RECOVERED:
-            by_channel[channel]["recovered"] += 1
-        by_channel[channel]["recovered_paise"] += c.recovered_amount_paise
+            by_channel[ch]["recovered"] += 1
+        by_channel[ch]["recovered_paise"] += c.recovered_amount_paise
 
-    # Exception list — cases that couldn't be recovered
+    # Exception list (Feature 12)
     exceptions = [
-        {"case_id": c.id, "status": c.status.value,
-         "case_type": c.case_type.value, "amount_paise": c.amount_paise}
-        for c in cases if c.status in [CaseStatus.FAILED, CaseStatus.ESCALATED, CaseStatus.CLOSED]
+        {"case_id": c.id, "status": c.status.value, "case_type": c.case_type.value,
+         "amount_paise": c.amount_paise}
+        for c in cases if c.status in (CaseStatus.FAILED, CaseStatus.ESCALATED, CaseStatus.CLOSED)
     ]
 
     return {
-        "total_cases": total_cases,
-        "total_at_risk_paise": total_at_risk_paise,
-        "total_recovered_paise": total_recovered_paise,
-        "total_discount_cost_paise": total_discounts_paise,
-        "total_comms_cost_paise": total_comms_cost_paise,
-        "net_recovered_paise": net_recovered_paise,
-        "recovery_rate_percent": round(recovered_cases / total_cases * 100, 2) if total_cases > 0 else 0.0,
-        "net_recovery_rate_percent": round(net_recovered_paise / total_at_risk_paise * 100, 2) if total_at_risk_paise > 0 else 0.0,
+        "total_cases": total,
+        "total_at_risk_paise": at_risk,
+        "total_recovered_paise": recovered_paise,
+        "total_discount_cost_paise": discounts,
+        "total_comms_cost_paise": comms_cost,
+        "net_recovered_paise": net,
+        "recovery_rate_percent": round(recovered_count / total * 100, 2),
+        "net_recovery_rate_percent": round(net / at_risk * 100, 2) if at_risk > 0 else 0.0,
         "breakdown_by_case_type": by_type,
         "breakdown_by_status": by_status,
         "breakdown_by_channel": by_channel,
@@ -946,325 +503,79 @@ def get_analytics(db: Session = Depends(get_db)):
     }
 
 
-# ── Policy Config ────────────────────────────────────────────────────────
+# ── Policy Config (Feature 3: visible, inspectable) ─────────────────────
 
-@app.get("/api/v1/policy", response_model=schemas.PolicyConfigResponse)
+@app.get("/api/v1/policy", response_model=PolicyConfigResponse)
 def get_policy():
-    return schemas.PolicyConfigResponse(
-        max_retries=PolicyConfig.MAX_RETRIES,
-        max_discount_percent=PolicyConfig.MAX_DISCOUNT_PERCENT,
-        require_human_approval_above_paise=PolicyConfig.REQUIRE_HUMAN_APPROVAL_ABOVE_PAISE,
-        block_hard_declines=PolicyConfig.BLOCK_HARD_DECLINES,
-        min_confidence_score=PolicyConfig.MIN_CONFIDENCE_SCORE,
-        min_enach_delay_hours=PolicyConfig.MIN_ENACH_DELAY_HOURS,
-        pre_debit_notice_hours=PolicyConfig.PRE_DEBIT_NOTICE_HOURS,
-        max_days_pursued=PolicyConfig.MAX_DAYS_PURSUED
+    return PolicyConfigResponse(
+        max_retries=POLICY["max_retries"],
+        max_discount_percent=POLICY["max_discount_percent"],
+        require_human_approval_above_paise=POLICY["require_human_approval_above_paise"],
+        block_hard_declines=POLICY["block_hard_declines"],
+        min_confidence_score=POLICY["min_confidence_score"],
+        pre_debit_notice_hours=POLICY["pre_debit_notice_hours"],
+        max_days_pursued=POLICY["max_days_pursued"],
     )
 
 
-# ── Human Approval Gate (Feature 15) ─────────────────────────────────────
+# ── Background helpers ──────────────────────────────────────────────────
 
-@app.post("/api/v1/cases/{case_id}/approve")
-def approve_escalated_case(case_id: str, payload: schemas.DecisionApprovalRequest, db: Session = Depends(get_db)):
-    """Human approval: Atomically unblock case and trigger execution."""
-    if not payload.reviewer_id:
-        raise HTTPException(status_code=400, detail="reviewer_id is required")
-    if not payload.decision_id:
-        raise HTTPException(status_code=400, detail="decision_id is required")
-
-    stmt = (
-        update(models.RecoveryCase)
-        .where(models.RecoveryCase.id == case_id)
-        .where(models.RecoveryCase.status == CaseStatus.AWAITING_APPROVAL)
-        .where(models.RecoveryCase.approval_status == models.ApprovalStatus.PENDING)
-        .where(models.RecoveryCase.pending_decision_id == payload.decision_id)
-        .where(models.RecoveryCase.pending_decision_hash == payload.decision_hash)
-        .values(
-            approval_status=models.ApprovalStatus.APPROVED,
-            approved_decision_id=payload.decision_id,
-            approved_decision_hash=payload.decision_hash,
-            approved_at=func.now(),
-            approved_by=payload.reviewer_id
-        )
-        .returning(models.RecoveryCase.id)
-    )
-
-    result = db.execute(stmt)
-    updated_id = result.scalar()
-    
-    if not updated_id:
-        raise HTTPException(status_code=409, detail="APPROVAL_NO_LONGER_VALID")
-        
-    db.commit()
-
-    # Trigger execution workflow
-    inngest_client.send_sync(Event(name="case.execute_approved", data={"case_id": case_id}))
-    return {"status": "approved", "case_id": case_id}
+def _run_pipeline_safe(case_id: str):
+    """Run the pipeline in a background task with its own DB session."""
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        run_pipeline(db, case_id)
+    except Exception as e:
+        logger.error(f"Pipeline error for {case_id}: {e}")
+    finally:
+        db.close()
 
 
-@app.post("/api/v1/cases/{case_id}/close")
-def close_escalated_case(case_id: str, db: Session = Depends(get_db)):
-    """Human closure: Mark an escalated or approval-pending case as closed."""
-    stmt = (
-        update(models.RecoveryCase)
-        .where(models.RecoveryCase.id == case_id)
-        .where(models.RecoveryCase.status.in_([CaseStatus.ESCALATED, CaseStatus.AWAITING_APPROVAL]))
-        .values(status=CaseStatus.CLOSED)
-        .returning(models.RecoveryCase.id)
-    )
-    result = db.execute(stmt)
-    updated_id = result.scalar()
+def _execute_approved(case_id: str):
+    """Execute a human-approved action."""
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+        if not case or not case.pending_decision_json:
+            return
+        if case.approval_status != ApprovalStatus.APPROVED:
+            return
 
-    if not updated_id:
-        raise HTTPException(status_code=400, detail="Cannot close case: not found or not in an escalated/approval-pending state.")
+        decision = DecisionResult.model_validate(case.pending_decision_json)
+        executor = Executor()
+        exec_result = executor.execute(case, decision)
 
-    db.commit()
-    return {"status": "closed", "case_id": case_id}
+        _audit(db, case.id, "ACTION_EXECUTED",
+               f"Approved action executed: {exec_result.status.value}",
+               json.dumps({"reason": exec_result.reason,
+                           "external_ref": exec_result.external_reference_id}))
 
+        from app.models import ExecutionStatus
+        if exec_result.status in (ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN):
+            case.status = CaseStatus.PAYMENT_PENDING
+        else:
+            case.status = CaseStatus.FAILED
 
-@app.post("/api/v1/cases/{case_id}/reject")
-def reject_escalated_case(case_id: str, payload: schemas.DecisionApprovalRequest, db: Session = Depends(get_db)):
-    """Human rejection: Atomically reject case and return to AI loop."""
-    stmt = (
-        update(models.RecoveryCase)
-        .where(models.RecoveryCase.id == case_id)
-        .where(models.RecoveryCase.status == CaseStatus.AWAITING_APPROVAL)
-        .where(models.RecoveryCase.approval_status == models.ApprovalStatus.PENDING)
-        .where(
-            (models.RecoveryCase.pending_decision_hash == payload.decision_hash) |
-            (models.RecoveryCase.approved_decision_hash == payload.decision_hash)
-        )
-        .values(
-            approval_status=models.ApprovalStatus.REJECTED,
-            status=CaseStatus.IN_PROGRESS
-        )
-        .returning(models.RecoveryCase.id)
-    )
-    result = db.execute(stmt)
-    updated_id = result.scalar()
-    
-    if not updated_id:
-        raise HTTPException(status_code=400, detail="Cannot reject case: not awaiting approval, already processed, or hash mismatch.")
-        
-    db.commit()
-
-    # Log rejection
-    audit_log = models.AuditLog(
-        case_id=case_id,
-        action_type="MANUAL_REJECT",
-        description="Human reviewer rejected AI proposed action",
-        reasoning="Returned to AI loop."
-    )
-    db.add(audit_log)
-    db.commit()
-
-    # Restart workflow
-    inngest_client.send_sync(Event(name="case.received", data={"case_id": case_id}))
-    return {"status": "rejected", "case_id": case_id}
-
-
-# ── Promise-to-Pay Capture (Feature 14) ─────────────────────────────────
-
-@app.post("/api/v1/cases/{case_id}/promise-to-pay")
-def capture_promise_to_pay(case_id: str, body: schemas.PromiseToPayRequest, db: Session = Depends(get_db)):
-    """
-    Capture a customer's verbal/written commitment to pay by a specific date.
-    
-    Effect:
-    - Records the date on the case.
-    - Suppresses standard AI reminders until that date (the workflow checks this field).
-    - If payment is not received by the promised date, the case is auto-escalated
-      with reason 'promise to pay broken'.
-    """
-    existing = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
-    if not existing:
-        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-    if existing.status in [CaseStatus.RECOVERED, CaseStatus.CLOSED]:
-        raise HTTPException(status_code=400, detail=f"Case is already resolved ({existing.status.value}); cannot set a promise-to-pay date.")
-
-    from datetime import date
-    if body.date < date.today():
-        raise HTTPException(status_code=400, detail="promise_to_pay_date must be today or in the future.")
-
-    existing.promise_to_pay_date = body.date
-    audit_log = models.AuditLog(
-        case_id=case_id,
-        action_type="PTP_CAPTURED",
-        description=f"Promise-to-pay captured: customer committed to pay by {body.date}",
-        reasoning=(
-            f"{body.note or 'Customer stated they will pay by this date.'} "
-            f"Standard recovery reminders suppressed until {body.date}. "
-            f"Automatic escalation will trigger if payment is not received by then."
-        )
-    )
-    db.add(audit_log)
-    db.commit()
-
-    return {
-        "status": "captured",
-        "case_id": case_id,
-        "promise_to_pay_date": str(body.date),
-        "message": f"Reminders suppressed until {body.date}. Auto-escalation on breach."
-    }
-
-
-# ── Customer Opt-Out (Feature 8) ────────────────────────────────────────
-
-@app.post("/api/v1/cases/{case_id}/opt-out")
-def record_customer_opt_out(case_id: str, body: schemas.OptOutRequest = schemas.OptOutRequest(), db: Session = Depends(get_db)):
-    """
-    Records customer opt-out from communications. Immediately stops recovery and closes the case.
-    """
-    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
-    if not case:
-        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-
-    case.opted_out = True
-    case.status = CaseStatus.CLOSED
-
-    audit_log = models.AuditLog(
-        case_id=case_id,
-        action_type="CUSTOMER_OPT_OUT",
-        description="Customer opted out of recovery communications",
-        reasoning=body.reason or "Customer requested communication suppression. Case closed."
-    )
-    db.add(audit_log)
-    db.commit()
-
-    return {"status": "opted_out", "case_id": case_id, "case_status": case.status.value}
-
-
-# ── Simulation & Demo Endpoints ────────────────────────────────────────
-
-@app.post("/api/v1/cases/{case_id}/simulate-payment")
-def simulate_case_payment(case_id: str, db: Session = Depends(get_db)):
-    """Simulate customer completing payment for a case via unified payment confirmation path."""
-    case = db.query(models.RecoveryCase).filter(models.RecoveryCase.id == case_id).first()
-    if not case:
-        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-    
-    pay_id = f"pay_sim_{case_id.replace('-', '')[:14]}"
-    return process_payment_confirmation(db, pay_id, case_id, case.amount_paise, source="manual_simulation")
-
-
-@app.post("/api/v1/demo/seed")
-def seed_demo_scenarios(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """
-    Seeds the 5 canonical demo scenarios:
-      1. Recoverable soft decline (₹4,999 insufficient funds)
-      2. Hard decline (₹2,999 card permanently blocked)
-      3. Checkout abandonment (₹2,999 cart, repeat visitor)
-      4. High-value case (₹75,000 requiring human approval)
-      5. Overdue invoice (₹15,000, 7 days overdue)
-    """
-    scenarios = [
-        {
-            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-            "amount_paise": 499900,
-            "currency": "INR",
-            "customer_id": "cust_demo_soft_01",
-            "customer_email": "rahul.sharma@example.com",
-            "customer_phone": "+919876500001",
-            "payment_rail": "card",
-            "raw_signal_payload": {
-                "reason": "insufficient_funds",
-                "customer_name": "Rahul Sharma",
-                "email": "rahul.sharma@example.com",
-                "contact": "+919876500001"
-            }
-        },
-        {
-            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-            "amount_paise": 299900,
-            "currency": "INR",
-            "customer_id": "cust_demo_hard_02",
-            "customer_email": "priya.verma@example.com",
-            "customer_phone": "+919876500002",
-            "payment_rail": "card",
-            "raw_signal_payload": {
-                "reason": "lost_card_reported",
-                "customer_name": "Priya Verma",
-                "email": "priya.verma@example.com",
-                "contact": "+919876500002"
-            }
-        },
-        {
-            "case_type": CaseType.CHECKOUT_ABANDONED.value,
-            "amount_paise": 299900,
-            "currency": "INR",
-            "customer_id": "cust_demo_cart_03",
-            "customer_email": "amit.patel@example.com",
-            "customer_phone": "+919876500003",
-            "payment_rail": "upi",
-            "raw_signal_payload": {
-                "cart_items": 2,
-                "is_repeat_customer": True,
-                "time_on_page_sec": 180,
-                "customer_name": "Amit Patel",
-                "email": "amit.patel@example.com",
-                "contact": "+919876500003"
-            }
-        },
-        {
-            "case_type": CaseType.SUBSCRIPTION_FAILED.value,
-            "amount_paise": 7500000,
-            "currency": "INR",
-            "customer_id": "cust_demo_highval_04",
-            "customer_email": "enterprise.corp@example.com",
-            "customer_phone": "+919876500004",
-            "payment_rail": "enach",
-            "raw_signal_payload": {
-                "reason": "insufficient_funds",
-                "customer_name": "Enterprise Corp",
-                "email": "enterprise.corp@example.com",
-                "contact": "+919876500004"
-            }
-        },
-        {
-            "case_type": CaseType.INVOICE_OVERDUE.value,
-            "amount_paise": 1500000,
-            "currency": "INR",
-            "customer_id": "cust_demo_invoice_05",
-            "customer_email": "vikram.singh@example.com",
-            "customer_phone": "+919876500005",
-            "payment_rail": "upi",
-            "raw_signal_payload": {
-                "days_overdue": 7,
-                "invoice_number": "INV-2026-005",
-                "customer_name": "Vikram Singh",
-                "email": "vikram.singh@example.com",
-                "contact": "+919876500005"
-            }
-        }
-    ]
-    created_ids = []
-    for s in scenarios:
-        case = models.RecoveryCase(
-            case_type=s["case_type"],
-            amount_paise=s["amount_paise"],
-            currency=s["currency"],
-            customer_id=s["customer_id"],
-            customer_email=s["customer_email"],
-            customer_phone=s["customer_phone"],
-            payment_rail=s["payment_rail"],
-            priority_score=compute_priority_score(s["case_type"], s["amount_paise"], s["raw_signal_payload"]),
-            raw_signal_payload=s["raw_signal_payload"]
-        )
-        audit_log = models.AuditLog(
-            action_type="SIGNAL_RECEIVED",
-            description=f"Demo scenario case created: {s['case_type']}",
-            reasoning="Seed demo scenario"
-        )
-        case.audit_logs.append(audit_log)
-        db.add(case)
         db.commit()
-        db.refresh(case)
-        
-        try:
-            inngest_client.send_sync(Event(name="case.received", data={"case_id": case.id}))
-        except Exception as e:
-            logger.warning(f"Inngest dispatch for demo case {case.id}: {e}")
-        created_ids.append(case.id)
-        
-    return {"status": "seeded", "count": len(created_ids), "case_ids": created_ids}
+    except Exception as e:
+        logger.error(f"Approved execution error for {case_id}: {e}")
+    finally:
+        db.close()
 
+
+def _simulate_payment(db: Session, case_id: str):
+    """Simulate a customer completing payment (for demo/batch)."""
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    if not case:
+        return
+    if case.status not in (CaseStatus.PAYMENT_PENDING, CaseStatus.IN_PROGRESS, CaseStatus.OPEN):
+        return
+
+    case.recovered_amount_paise = case.amount_paise
+    case.status = CaseStatus.RECOVERED
+    _audit(db, case.id, "PAYMENT_CONFIRMED",
+           f"Payment confirmed for {case.amount_paise} paise (simulated)",
+           "Simulated payment for demo/batch processing")
+    db.commit()

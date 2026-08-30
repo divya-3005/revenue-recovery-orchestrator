@@ -7,28 +7,15 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
-  RefreshCw, Play, Search, AlertCircle, Activity, ShieldCheck,
-  TrendingUp, ChevronRight, Users, CheckCircle2,
-  BarChart3, Inbox, AlertTriangle, DollarSign, Minus, ArrowUpRight,
-  CalendarClock
+  RefreshCw, Play, Search, Activity, ShieldCheck,
+  Users, CheckCircle2,
+  Inbox, Minus, ArrowUpRight,
+  CalendarClock, XCircle
 } from "lucide-react";
 
-// --- Types ---
-type CaseStatus = "open" | "in_progress" | "awaiting_payment" | "recovered" | "failed" | "escalated" | "closed" | "payment_pending" | "partially_recovered" | "awaiting_approval";
+// ── Types ────────────────────────────────────────────────────────────────
 
-interface PendingDecision {
-  recommended_action: string;
-  action_parameters?: Record<string, unknown>;
-  confidence_score: number;
-  reasoning: string;
-}
-
-interface PendingDiagnosis {
-  root_cause_category: string;
-  specific_reason: string;
-  confidence_score: number;
-  reasoning: string;
-}
+type CaseStatus = "open" | "in_progress" | "payment_pending" | "awaiting_approval" | "escalated" | "recovered" | "failed" | "closed";
 
 interface RecoveryCase {
   id: string;
@@ -39,24 +26,16 @@ interface RecoveryCase {
   status: CaseStatus;
   retry_count: number;
   cumulative_discount_paise: number;
-  cumulative_comms_cost_paise: number;
   latest_diagnosis_category: string | null;
   latest_diagnosis_reasoning: string | null;
+  latest_action_recommended: string | null;
+  latest_channel: string | null;
+  latest_comms_preview: string | null;
   promise_to_pay_date: string | null;
-  pending_decision_json: PendingDecision | null;
-  pending_diagnosis_json: PendingDiagnosis | null;
+  pending_decision_json: { recommended_action: string; reasoning: string; action_parameters?: Record<string, unknown> } | null;
   pending_decision_id?: string | null;
   pending_decision_hash?: string | null;
-  approved_decision_id?: string | null;
-  approved_decision_hash: string | null;
   created_at: string;
-}
-
-interface ByTypeEntry {
-  total: number;
-  recovered: number;
-  at_risk_paise: number;
-  recovered_paise: number;
 }
 
 interface Analytics {
@@ -68,8 +47,8 @@ interface Analytics {
   net_recovered_paise: number;
   recovery_rate_percent: number;
   net_recovery_rate_percent: number;
-  breakdown_by_case_type: Record<string, ByTypeEntry>;
-  breakdown_by_channel: Record<string, ByTypeEntry>;
+  breakdown_by_case_type: Record<string, { total: number; recovered: number; at_risk_paise: number; recovered_paise: number }>;
+  breakdown_by_channel: Record<string, { total: number; recovered: number; at_risk_paise: number; recovered_paise: number }>;
   breakdown_by_status: Record<string, number>;
   exceptions: { case_id: string; status: string; case_type: string; amount_paise: number }[];
 }
@@ -82,801 +61,588 @@ interface AuditLog {
   created_at: string;
 }
 
+interface PolicyConfig {
+  max_retries: number;
+  max_discount_percent: number;
+  require_human_approval_above_paise: number;
+  block_hard_declines: boolean;
+  pre_debit_notice_hours?: number;
+  max_days_pursued?: number;
+}
+
 const API_BASE = "http://127.0.0.1:8000/api/v1";
 
 const formatINR = (paise: number) =>
   (paise / 100).toLocaleString("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
 
-const CASE_TYPE_LABELS: Record<string, string> = {
-  subscription_failed: "Subscription Failed",
-  checkout_abandoned: "Checkout Abandoned",
-  invoice_overdue: "Invoice Overdue",
+const CASE_LABELS: Record<string, string> = {
+  subscription_failed: "Subscription",
+  checkout_abandoned: "Checkout Cart",
+  invoice_overdue: "Overdue Invoice",
 };
 
-const STATUS_COLORS: Record<string, string> = {
-  recovered: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
-  partially_recovered: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
-  in_progress: "bg-blue-500/10 text-blue-400 border-blue-500/20",
-  failed: "bg-rose-500/10 text-rose-400 border-rose-500/20",
-  escalated: "bg-amber-500/10 text-amber-400 border-amber-500/20",
-  awaiting_approval: "bg-amber-500/10 text-amber-400 border-amber-500/20",
-  awaiting_payment: "bg-yellow-500/10 text-yellow-400 border-yellow-500/20",
-  payment_pending: "bg-yellow-500/10 text-yellow-400 border-yellow-500/20",
-  closed: "bg-slate-500/10 text-slate-400 border-slate-500/20",
-  open: "bg-white/5 text-slate-300 border-white/10",
+const STATUS_BADGE_STYLES: Record<string, string> = {
+  recovered: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30",
+  payment_pending: "bg-amber-500/10 text-amber-300 border-amber-500/30",
+  awaiting_approval: "bg-purple-500/10 text-purple-300 border-purple-500/30",
+  escalated: "bg-rose-500/10 text-rose-300 border-rose-500/30",
+  in_progress: "bg-blue-500/10 text-blue-300 border-blue-500/30",
+  failed: "bg-red-500/10 text-red-400 border-red-500/30",
+  closed: "bg-slate-500/10 text-slate-400 border-slate-500/30",
+  open: "bg-slate-800 text-slate-300 border-slate-700",
 };
 
-// Tomorrow as YYYY-MM-DD — must be at module level so component state can reference it
-const tomorrowStr = () => {
-  const d = new Date(); d.setDate(d.getDate() + 1);
-  return d.toISOString().split("T")[0];
-};
-
-type Tab = "queue" | "escalation" | "analytics";
+// ── Main Dashboard ───────────────────────────────────────────────────────
 
 export default function Dashboard() {
-  const [activeTab, setActiveTab] = useState<Tab>("queue");
-  const [analytics, setAnalytics] = useState<Analytics | null>(null);
+  const [tab, setTab] = useState<"queue" | "escalated" | "analytics">("queue");
   const [cases, setCases] = useState<RecoveryCase[]>([]);
-  const [escalatedCases, setEscalatedCases] = useState<RecoveryCase[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [batchLoading, setBatchLoading] = useState(false);
-  const [approvingId, setApprovingId] = useState<string | null>(null);
+  const [escalated, setEscalated] = useState<RecoveryCase[]>([]);
+  const [analytics, setAnalytics] = useState<Analytics | null>(null);
+  const [policy, setPolicy] = useState<PolicyConfig | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
 
-  // Promise-to-Pay state
-  const [ptpModalOpen, setPtpModalOpen] = useState(false);
-  const [ptpCaseId, setPtpCaseId] = useState<string | null>(null);
-  const [ptpDate, setPtpDate] = useState(tomorrowStr());
-  const [ptpNote, setPtpNote] = useState("");
-  const [ptpLoading, setPtpLoading] = useState(false);
-  const [ptpError, setPtpError] = useState<string | null>(null);
-
-  const [auditModalOpen, setAuditModalOpen] = useState(false);
-  const [selectedCaseId, setSelectedCaseId] = useState<string | null>(null);
+  // Modals state
+  const [auditCaseId, setAuditCaseId] = useState<string | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
 
-  const [commsModalOpen, setCommsModalOpen] = useState(false);
-  const [commsMsg, setCommsMsg] = useState("");
+  const [commsModalMsg, setCommsModalMsg] = useState<string | null>(null);
 
-  const loadData = useCallback(async () => {
-    setLoading(true);
+  const [ptpCaseId, setPtpCaseId] = useState<string | null>(null);
+  const [ptpDate, setPtpDate] = useState(() => {
+    const d = new Date(); d.setDate(d.getDate() + 2);
+    return d.toISOString().split("T")[0];
+  });
+  const [ptpNote, setPtpNote] = useState("");
+
+  const refreshData = useCallback(async () => {
     try {
-      const [analyticsRes, casesRes, escalatedRes] = await Promise.all([
-        fetch(`${API_BASE}/analytics`),
+      const [cRes, eRes, aRes, pRes] = await Promise.all([
         fetch(`${API_BASE}/cases?limit=100`),
         fetch(`${API_BASE}/cases/escalated`),
+        fetch(`${API_BASE}/analytics`),
+        fetch(`${API_BASE}/policy`),
       ]);
-      setAnalytics(await analyticsRes.json());
-      setCases(await casesRes.json());
-      setEscalatedCases(await escalatedRes.json());
-    } catch (err) {
-      console.error("Failed to fetch dashboard data:", err);
-    } finally {
-      setLoading(false);
+      if (cRes.ok) setCases(await cRes.json());
+      if (eRes.ok) setEscalated(await eRes.json());
+      if (aRes.ok) setAnalytics(await aRes.json());
+      if (pRes.ok) setPolicy(await pRes.json());
+    } catch (e) {
+      console.error("Data refresh failed", e);
     }
   }, []);
 
   useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 5000);
-    return () => clearInterval(interval);
-  }, [loadData]);
+    refreshData();
+    const timer = setInterval(refreshData, 4000);
+    return () => clearInterval(timer);
+  }, [refreshData]);
 
+  // Actions
   const runBatch = async () => {
-    setBatchLoading(true);
+    setActionBusy("batch");
     try {
       await fetch(`${API_BASE}/batch?simulate=true`, { method: "POST" });
-      await loadData();
-    } catch (err) {
-      console.error("Failed to run batch:", err);
+      await refreshData();
     } finally {
-      setBatchLoading(false);
+      setActionBusy(null);
     }
   };
 
-  const viewAudit = async (caseId: string) => {
-    setSelectedCaseId(caseId);
-    setAuditModalOpen(true);
+  const seedDemo = async () => {
+    setActionBusy("demo");
+    try {
+      await fetch(`${API_BASE}/demo/seed`, { method: "POST" });
+      await refreshData();
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const openAudit = async (caseId: string) => {
+    setAuditCaseId(caseId);
     setAuditLoading(true);
     try {
       const res = await fetch(`${API_BASE}/cases/${caseId}/audit`);
-      setAuditLogs(await res.json());
-    } catch (err) {
-      console.error("Failed to fetch audit logs:", err);
+      if (res.ok) setAuditLogs(await res.json());
     } finally {
       setAuditLoading(false);
     }
   };
 
-  const [demoLoading, setDemoLoading] = useState(false);
-
-  const seedDemo = async () => {
-    setDemoLoading(true);
+  const approveCase = async (c: RecoveryCase) => {
+    setActionBusy(c.id);
     try {
-      const res = await fetch(`${API_BASE}/demo/seed`, { method: "POST" });
-      if (!res.ok) throw new Error();
-      await loadData();
-    } catch (err) {
-      console.error("Failed to seed demo:", err);
-    } finally {
-      setDemoLoading(false);
-    }
-  };
-
-  const approveCase = async (caseId: string, decisionHash: string, decisionId?: string) => {
-    setApprovingId(caseId);
-    try {
-      const res = await fetch(`${API_BASE}/cases/${caseId}/approve`, {
+      await fetch(`${API_BASE}/cases/${c.id}/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          decision_hash: decisionHash,
-          decision_id: decisionId || "dec_human_01",
-          reviewer_id: "reviewer_admin_01"
+          decision_id: c.pending_decision_id || "dec_human",
+          decision_hash: c.pending_decision_hash || "hash_human",
+          reviewer_id: "operations_admin",
         }),
       });
-      if (!res.ok) throw new Error(await res.text());
-      await loadData();
-    } catch {
-      alert("Failed to approve case");
+      await refreshData();
     } finally {
-      setApprovingId(null);
+      setActionBusy(null);
+    }
+  };
+
+  const rejectCase = async (c: RecoveryCase) => {
+    setActionBusy(c.id);
+    try {
+      await fetch(`${API_BASE}/cases/${c.id}/reject`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          decision_id: c.pending_decision_id || "dec_human",
+          decision_hash: c.pending_decision_hash || "hash_human",
+          reviewer_id: "operations_admin",
+        }),
+      });
+      await refreshData();
+    } finally {
+      setActionBusy(null);
     }
   };
 
   const closeCase = async (caseId: string) => {
-    setApprovingId(caseId);
+    setActionBusy(caseId);
     try {
-      const res = await fetch(`${API_BASE}/cases/${caseId}/close`, { method: "POST" });
-      if (!res.ok) throw new Error();
-      await loadData();
-    } catch {
-      alert("Failed to close case");
+      await fetch(`${API_BASE}/cases/${caseId}/close`, { method: "POST" });
+      await refreshData();
     } finally {
-      setApprovingId(null);
+      setActionBusy(null);
     }
-  };
-
-  const openPtpModal = (caseId: string) => {
-    setPtpCaseId(caseId);
-    setPtpDate(tomorrowStr());
-    setPtpNote("");
-    setPtpError(null);
-    setPtpModalOpen(true);
   };
 
   const submitPtp = async () => {
     if (!ptpCaseId || !ptpDate) return;
-    setPtpLoading(true);
-    setPtpError(null);
+    setActionBusy("ptp");
     try {
-      const res = await fetch(`${API_BASE}/cases/${ptpCaseId}/promise-to-pay`, {
+      await fetch(`${API_BASE}/cases/${ptpCaseId}/promise-to-pay`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date: ptpDate, note: ptpNote || undefined }),
+        body: JSON.stringify({ date: ptpDate, note: ptpNote || "Customer payment promise" }),
       });
-      if (!res.ok) {
-        const err = await res.json();
-        setPtpError(err.detail ?? "Failed to capture promise.");
-        return;
-      }
-      setPtpModalOpen(false);
-      await loadData();
-    } catch {
-      setPtpError("Network error — please try again.");
+      setPtpCaseId(null);
+      await refreshData();
     } finally {
-      setPtpLoading(false);
+      setActionBusy(null);
     }
   };
 
-  const tabs: { id: Tab; label: string; icon: React.ReactNode; count?: number }[] = [
-    { id: "queue", label: "Live Queue", icon: <Inbox className="w-4 h-4" />, count: cases.length },
-    { id: "escalation", label: "Escalation Queue", icon: <AlertTriangle className="w-4 h-4" />, count: escalatedCases.length },
-    { id: "analytics", label: "Analytics", icon: <BarChart3 className="w-4 h-4" /> },
-  ];
-
   return (
-    <div className="min-h-screen bg-[#06080F] text-slate-200 font-sans selection:bg-indigo-500/30 overflow-hidden relative pb-10">
-      {/* Background orbs */}
-      <div className="fixed top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-indigo-600/20 blur-[120px] pointer-events-none" />
-      <div className="fixed bottom-[-20%] right-[-10%] w-[50%] h-[50%] rounded-full bg-emerald-600/10 blur-[120px] pointer-events-none" />
-      <div className="fixed top-[20%] right-[20%] w-[30%] h-[30%] rounded-full bg-purple-600/10 blur-[100px] pointer-events-none" />
+    <div className="min-h-screen bg-[#070913] text-slate-100 font-sans pb-16 selection:bg-indigo-500/30">
+      {/* Background glow */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute -top-40 left-1/4 w-96 h-96 bg-indigo-600/20 rounded-full blur-[140px]" />
+        <div className="absolute top-1/3 -right-20 w-96 h-96 bg-purple-600/15 rounded-full blur-[140px]" />
+        <div className="absolute bottom-10 left-10 w-96 h-96 bg-emerald-600/10 rounded-full blur-[140px]" />
+      </div>
 
-      <div className="relative max-w-7xl mx-auto space-y-6 p-8 z-10">
-
-        {/* Header */}
-        <div className="flex justify-between items-center bg-white/[0.03] p-5 rounded-2xl shadow-2xl border border-white/5 backdrop-blur-xl">
-          <div className="flex items-center gap-4">
-            <div className="p-3 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl shadow-lg shadow-indigo-500/20">
+      <div className="relative max-w-7xl mx-auto px-6 pt-8 space-y-6">
+        {/* Top Header */}
+        <header className="flex flex-wrap items-center justify-between gap-4 p-5 rounded-2xl bg-white/[0.03] border border-white/10 backdrop-blur-xl shadow-2xl">
+          <div className="flex items-center gap-3.5">
+            <div className="p-2.5 rounded-xl bg-gradient-to-tr from-indigo-500 to-purple-500 shadow-lg shadow-indigo-500/25">
               <Activity className="w-6 h-6 text-white" />
             </div>
             <div>
-              <h1 className="text-2xl font-bold tracking-tight text-white flex items-center gap-2">
-                Revenue Recovery Orchestrator
-                <Badge variant="outline" className="bg-indigo-500/10 text-indigo-400 border-indigo-500/20 ml-2 text-xs">LIVE</Badge>
-              </h1>
-              <p className="text-slate-400 mt-0.5 text-sm">AI-orchestrated · Deterministic guardrails · Full audit trail</p>
+              <div className="flex items-center gap-2">
+                <h1 className="text-xl font-bold tracking-tight text-white">Revenue Recovery Orchestrator</h1>
+                <Badge variant="outline" className="bg-emerald-500/10 text-emerald-400 border-emerald-500/30 text-[10px] tracking-wide">
+                  AUTONOMOUS
+                </Badge>
+              </div>
+              <p className="text-xs text-slate-400">Subscriptions · Abandoned Checkouts · Invoices — One Decision Engine</p>
             </div>
           </div>
-          <div className="flex space-x-3">
-            <Button variant="outline" onClick={loadData} disabled={loading}
-              className="bg-white/5 border-white/10 text-slate-300 hover:bg-white/10 hover:text-white">
-              <RefreshCw className={`w-4 h-4 mr-2 ${loading ? "animate-spin" : ""}`} />Refresh
+
+          <div className="flex items-center gap-2.5">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => { setLoading(true); refreshData().finally(() => setLoading(false)); }}
+              disabled={loading}
+              className="bg-white/5 border-white/10 text-slate-300 hover:bg-white/10"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${loading ? "animate-spin" : ""}`} /> Refresh
             </Button>
-            <Button variant="outline" onClick={seedDemo} disabled={demoLoading}
-              className="bg-purple-600/20 border-purple-500/30 text-purple-200 hover:bg-purple-600/30 hover:text-white">
-              <Play className={`w-4 h-4 mr-2 ${demoLoading ? "animate-pulse" : ""}`} />
-              {demoLoading ? "Seeding…" : "Seed 5 Demo Scenarios"}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={seedDemo}
+              disabled={actionBusy === "demo"}
+              className="bg-purple-500/10 border-purple-500/30 text-purple-300 hover:bg-purple-500/20"
+            >
+              <Play className="w-3.5 h-3.5 mr-1.5" /> {actionBusy === "demo" ? "Seeding…" : "Seed 5 Pitch Demos"}
             </Button>
-            <Button onClick={runBatch} disabled={batchLoading}
-              className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 border border-indigo-500/50">
-              <Play className={`w-4 h-4 mr-2 ${batchLoading ? "animate-pulse" : ""}`} />
-              {batchLoading ? "Running…" : "Run 50+ Batch"}
+            <Button
+              size="sm"
+              onClick={runBatch}
+              disabled={actionBusy === "batch"}
+              className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/30"
+            >
+              <Play className="w-3.5 h-3.5 mr-1.5" /> {actionBusy === "batch" ? "Processing Batch…" : "Run 50+ Case Batch"}
             </Button>
           </div>
-        </div>
+        </header>
 
-        {/* Top KPI Strip */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          {[
-            { label: "Total Cases", value: analytics?.total_cases ?? "-", icon: <Users className="w-4 h-4" />, color: "text-white" },
-            { label: "At Risk", value: analytics ? formatINR(analytics.total_at_risk_paise) : "-", icon: <AlertCircle className="w-4 h-4" />, color: "text-rose-400" },
-            { label: "Gross Recovered", value: analytics ? formatINR(analytics.total_recovered_paise) : "-", icon: <ShieldCheck className="w-4 h-4" />, color: "text-emerald-400" },
-            { label: "Recovery Rate", value: analytics ? `${analytics.recovery_rate_percent}%` : "-", icon: <TrendingUp className="w-4 h-4" />, color: "text-indigo-400" },
-          ].map((kpi) => (
-            <Card key={kpi.label} className="bg-white/[0.02] border-white/5 backdrop-blur-md shadow-xl hover:bg-white/[0.04] hover:border-white/10 transition-all group">
-              <CardHeader className="pb-1 pt-4 px-4">
-                <CardTitle className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                  <span className="text-slate-500 group-hover:text-indigo-400 transition-colors">{kpi.icon}</span>
-                  {kpi.label}
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="px-4 pb-4">
-                <p className={`text-3xl font-bold tracking-tight ${kpi.color}`}>{kpi.value}</p>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+        {/* KPI Strip */}
+        <section className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <Card className="bg-white/[0.02] border-white/5">
+            <CardHeader className="p-4 pb-1">
+              <CardTitle className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                <Users className="w-3.5 h-3.5 text-indigo-400" /> Total Revenue at Risk
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 pt-1">
+              <p className="text-2xl font-bold text-rose-400">{analytics ? formatINR(analytics.total_at_risk_paise) : "₹0"}</p>
+              <p className="text-[11px] text-slate-500 mt-0.5">{analytics?.total_cases ?? 0} active/historical cases</p>
+            </CardContent>
+          </Card>
 
-        {/* Tab Bar */}
-        <div className="flex gap-1 bg-white/[0.03] border border-white/5 rounded-xl p-1">
-          {tabs.map((tab) => (
+          <Card className="bg-white/[0.02] border-white/5">
+            <CardHeader className="p-4 pb-1">
+              <CardTitle className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" /> Gross Recovered
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 pt-1">
+              <p className="text-2xl font-bold text-emerald-400">{analytics ? formatINR(analytics.total_recovered_paise) : "₹0"}</p>
+              <p className="text-[11px] text-emerald-500/80 mt-0.5">{analytics?.recovery_rate_percent ?? 0}% recovery rate</p>
+            </CardContent>
+          </Card>
+
+          <Card className="bg-white/[0.02] border-white/5">
+            <CardHeader className="p-4 pb-1">
+              <CardTitle className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                <Minus className="w-3.5 h-3.5 text-amber-400" /> Discounts & Comms
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 pt-1">
+              <p className="text-2xl font-bold text-amber-400">
+                {analytics ? formatINR((analytics.total_discount_cost_paise || 0) + (analytics.total_comms_cost_paise || 0)) : "₹0"}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-0.5">Discounts: {formatINR(analytics?.total_discount_cost_paise || 0)}</p>
+            </CardContent>
+          </Card>
+
+          <Card className="bg-indigo-950/30 border-indigo-500/20">
+            <CardHeader className="p-4 pb-1">
+              <CardTitle className="text-xs font-semibold uppercase tracking-wider text-indigo-300 flex items-center gap-1.5">
+                <ArrowUpRight className="w-3.5 h-3.5 text-indigo-400" /> Net Recovered Value
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 pt-1">
+              <p className="text-2xl font-bold text-indigo-300">{analytics ? formatINR(analytics.net_recovered_paise) : "₹0"}</p>
+              <p className="text-[11px] text-indigo-400/80 mt-0.5">{analytics?.net_recovery_rate_percent ?? 0}% net recovered</p>
+            </CardContent>
+          </Card>
+        </section>
+
+        {/* Tab Navigation */}
+        <div className="flex border-b border-white/10 gap-2">
+          {(
+            [
+              { id: "queue", label: "Live Queue", count: cases.length },
+              { id: "escalated", label: "Escalation & Approvals", count: escalated.length },
+              { id: "analytics", label: "Analytics & Economics" },
+            ] as Array<{ id: "queue" | "escalated" | "analytics"; label: string; count?: number }>
+          ).map((t) => (
             <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all flex-1 justify-center
-                ${activeTab === tab.id
-                  ? "bg-indigo-600/80 text-white shadow-md shadow-indigo-600/20 border border-indigo-500/50"
-                  : "text-slate-400 hover:text-slate-200 hover:bg-white/5"}`}
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              className={`pb-3 px-4 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 ${
+                tab === t.id
+                  ? "border-indigo-500 text-indigo-300"
+                  : "border-transparent text-slate-400 hover:text-slate-200"
+              }`}
             >
-              {tab.icon}
-              {tab.label}
-              {tab.count !== undefined && (
-                <span className={`ml-1 text-xs px-1.5 py-0.5 rounded-full font-mono
-                  ${activeTab === tab.id ? "bg-white/20 text-white" : "bg-white/5 text-slate-500"}`}>
-                  {tab.count}
+              {t.label}
+              {t.count !== undefined && (
+                <span className={`text-[11px] px-2 py-0.5 rounded-full ${tab === t.id ? "bg-indigo-500/20 text-indigo-300" : "bg-white/5 text-slate-400"}`}>
+                  {t.count}
                 </span>
               )}
             </button>
           ))}
         </div>
 
-        {/* ── LIVE QUEUE TAB ── */}
-        {activeTab === "queue" && (
-          <Card className="bg-white/[0.02] border-white/5 backdrop-blur-xl shadow-2xl overflow-hidden rounded-2xl">
-            <CardHeader className="bg-white/[0.02] border-b border-white/5 px-6 py-4">
-              <div className="flex justify-between items-center">
-                <CardTitle className="text-base text-white font-medium">Recovery Cases — sorted by expected value</CardTitle>
-                <Badge variant="outline" className="bg-white/5 border-white/10 text-slate-400 font-mono text-xs">
-                  {cases.length} entries
-                </Badge>
-              </div>
-            </CardHeader>
-            <CardContent className="p-0">
-              <div className="overflow-x-auto">
-                <Table>
-                  <TableHeader>
-                    <TableRow className="hover:bg-transparent border-white/5 bg-black/20">
-                      {["Case ID", "Customer", "Type", "Diagnosis", "Next Action", "Amount", "Exp. Recovery", "Status", "Attempts", "Discount", "Actions"].map((h) => (
-                        <TableHead key={h} className="text-slate-400 font-semibold tracking-wider text-xs">{h}</TableHead>
-                      ))}
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {cases.length === 0 && !loading && (
-                      <TableRow className="border-white/5 hover:bg-transparent">
-                        <TableCell colSpan={10} className="text-center py-16 text-slate-500">
-                          <div className="flex flex-col items-center gap-3">
-                            <AlertCircle className="w-8 h-8 opacity-50" />
-                            <p>No cases found. Run a batch to ingest test cases.</p>
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    )}
-                    {cases.map((c) => (
-                      <TableRow key={c.id} className="border-white/5 hover:bg-white/[0.03] transition-colors group cursor-pointer" onClick={() => viewAudit(c.id)}>
-                        <TableCell className="font-mono text-xs text-slate-500 group-hover:text-slate-300">{c.id.split("-")[0]}</TableCell>
-                        <TableCell className="font-medium text-slate-200">{c.customer_id}</TableCell>
-                        <TableCell className="text-slate-400 text-sm">{CASE_TYPE_LABELS[c.case_type] ?? c.case_type}</TableCell>
-                        <TableCell className="text-slate-400 text-xs truncate max-w-[150px]" title={c.latest_diagnosis_reasoning || "Diagnosis runs on workflow execution"}>
+        {/* ── TAB 1: LIVE QUEUE ── */}
+        {tab === "queue" && (
+          <Card className="bg-white/[0.02] border-white/10 overflow-hidden">
+            <Table>
+              <TableHeader>
+                <TableRow className="border-white/10 hover:bg-transparent bg-white/[0.01]">
+                  <TableHead className="text-slate-400 text-xs">Case / Customer</TableHead>
+                  <TableHead className="text-slate-400 text-xs">Type</TableHead>
+                  <TableHead className="text-slate-400 text-xs">AI Diagnosis</TableHead>
+                  <TableHead className="text-slate-400 text-xs">Next Action</TableHead>
+                  <TableHead className="text-slate-400 text-xs">Amount</TableHead>
+                  <TableHead className="text-slate-400 text-xs">Expected Value</TableHead>
+                  <TableHead className="text-slate-400 text-xs">Status</TableHead>
+                  <TableHead className="text-slate-400 text-xs text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {cases.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={8} className="text-center py-12 text-slate-500 text-sm">
+                      No recovery cases found. Click &quot;Run 50+ Case Batch&quot; or &quot;Seed 5 Pitch Demos&quot; to begin.
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  cases.map((c) => (
+                    <TableRow key={c.id} className="border-white/5 hover:bg-white/[0.02] transition-colors">
+                      <TableCell>
+                        <div className="font-mono text-xs text-slate-400">{c.id.slice(0, 8)}…</div>
+                        <div className="text-xs font-semibold text-slate-200">{c.customer_id}</div>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className="bg-white/5 text-slate-300 border-white/10 text-[11px]">
+                          {CASE_LABELS[c.case_type] || c.case_type}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="max-w-[180px]">
+                        <div className="text-xs font-medium text-slate-200 truncate capitalize">
                           {c.latest_diagnosis_category ? c.latest_diagnosis_category.replace(/_/g, " ") : "—"}
-                        </TableCell>
-                        <TableCell className="text-slate-400 text-xs truncate max-w-[150px]" title={c.latest_action_recommended || ""}>
-                          {c.latest_action_recommended ? c.latest_action_recommended.replace(/_/g, " ") : "—"}
-                        </TableCell>
-                        <TableCell className="text-right font-medium text-slate-200">{formatINR(c.amount_paise)}</TableCell>
-                        <TableCell className="text-right text-indigo-400 font-medium">{formatINR(c.priority_score)}</TableCell>
-                        <TableCell>
-                          <Badge variant="outline" className={`${STATUS_COLORS[c.status] ?? STATUS_COLORS.open} capitalize`}>
-                            {c.status.replace(/_/g, " ")}
+                        </div>
+                        <div className="text-[11px] text-slate-400 truncate">{c.latest_diagnosis_reasoning || "Analyzing..."}</div>
+                      </TableCell>
+                      <TableCell className="text-xs font-mono text-indigo-300">
+                        {c.latest_action_recommended ? c.latest_action_recommended.replace(/_/g, " ") : "—"}
+                      </TableCell>
+                      <TableCell className="text-xs font-semibold text-slate-200">{formatINR(c.amount_paise)}</TableCell>
+                      <TableCell className="text-xs font-mono text-emerald-400">{formatINR(c.priority_score)}</TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className={`${STATUS_BADGE_STYLES[c.status] || ""} text-[10px] uppercase font-mono`}>
+                          {c.status.replace(/_/g, " ")}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-right space-x-1">
+                        {c.promise_to_pay_date && (
+                          <Badge variant="outline" className="bg-teal-500/10 text-teal-300 border-teal-500/30 text-[10px]">
+                            PTP {c.promise_to_pay_date}
                           </Badge>
-                        </TableCell>
-                        <TableCell className="text-center text-slate-500 font-mono text-xs">{c.retry_count}</TableCell>
-                        <TableCell className="text-right text-slate-500 text-xs">
-                          {c.cumulative_discount_paise > 0 ? (
-                            <span className="text-amber-400">{formatINR(c.cumulative_discount_paise)}</span>
-                          ) : "—"}
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex items-center gap-1 justify-end">
-                            {c.promise_to_pay_date && (
-                              <Badge variant="outline" className="bg-teal-500/10 text-teal-400 border-teal-500/20 text-xs font-mono">
-                                PTP {new Date(c.promise_to_pay_date + "T00:00:00").toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}
-                              </Badge>
-                            )}
-                            <Button variant="ghost" size="sm"
-                              onClick={(e) => { e.stopPropagation(); openPtpModal(c.id); }}
-                              title="Set Promise-to-Pay date"
-                              className="text-teal-500/60 hover:text-teal-300 hover:bg-teal-500/10 rounded-lg">
-                              <CalendarClock className="w-4 h-4" />
-                            </Button>
-                            {c.latest_comms_preview && (
-                              <Button variant="ghost" size="sm"
-                                onClick={(e) => { e.stopPropagation(); setCommsModalOpen(true); setCommsMsg(c.latest_comms_preview!); }}
-                                title="View Sent Comms"
-                                className="text-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg">
-                                <Inbox className="w-4 h-4" />
-                              </Button>
-                            )}
-                            <Button variant="ghost" size="sm"
-                                onClick={(e) => { e.stopPropagation(); viewAudit(c.id); }}
-                                className="text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg">
-                                <Search className="w-4 h-4" />
-                            </Button>
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-            </CardContent>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => { setPtpCaseId(c.id); }}
+                          title="Capture Promise to Pay"
+                          className="h-7 w-7 p-0 text-slate-400 hover:text-teal-300 hover:bg-teal-500/10"
+                        >
+                          <CalendarClock className="w-3.5 h-3.5" />
+                        </Button>
+                        {c.latest_comms_preview && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setCommsModalMsg(c.latest_comms_preview)}
+                            title="Preview Customer Message"
+                            className="h-7 w-7 p-0 text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10"
+                          >
+                            <Inbox className="w-3.5 h-3.5" />
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => openAudit(c.id)}
+                          title="View Full Decision Trace"
+                          className="h-7 w-7 p-0 text-slate-400 hover:text-white hover:bg-white/10"
+                        >
+                          <Search className="w-3.5 h-3.5" />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
           </Card>
         )}
 
-        {/* ── ESCALATION QUEUE TAB ── */}
-        {activeTab === "escalation" && (
+        {/* ── TAB 2: ESCALATED & HUMAN APPROVAL ── */}
+        {tab === "escalated" && (
           <div className="space-y-4">
-            <div className="flex items-center gap-3 bg-amber-500/5 border border-amber-500/20 rounded-xl px-5 py-4">
-              <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
-              <p className="text-sm text-amber-200">
-                These cases were blocked by policy (high value, low confidence, or manual flag) and require human review before re-processing.
-                Click <strong>Approve</strong> to re-queue a case into the AI pipeline.
-              </p>
-            </div>
-
-            {escalatedCases.length === 0 ? (
-              <Card className="bg-white/[0.02] border-white/5 rounded-2xl">
-                <CardContent className="py-20 text-center text-slate-500">
-                  <CheckCircle2 className="w-10 h-10 mx-auto mb-3 opacity-40" />
-                  <p>No cases in the escalation queue.</p>
-                </CardContent>
+            {escalated.length === 0 ? (
+              <Card className="bg-white/[0.02] border-white/10 p-12 text-center text-slate-400">
+                <CheckCircle2 className="w-8 h-8 text-emerald-400 mx-auto mb-2 opacity-80" />
+                <p className="text-sm">No cases currently require human approval or escalation.</p>
               </Card>
             ) : (
-              <div className="space-y-3">
-                {escalatedCases.map((c) => (
-                  <div key={c.id} className="bg-white/[0.02] border border-amber-500/15 rounded-xl px-5 py-4 flex items-center justify-between gap-4 hover:border-amber-500/30 transition-all">
-                    <div className="flex items-start gap-4 flex-1 min-w-0">
-                      <div className="p-2 bg-amber-500/10 rounded-lg shrink-0">
-                        <AlertTriangle className="w-5 h-5 text-amber-400" />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-3 flex-wrap">
-                          <span className="font-mono text-xs text-slate-500">{c.id.split("-")[0]}</span>
-                          <span className="font-medium text-slate-200">{c.customer_id}</span>
-                          <Badge variant="outline" className="bg-amber-500/10 text-amber-400 border-amber-500/20 text-xs">
-                            {CASE_TYPE_LABELS[c.case_type] ?? c.case_type}
-                          </Badge>
-                        </div>
-                        <div className="mt-1 flex items-center gap-4 text-sm text-slate-400 flex-wrap">
-                          <span className="text-rose-400 font-semibold">{formatINR(c.amount_paise)}</span>
-                          <span>· {c.retry_count} attempts</span>
-                          {c.cumulative_discount_paise > 0 && (
-                            <span className="text-amber-400">· {formatINR(c.cumulative_discount_paise)} discounted</span>
-                          )}
-                          <span>· created {new Date(c.created_at).toLocaleDateString("en-IN")}</span>
-                        </div>
-                      </div>
+              escalated.map((c) => (
+                <Card key={c.id} className="bg-white/[0.02] border-white/10 p-5 rounded-2xl flex flex-wrap items-center justify-between gap-4">
+                  <div className="space-y-1.5 max-w-xl">
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-xs text-slate-400">{c.id.slice(0, 8)}…</span>
+                      <span className="text-sm font-bold text-white">{c.customer_id}</span>
+                      <Badge variant="outline" className={`${STATUS_BADGE_STYLES[c.status] || ""} text-[10px]`}>
+                        {c.status.replace(/_/g, " ")}
+                      </Badge>
+                      <span className="text-sm font-semibold text-rose-300">{formatINR(c.amount_paise)}</span>
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
-            <Button variant="ghost" size="sm"
-                        onClick={() => viewAudit(c.id)}
-                        className="text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg text-xs">
-                        <Search className="w-3.5 h-3.5 mr-1.5" />View Audit
-                      </Button>
-                      
-                      {c.pending_decision_json ? (
-                        <div className="flex flex-col items-end gap-1">
-                          <Button size="sm"
-                            onClick={() => approveCase(c.id, c.pending_decision_hash || c.approved_decision_hash!, c.pending_decision_id || c.approved_decision_id || "dec_human_01")}
-                            disabled={approvingId === c.id}
-                            className="bg-emerald-600/80 hover:bg-emerald-500 text-white border border-emerald-500/50 shadow-md shadow-emerald-600/20 rounded-lg text-xs">
-                            {approvingId === c.id ? (
-                              <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" />
-                            ) : (
-                              <CheckCircle2 className="w-3.5 h-3.5 mr-1.5" />
-                            )}
-                            {approvingId === c.id ? "Approving…" : "Approve & Execute"}
-                          </Button>
-                          <span className="text-[10px] text-slate-500 max-w-[150px] text-right truncate">
-                            Pending: {c.pending_decision_json.recommended_action.replace(/_/g, " ")}
-                          </span>
-                        </div>
-                      ) : (
-                        <Button size="sm" variant="outline"
-                          onClick={() => closeCase(c.id)}
-                          disabled={approvingId === c.id}
-                          className="border-amber-500/30 text-amber-400 hover:bg-amber-500/10 rounded-lg text-xs">
-                          {approvingId === c.id ? (
-                            <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" />
-                          ) : (
-                            <Search className="w-3.5 h-3.5 mr-1.5" />
-                          )}
-                          {approvingId === c.id ? "Closing…" : "Close Case"}
-                        </Button>
-                      )}
-                    </div>
+                    <p className="text-xs text-slate-300">
+                      <span className="text-indigo-400 font-medium">AI Recommendation:</span>{" "}
+                      {c.pending_decision_json?.recommended_action.replace(/_/g, " ") || c.latest_action_recommended || "Human review requested"}
+                    </p>
+                    <p className="text-xs text-slate-400 italic">
+                      &quot;{c.pending_decision_json?.reasoning || c.latest_diagnosis_reasoning || "Awaiting manager sign-off for high value transaction."}&quot;
+                    </p>
                   </div>
-                ))}
-              </div>
+
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => openAudit(c.id)}
+                      className="bg-white/5 border-white/10 text-slate-300 hover:bg-white/10"
+                    >
+                      <Search className="w-3.5 h-3.5 mr-1.5" /> Trace
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => approveCase(c)}
+                      disabled={actionBusy === c.id}
+                      className="bg-emerald-600 hover:bg-emerald-500 text-white"
+                    >
+                      <CheckCircle2 className="w-3.5 h-3.5 mr-1.5" /> Approve &amp; Execute
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => rejectCase(c)}
+                      disabled={actionBusy === c.id}
+                      className="bg-rose-500/10 border-rose-500/30 text-rose-300 hover:bg-rose-500/20"
+                    >
+                      <XCircle className="w-3.5 h-3.5 mr-1.5" /> Reject
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => closeCase(c.id)}
+                      disabled={actionBusy === c.id}
+                      className="text-slate-400 hover:text-white"
+                    >
+                      Close
+                    </Button>
+                  </div>
+                </Card>
+              ))
             )}
           </div>
         )}
 
-        {/* ── ANALYTICS TAB ── */}
-        {activeTab === "analytics" && analytics && (
+        {/* ── TAB 3: ANALYTICS & ECONOMICS ── */}
+        {tab === "analytics" && analytics && (
           <div className="space-y-6">
-
-            {/* Net Economics Banner */}
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-              <Card className="bg-white/[0.02] border-white/5 hover:border-emerald-500/20 transition-all group">
-                <CardHeader className="pb-1 pt-4 px-4">
-                  <CardTitle className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                    <DollarSign className="w-4 h-4 text-slate-500 group-hover:text-emerald-400 transition-colors" />Gross Recovered
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="px-4 pb-4">
-                  <p className="text-3xl font-bold text-emerald-400">{formatINR(analytics.total_recovered_paise)}</p>
-                  <p className="text-xs text-slate-500 mt-1">{analytics.recovery_rate_percent}% recovery rate</p>
-                </CardContent>
-              </Card>
-              <Card className="bg-white/[0.02] border-white/5 hover:border-amber-500/20 transition-all group">
-                <CardHeader className="pb-1 pt-4 px-4">
-                  <CardTitle className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                    <Minus className="w-4 h-4 text-slate-500 group-hover:text-amber-400 transition-colors" />Discount Cost
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="px-4 pb-4">
-                  <p className="text-3xl font-bold text-amber-400">{formatINR(analytics.total_discount_cost_paise)}</p>
-                  <p className="text-xs text-slate-500 mt-1">Cumulative across all cases</p>
-                </CardContent>
-              </Card>
-              <Card className="bg-white/[0.02] border-white/5 hover:border-rose-500/20 transition-all group">
-                <CardHeader className="pb-1 pt-4 px-4">
-                  <CardTitle className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                    <Minus className="w-4 h-4 text-slate-500 group-hover:text-rose-400 transition-colors" />Comms Cost
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="px-4 pb-4">
-                  <p className="text-3xl font-bold text-rose-400">{formatINR(analytics.total_comms_cost_paise)}</p>
-                  <p className="text-xs text-slate-500 mt-1">₹0.25 per message</p>
-                </CardContent>
-              </Card>
-              <Card className="bg-indigo-900/20 border-indigo-500/20 hover:border-indigo-500/40 transition-all group relative overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-br from-indigo-500/10 to-purple-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
-                <CardHeader className="pb-1 pt-4 px-4 relative z-10">
-                  <CardTitle className="text-xs font-semibold text-indigo-300 uppercase tracking-widest flex items-center gap-2">
-                    <ArrowUpRight className="w-4 h-4" />Net Recovered (after discounts)
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="px-4 pb-4 relative z-10">
-                  <p className="text-3xl font-bold text-indigo-300">{formatINR(analytics.net_recovered_paise)}</p>
-                  <p className="text-xs text-indigo-400 mt-1">{analytics.net_recovery_rate_percent}% net recovery rate</p>
-                </CardContent>
-              </Card>
-            </div>
-
-            {/* Breakdown by Case Type */}
-            <Card className="bg-white/[0.02] border-white/5 rounded-2xl overflow-hidden">
-              <CardHeader className="bg-white/[0.02] border-b border-white/5 px-6 py-4">
-                <CardTitle className="text-base text-white font-medium">Breakdown by Case Type</CardTitle>
+            {/* Case Type Breakdown */}
+            <Card className="bg-white/[0.02] border-white/10">
+              <CardHeader className="p-5 border-b border-white/5">
+                <CardTitle className="text-sm font-semibold text-white">Recovery Performance by Case Type</CardTitle>
               </CardHeader>
               <CardContent className="p-0">
                 <Table>
                   <TableHeader>
-                    <TableRow className="hover:bg-transparent border-white/5 bg-black/20">
-                      {["Case Type", "Total Cases", "Recovered", "Recovery Rate", "At Risk", "Recovered ₹"].map(h => (
-                        <TableHead key={h} className="text-slate-400 font-semibold tracking-wider text-xs">{h}</TableHead>
-                      ))}
+                    <TableRow className="border-white/5 hover:bg-transparent">
+                      <TableHead className="text-slate-400 text-xs">Signal Type</TableHead>
+                      <TableHead className="text-slate-400 text-xs">Total Cases</TableHead>
+                      <TableHead className="text-slate-400 text-xs">Recovered Cases</TableHead>
+                      <TableHead className="text-slate-400 text-xs">At Risk</TableHead>
+                      <TableHead className="text-slate-400 text-xs">Recovered Value</TableHead>
+                      <TableHead className="text-slate-400 text-xs">Success Rate</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {Object.entries(analytics.breakdown_by_case_type).map(([type, data]) => {
+                    {Object.entries(analytics.breakdown_by_case_type).map(([key, data]) => {
                       const rate = data.total > 0 ? Math.round((data.recovered / data.total) * 100) : 0;
                       return (
-                        <TableRow key={type} className="border-white/5 hover:bg-white/[0.03]">
-                          <TableCell className="font-medium text-slate-200">{CASE_TYPE_LABELS[type] ?? type}</TableCell>
-                          <TableCell className="text-slate-300 font-mono">{data.total}</TableCell>
-                          <TableCell className="text-emerald-400 font-mono">{data.recovered}</TableCell>
+                        <TableRow key={key} className="border-white/5">
+                          <TableCell className="text-xs font-medium text-white">{CASE_LABELS[key] || key}</TableCell>
+                          <TableCell className="text-xs font-mono text-slate-300">{data.total}</TableCell>
+                          <TableCell className="text-xs font-mono text-emerald-400">{data.recovered}</TableCell>
+                          <TableCell className="text-xs font-semibold text-rose-300">{formatINR(data.at_risk_paise)}</TableCell>
+                          <TableCell className="text-xs font-semibold text-emerald-300">{formatINR(data.recovered_paise)}</TableCell>
                           <TableCell>
-                            <div className="flex items-center gap-2">
-                              <div className="flex-1 bg-white/5 rounded-full h-1.5 max-w-[80px]">
-                                <div className="bg-emerald-500 h-1.5 rounded-full transition-all" style={{ width: `${rate}%` }} />
-                              </div>
-                              <span className="text-slate-300 text-xs font-mono w-8">{rate}%</span>
-                            </div>
-                          </TableCell>
-                          <TableCell className="text-rose-400">{formatINR(data.at_risk_paise)}</TableCell>
-                          <TableCell className="text-emerald-400">{formatINR(data.recovered_paise)}</TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </CardContent>
-            </Card>
-
-            {/* Breakdown by Channel */}
-            <Card className="bg-white/[0.02] border-white/5 rounded-2xl overflow-hidden mt-6">
-              <CardHeader className="bg-white/[0.02] border-b border-white/5 px-6 py-4">
-                <CardTitle className="text-base text-white font-medium">Breakdown by Channel</CardTitle>
-              </CardHeader>
-              <CardContent className="p-0">
-                <Table>
-                  <TableHeader>
-                    <TableRow className="hover:bg-transparent border-white/5 bg-black/20">
-                      {["Channel", "Total Cases", "Recovered", "Recovery Rate", "At Risk", "Recovered ₹"].map(h => (
-                        <TableHead key={h} className="text-slate-400 font-semibold tracking-wider text-xs">{h}</TableHead>
-                      ))}
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {Object.entries(analytics.breakdown_by_channel).map(([channel, data]) => {
-                      const rate = data.total > 0 ? Math.round((data.recovered / data.total) * 100) : 0;
-                      return (
-                        <TableRow key={channel} className="border-white/5 hover:bg-white/[0.03]">
-                          <TableCell className="font-medium text-slate-200 capitalize">{channel}</TableCell>
-                          <TableCell className="text-slate-300 font-mono">{data.total}</TableCell>
-                          <TableCell className="text-emerald-400 font-mono">{data.recovered}</TableCell>
-                          <TableCell>
-                            <div className="flex items-center gap-2">
-                              <div className="flex-1 bg-white/5 rounded-full h-1.5 max-w-[80px]">
-                                <div className="bg-emerald-500 h-1.5 rounded-full transition-all" style={{ width: `${rate}%` }} />
-                              </div>
-                              <span className="text-slate-300 text-xs font-mono w-8">{rate}%</span>
-                            </div>
-                          </TableCell>
-                          <TableCell className="text-rose-400">{formatINR(data.at_risk_paise)}</TableCell>
-                          <TableCell className="text-emerald-400">{formatINR(data.recovered_paise)}</TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </CardContent>
-            </Card>
-
-            {/* Status Breakdown + Exceptions */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {/* Status Breakdown */}
-              <Card className="bg-white/[0.02] border-white/5 rounded-2xl overflow-hidden">
-                <CardHeader className="bg-white/[0.02] border-b border-white/5 px-5 py-4">
-                  <CardTitle className="text-base text-white font-medium">Pipeline Status Distribution</CardTitle>
-                </CardHeader>
-                <CardContent className="p-5 space-y-3">
-                  {Object.entries(analytics.breakdown_by_status)
-                    .sort(([, a], [, b]) => b - a)
-                    .map(([status, count]) => {
-                      const pct = analytics.total_cases > 0 ? Math.round((count / analytics.total_cases) * 100) : 0;
-                      return (
-                        <div key={status} className="flex items-center gap-3">
-                          <div className="w-28 shrink-0">
-                            <Badge variant="outline" className={`${STATUS_COLORS[status] ?? STATUS_COLORS.open} capitalize text-xs`}>
-                              {status.replace(/_/g, " ")}
+                            <Badge variant="outline" className="bg-emerald-500/10 text-emerald-300 border-emerald-500/30 text-[10px]">
+                              {rate}%
                             </Badge>
-                          </div>
-                          <div className="flex-1 bg-white/5 rounded-full h-1.5">
-                            <div className="bg-indigo-500 h-1.5 rounded-full transition-all" style={{ width: `${pct}%` }} />
-                          </div>
-                          <span className="text-slate-400 font-mono text-xs w-10 text-right">{count}</span>
-                        </div>
+                          </TableCell>
+                        </TableRow>
                       );
                     })}
-                </CardContent>
-              </Card>
+                  </TableBody>
+                </Table>
+              </CardContent>
+            </Card>
 
-              {/* Exceptions */}
-              <Card className="bg-white/[0.02] border-white/5 rounded-2xl overflow-hidden">
-                <CardHeader className="bg-white/[0.02] border-b border-white/5 px-5 py-4">
-                  <div className="flex justify-between items-center">
-                    <CardTitle className="text-base text-white font-medium">Exception List</CardTitle>
-                    <Badge variant="outline" className="bg-rose-500/10 text-rose-400 border-rose-500/20 text-xs font-mono">
-                      {analytics.exceptions.length} cases
-                    </Badge>
+            {/* Policy Configuration Box */}
+            {policy && (
+              <Card className="bg-white/[0.02] border-white/10 p-5 rounded-2xl">
+                <div className="flex items-center gap-2 mb-4">
+                  <ShieldCheck className="w-4 h-4 text-indigo-400" />
+                  <h3 className="text-sm font-semibold text-white">Active Deterministic Guardrails (Policy Layer)</h3>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                  <div className="p-3 bg-white/5 rounded-xl border border-white/5">
+                    <span className="text-slate-400 block mb-1">Max Retry Cap:</span>
+                    <span className="text-sm font-bold text-indigo-300">{policy.max_retries} attempts</span>
                   </div>
-                </CardHeader>
-                <CardContent className="p-0">
-                  {analytics.exceptions.length === 0 ? (
-                    <div className="py-10 text-center text-slate-500 text-sm">
-                      <CheckCircle2 className="w-6 h-6 mx-auto mb-2 text-emerald-500 opacity-60" />
-                      No exceptions — all cases resolved.
-                    </div>
-                  ) : (
-                    <div className="max-h-64 overflow-y-auto divide-y divide-white/5">
-                      {analytics.exceptions.map((ex) => (
-                        <div key={ex.case_id} className="px-5 py-3 flex items-center justify-between hover:bg-white/[0.02]">
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono text-xs text-slate-500">{ex.case_id.split("-")[0]}</span>
-                              <Badge variant="outline" className={`${STATUS_COLORS[ex.status] ?? ""} capitalize text-xs`}>
-                                {ex.status}
-                              </Badge>
-                            </div>
-                            <p className="text-xs text-slate-400 mt-0.5">{CASE_TYPE_LABELS[ex.case_type] ?? ex.case_type}</p>
-                          </div>
-                          <span className="text-rose-400 font-semibold text-sm">{formatINR(ex.amount_paise)}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </CardContent>
+                  <div className="p-3 bg-white/5 rounded-xl border border-white/5">
+                    <span className="text-slate-400 block mb-1">Discount Ceiling:</span>
+                    <span className="text-sm font-bold text-amber-300">{policy.max_discount_percent}% max</span>
+                  </div>
+                  <div className="p-3 bg-white/5 rounded-xl border border-white/5">
+                    <span className="text-slate-400 block mb-1">Human Approval Threshold:</span>
+                    <span className="text-sm font-bold text-rose-300">{formatINR(policy.require_human_approval_above_paise)}</span>
+                  </div>
+                  <div className="p-3 bg-white/5 rounded-xl border border-white/5">
+                    <span className="text-slate-400 block mb-1">Hard Decline Handling:</span>
+                    <span className="text-sm font-bold text-emerald-300">Immediate Stop</span>
+                  </div>
+                </div>
               </Card>
-            </div>
-
-            {/* Policy Config */}
-            <PolicyConfigCard />
+            )}
           </div>
         )}
       </div>
 
-      {/* Promise-to-Pay Modal */}
-      <Dialog open={ptpModalOpen} onOpenChange={setPtpModalOpen}>
-        <DialogContent className="max-w-md bg-[#0F1523] border-white/10 shadow-2xl shadow-black p-0 gap-0">
-          <DialogHeader className="p-6 pb-4 bg-white/[0.02] border-b border-white/5">
-            <DialogTitle className="flex items-center text-lg text-white font-medium">
-              <CalendarClock className="w-5 h-5 mr-3 text-teal-400" />
-              Capture Promise-to-Pay
+      {/* ── MODAL: AUDIT TRACE ── */}
+      <Dialog open={!!auditCaseId} onOpenChange={(open) => !open && setAuditCaseId(null)}>
+        <DialogContent className="bg-[#0b0e1b] border-white/10 text-slate-100 max-w-2xl max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="text-base font-bold text-white flex items-center gap-2">
+              <Activity className="w-4 h-4 text-indigo-400" /> Decision Trace &amp; Audit Trail
+              <span className="text-xs font-mono text-slate-400 ml-auto">{auditCaseId?.slice(0, 12)}…</span>
             </DialogTitle>
           </DialogHeader>
-          <div className="p-6 space-y-5">
-            <p className="text-sm text-slate-400">
-              Record the date the customer committed to paying. Standard AI reminders will be suppressed until then.
-              If payment is not received by this date, the case will auto-escalate.
-            </p>
-            <div>
-              <label className="block text-xs text-slate-400 uppercase tracking-wider mb-2">Payment Date *</label>
-              <input
-                type="date"
-                value={ptpDate}
-                onChange={(e) => setPtpDate(e.target.value)}
-                min={new Date().toISOString().split("T")[0]}
-                className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2.5 text-slate-200 text-sm focus:outline-none focus:border-teal-500/50 focus:ring-1 focus:ring-teal-500/30"
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-slate-400 uppercase tracking-wider mb-2">Customer Note (optional)</label>
-              <input
-                type="text"
-                value={ptpNote}
-                onChange={(e) => setPtpNote(e.target.value)}
-                placeholder="e.g. Customer said payment will clear on salary day"
-                className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2.5 text-slate-200 text-sm placeholder:text-slate-600 focus:outline-none focus:border-teal-500/50 focus:ring-1 focus:ring-teal-500/30"
-              />
-            </div>
-            {ptpError && (
-              <div className="bg-rose-500/10 border border-rose-500/20 rounded-lg px-4 py-3 text-rose-400 text-sm flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 shrink-0" />{ptpError}
-              </div>
-            )}
-            <div className="flex gap-3 pt-1">
-              <Button variant="outline" onClick={() => setPtpModalOpen(false)}
-                className="flex-1 bg-white/5 border-white/10 text-slate-400 hover:text-white hover:bg-white/10">
-                Cancel
-              </Button>
-              <Button onClick={submitPtp} disabled={ptpLoading || !ptpDate}
-                className="flex-1 bg-teal-600/80 hover:bg-teal-500 text-white border border-teal-500/50">
-                {ptpLoading ? <RefreshCw className="w-4 h-4 animate-spin mr-2" /> : <CalendarClock className="w-4 h-4 mr-2" />}
-                {ptpLoading ? "Saving…" : "Capture Promise"}
-              </Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* Audit Trail Modal */}
-
-      <Dialog open={auditModalOpen} onOpenChange={setAuditModalOpen}>
-        <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col p-0 gap-0 overflow-hidden bg-[#0F1523] border-white/10 shadow-2xl shadow-black">
-          <DialogHeader className="p-6 pb-4 bg-white/[0.02] border-b border-white/5">
-            <DialogTitle className="flex items-center text-xl text-white font-medium tracking-tight">
-              <Activity className="w-5 h-5 mr-3 text-indigo-400" />
-              Decision & Audit Trace
-              <span className="ml-4 text-xs font-mono text-slate-400 bg-black/40 px-3 py-1 rounded-full border border-white/5">
-                {selectedCaseId}
-              </span>
-            </DialogTitle>
-          </DialogHeader>
-          <div className="p-6 overflow-y-auto flex-1 bg-gradient-to-b from-[#0F1523] to-[#0B0F19]">
+          <div className="space-y-4 pt-2">
             {auditLoading ? (
-              <div className="flex justify-center items-center py-20">
-                <RefreshCw className="w-8 h-8 animate-spin text-indigo-500" />
-              </div>
+              <div className="py-8 text-center text-slate-400 text-xs">Loading audit trail…</div>
             ) : auditLogs.length === 0 ? (
-              <div className="flex flex-col items-center gap-3 py-16 text-slate-500">
-                <AlertCircle className="w-8 h-8 opacity-50" />
-                <p>No audit trail available for this case.</p>
-              </div>
+              <div className="py-8 text-center text-slate-500 text-xs">No audit logs recorded for this case.</div>
             ) : (
-              <div className="relative border-l border-indigo-500/30 ml-4 space-y-8 pb-8 pt-4">
+              <div className="border-l-2 border-indigo-500/30 pl-4 space-y-4 ml-2">
                 {auditLogs.map((log) => (
-                  <div key={log.id} className="relative pl-8 group">
-                    <div className="absolute w-4 h-4 bg-[#0F1523] border-2 border-indigo-500 rounded-full -left-[9px] top-1 shadow-[0_0_10px_rgba(99,102,241,0.5)] group-hover:scale-125 transition-transform duration-300" />
-                    <div className="bg-white/[0.03] rounded-xl p-5 border border-white/5 shadow-lg group-hover:border-indigo-500/30 group-hover:bg-white/[0.05] transition-all duration-300">
-                      <div className="flex justify-between items-start mb-3">
-                        <span className="font-semibold text-xs text-indigo-300 bg-indigo-500/10 px-2.5 py-1 rounded-md border border-indigo-500/20 tracking-wider uppercase">
-                          {log.action_type.replace(/_/g, " ")}
-                        </span>
-                        <span className="text-xs text-slate-500 font-mono bg-black/20 px-2 py-1 rounded border border-white/5">
-                          {new Date(log.created_at).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}
-                        </span>
-                      </div>
-                      <p className="text-slate-300 text-sm leading-relaxed">{log.description}</p>
-                      {log.reasoning && (() => {
-                        if (log.action_type === "POLICY_EVALUATED") {
-                          try {
-                            const parsed = JSON.parse(log.reasoning);
-                            return (
-                              <div className="mt-4 bg-black/40 border-l-2 border-indigo-500 p-4 rounded-r-lg text-sm">
-                                <div className="flex items-center gap-2 mb-2">
-                                  <ShieldCheck className="w-4 h-4 text-indigo-400" />
-                                  <span className="font-semibold text-slate-300">Policy Evaluation: {parsed.allowed ? "Passed" : "Failed"}</span>
-                                </div>
-                                <ul className="space-y-1 ml-6">
-                                  {parsed.rules.map((r: { passed: boolean; rule_name?: string; name?: string }, i: number) => (
-                                    <li key={i} className="text-slate-400 text-xs flex items-center gap-2">
-                                      {r.passed ? <CheckCircle2 className="w-3 h-3 text-emerald-500" /> : <AlertCircle className="w-3 h-3 text-rose-500" />}
-                                      <span className="font-mono">{r.rule_name || r.name}</span>
-                                    </li>
-                                  ))}
-                                </ul>
-                              </div>
-                            );
-                          } catch {
-                            // Fallback
-                          }
-                        }
-                        
-                        return (
-                          <div className="mt-4 bg-black/40 border-l-2 border-indigo-500 p-4 rounded-r-lg text-sm">
-                            <div className="flex gap-3">
-                              <ChevronRight className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" />
-                              <p className="text-slate-400 italic font-light">&quot;{log.reasoning}&quot;</p>
-                            </div>
-                          </div>
-                        );
-                      })()}
+                  <div key={log.id} className="relative space-y-1">
+                    <div className="absolute -left-[21px] top-1 w-2.5 h-2.5 rounded-full bg-indigo-500 ring-4 ring-[#0b0e1b]" />
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-indigo-300 uppercase tracking-wide">{log.action_type.replace(/_/g, " ")}</span>
+                      <span className="text-[10px] text-slate-500 font-mono">
+                        {new Date(log.created_at).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                      </span>
                     </div>
+                    <p className="text-xs text-slate-200">{log.description}</p>
+                    {log.reasoning && (
+                      <p className="text-[11px] text-slate-400 bg-black/30 p-2 rounded-lg font-mono whitespace-pre-wrap">
+                        {log.reasoning}
+                      </p>
+                    )}
                   </div>
                 ))}
               </div>
@@ -885,77 +651,60 @@ export default function Dashboard() {
         </DialogContent>
       </Dialog>
 
-      {/* Comms Preview Modal */}
-      <Dialog open={commsModalOpen} onOpenChange={setCommsModalOpen}>
-        <DialogContent className="max-w-md bg-[#0F1523] border-white/10 shadow-2xl shadow-black p-6">
-          <DialogHeader className="pb-4 border-b border-white/5">
-            <DialogTitle className="flex items-center justify-between text-lg text-white font-medium">
-              <div className="flex items-center">
-                <Inbox className="w-5 h-5 mr-3 text-indigo-400" />
-                Customer Communication
-              </div>
-              <Badge variant="outline" className="bg-amber-500/10 text-amber-300 border-amber-500/20 text-[11px] font-normal">
-                Simulated Delivery
-              </Badge>
+      {/* ── MODAL: CUSTOMER COMMS PREVIEW ── */}
+      <Dialog open={!!commsModalMsg} onOpenChange={(open) => !open && setCommsModalMsg(null)}>
+        <DialogContent className="bg-[#0b0e1b] border-white/10 text-slate-100 max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-sm font-bold text-white flex items-center gap-2">
+              <Inbox className="w-4 h-4 text-indigo-400" /> Generated Recovery Communication
             </DialogTitle>
           </DialogHeader>
-          <div className="pt-4 text-slate-300 whitespace-pre-wrap text-sm leading-relaxed font-sans">
-            {commsMsg}
+          <div className="p-4 rounded-xl bg-white/[0.02] border border-white/5 text-xs text-slate-300 whitespace-pre-wrap font-sans leading-relaxed">
+            {commsModalMsg}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── MODAL: PROMISE TO PAY ── */}
+      <Dialog open={!!ptpCaseId} onOpenChange={(open) => !open && setPtpCaseId(null)}>
+        <DialogContent className="bg-[#0b0e1b] border-white/10 text-slate-100 max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-sm font-bold text-white flex items-center gap-2">
+              <CalendarClock className="w-4 h-4 text-teal-400" /> Capture Promise-to-Pay
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 pt-2">
+            <p className="text-xs text-slate-400">
+              Customer commitment suspends automatic recovery actions until the promised date. If broken, auto-escalation triggers.
+            </p>
+            <div className="space-y-1">
+              <label className="text-[11px] uppercase tracking-wider text-slate-400">Promise Date</label>
+              <input
+                type="date"
+                value={ptpDate}
+                onChange={(e) => setPtpDate(e.target.value)}
+                className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-xs text-white focus:outline-none focus:border-teal-500"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-[11px] uppercase tracking-wider text-slate-400">Customer Note</label>
+              <input
+                type="text"
+                placeholder="e.g. Will pay after invoice sign-off on Friday"
+                value={ptpNote}
+                onChange={(e) => setPtpNote(e.target.value)}
+                className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-xs text-white focus:outline-none focus:border-teal-500"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button variant="ghost" size="sm" onClick={() => setPtpCaseId(null)}>Cancel</Button>
+              <Button size="sm" onClick={submitPtp} disabled={actionBusy === "ptp"} className="bg-teal-600 hover:bg-teal-500 text-white">
+                Save Commitment
+              </Button>
+            </div>
           </div>
         </DialogContent>
       </Dialog>
     </div>
-  );
-}
-
-function PolicyConfigCard() {
-  const [policy, setPolicy] = useState<{
-    max_retries: number;
-    max_discount_percent: number;
-    require_human_approval_above_paise: number;
-    block_hard_declines: boolean;
-    min_enach_delay_hours?: number;
-    pre_debit_notice_hours?: number;
-    max_days_pursued?: number;
-  } | null>(null);
-
-  useEffect(() => {
-    fetch(`${API_BASE}/policy`).then(r => r.json()).then(setPolicy).catch(console.error);
-  }, []);
-
-  if (!policy) return null;
-
-  const pursuitDays = policy.max_days_pursued ?? 14;
-  const enachNoticeHours = policy.min_enach_delay_hours ?? 72;
-
-  return (
-    <Card className="bg-white/[0.02] border-white/5 rounded-2xl">
-      <CardHeader className="bg-white/[0.02] border-b border-white/5 px-6 py-4">
-        <CardTitle className="text-base text-white font-medium flex items-center gap-2">
-          <ShieldCheck className="w-5 h-5 text-indigo-400" />
-          Live Policy Configuration
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="p-6">
-        <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
-          {[
-            { label: "Max Retries", value: policy.max_retries },
-            { label: "Max Discount", value: `${policy.max_discount_percent}%` },
-            { label: "Human Approval Above", value: formatINR(policy.require_human_approval_above_paise) },
-            { label: "Block Hard Declines", value: policy.block_hard_declines ? "Yes" : "No" },
-            { label: "RBI eNACH Notice", value: `${enachNoticeHours}h` },
-            { label: "Pursuit Window", value: `${pursuitDays} Days` },
-          ].map((item) => (
-            <div key={item.label} className="bg-white/[0.03] rounded-xl p-4 border border-white/5">
-              <p className="text-xs text-slate-500 uppercase tracking-wider mb-2">{item.label}</p>
-              <p className="text-lg font-bold text-indigo-300">{item.value}</p>
-            </div>
-          ))}
-        </div>
-        <p className="text-xs text-slate-500 mt-4">
-          + RBI eNACH/NACH {enachNoticeHours}h pre-debit notice · Max {pursuitDays}-day pursuit window · Customer opt-out stops recovery
-        </p>
-      </CardContent>
-    </Card>
   );
 }
