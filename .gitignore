@@ -5,4 +5,5 @@ backend/venv/
 .venv/
 .pytest_cache/
 .coverage
+*.db
 .agents/
