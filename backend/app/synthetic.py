@@ -17,7 +17,11 @@ def compute_priority_score(case_type: str, amount_paise: int, payload: dict) -> 
     if case_type == CaseType.CHECKOUT_ABANDONED.value:
         return int(amount_paise * 0.5)
     if case_type == CaseType.INVOICE_OVERDUE.value:
-        return int(amount_paise * 0.9)
+        # Recency-weighted: a 3-day-old invoice is far more collectable than
+        # a 30-day-old one, so decay expected value as it ages.
+        days = payload.get("days_overdue", 0)
+        urgency = max(0.5, 1.0 - (days / 60))
+        return int(amount_paise * 0.9 * urgency)
     return int(amount_paise * 0.5)
 
 

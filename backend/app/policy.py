@@ -5,6 +5,7 @@ Deterministic rules the AI decision engine must operate inside.
 Every rule is visible and inspectable — not buried in code.
 """
 
+from typing import Optional
 from app.models import (
     RecoveryCase, DecisionResult, DiagnosisResult, PolicyResult,
     RecoveryActionType, RootCauseCategory,
@@ -37,6 +38,7 @@ def evaluate_policy(
 ) -> PolicyResult:
     """
     Check the AI's proposed action against every guardrail.
+    Evaluates all 8 rules and tags each with status: 'passed', 'failed', or 'not_applicable'.
     Returns PolicyResult with allowed=True/False and the reason.
 
     human_approved=True bypasses the high-value gate only (a human already
@@ -47,47 +49,55 @@ def evaluate_policy(
     action = decision.recommended_action
     params = decision.action_parameters
     rules = []
+    first_blocker: Optional[dict] = None
 
-    def reject(reason, human=False):
-        return PolicyResult(
-            allowed=False, reason=reason, requires_human_approval=human,
-            decision=decision, rules_checked=rules,
-        )
+    def note(name, passed, **extra):
+        nonlocal first_blocker
+        entry = {"rule": name, "status": "passed" if passed else "failed", **extra}
+        rules.append(entry)
+        if not passed and first_blocker is None:
+            first_blocker = entry
 
-    def approve(reason):
-        return PolicyResult(
-            allowed=True, reason=reason, decision=decision, rules_checked=rules,
-        )
+    def skip(name, why):
+        rules.append({"rule": name, "status": "not_applicable", "why": why})
 
     # Rule 0: Customer opted out — hard block everything
     if case.opted_out:
-        rules.append({"rule": "customer_opt_out", "passed": False})
-        return reject("Blocked: customer opted out of recovery communications.")
-
-    rules.append({"rule": "customer_opt_out", "passed": True})
+        note("customer_opt_out", False, reason="Customer opted out")
+    else:
+        note("customer_opt_out", True)
 
     # Rule 1: Escalation and stop are always allowed
     if action in (RecoveryActionType.ESCALATE_TO_HUMAN, RecoveryActionType.STOP):
-        rules.append({"rule": "always_allowed", "passed": True})
-        return approve(f"{action.value} is always permitted.")
+        note("always_allowed", True, action=action.value)
+        # Always allowed overrides other rules
+        if not case.opted_out:
+            return PolicyResult(
+                allowed=True,
+                reason=f"{action.value} is always permitted.",
+                decision=decision,
+                rules_checked=rules,
+            )
+    else:
+        skip("always_allowed", "Action is not an escalation or stop")
 
     # Rule 2: Disputes require human review
     if diagnosis.root_cause_category == RootCauseCategory.DISPUTE:
-        rules.append({"rule": "dispute_gate", "passed": False})
-        return reject("Blocked: dispute detected — requires human intervention.", human=True)
-
-    rules.append({"rule": "dispute_gate", "passed": True})
+        note("dispute_gate", False, reason="Dispute detected — requires human intervention", requires_human=True)
+    else:
+        note("dispute_gate", True)
 
     # Rule 3: High-value cases need human approval for financial actions
-    if case.amount_paise > POLICY["require_human_approval_above_paise"] and not human_approved:
-        if action != RecoveryActionType.SEND_REMINDER:
-            rules.append({"rule": "high_value_gate", "passed": False, "amount": case.amount_paise})
-            return reject(
-                f"Blocked: case value ({case.amount_paise} paise) exceeds ₹50,000 threshold. Human approval required.",
-                human=True,
-            )
-
-    rules.append({"rule": "high_value_gate", "passed": True})
+    if case.amount_paise > POLICY["require_human_approval_above_paise"]:
+        if human_approved:
+            note("high_value_gate", True, human_approved=True)
+        elif action == RecoveryActionType.SEND_REMINDER:
+            skip("high_value_gate", "Non-financial reminder permitted without approval")
+        else:
+            note("high_value_gate", False, amount=case.amount_paise, requires_human=True,
+                 reason=f"Case value ({case.amount_paise} paise) exceeds ₹50,000 threshold.")
+    else:
+        note("high_value_gate", True)
 
     # Rule 4: Cap cumulative discount
     if action == RecoveryActionType.OFFER_DISCOUNT:
@@ -95,10 +105,12 @@ def evaluate_policy(
         proposed_paise = int(case.amount_paise * pct / 100)
         max_paise = int(case.amount_paise * POLICY["max_discount_percent"] / 100)
         if case.cumulative_discount_paise + proposed_paise > max_paise:
-            rules.append({"rule": "discount_cap", "passed": False})
-            return reject(f"Blocked: cumulative discount would exceed {POLICY['max_discount_percent']}%.")
-
-    rules.append({"rule": "discount_cap", "passed": True})
+            note("discount_cap", False,
+                 reason=f"Cumulative discount would exceed {POLICY['max_discount_percent']}%.")
+        else:
+            note("discount_cap", True)
+    else:
+        skip("discount_cap", "Action is not a discount offer")
 
     # Rule 5: Never retry a hard decline
     financial_actions = (
@@ -106,37 +118,30 @@ def evaluate_policy(
         RecoveryActionType.CREATE_PAYMENT_LINK,
         RecoveryActionType.SWITCH_RAIL,
     )
-    if action in financial_actions and diagnosis.root_cause_category == RootCauseCategory.HARD_DECLINE:
-        rules.append({"rule": "block_hard_decline", "passed": False})
-        return reject("Blocked: policy forbids retrying hard declines.")
-
-    rules.append({"rule": "block_hard_decline", "passed": True})
+    if action in financial_actions:
+        if diagnosis.root_cause_category == RootCauseCategory.HARD_DECLINE:
+            note("block_hard_decline", False, reason="Policy forbids retrying hard declines.")
+        else:
+            note("block_hard_decline", True)
+    else:
+        skip("block_hard_decline", "Action is not a financial retry")
 
     # Rule 6: Max retry attempts
-    # NOTE: max_attempts in pipeline.py is POLICY["max_retries"] + 1 ("initial
-    # try + retries"). retry_count is incremented AFTER each failed attempt,
-    # so on the loop's final allowed iteration retry_count == max_retries
-    # exactly — that attempt must still be allowed to execute. Using >= here
-    # blocks it one iteration early, short-circuiting the case to FAILED via
-    # a policy rejection that never calls the executor, instead of letting it
-    # exhaust its full attempt budget and reach ESCALATED (Feature 9).
-    if action in financial_actions and case.retry_count > POLICY["max_retries"]:
-        rules.append({"rule": "max_retries", "passed": False})
-        return reject(f"Blocked: max retries ({POLICY['max_retries']}) reached.")
-
-    rules.append({"rule": "max_retries", "passed": True})
+    if action in financial_actions:
+        if case.retry_count > POLICY["max_retries"]:
+            note("max_retries", False, reason=f"Max retries ({POLICY['max_retries']}) reached.")
+        else:
+            note("max_retries", True)
+    else:
+        skip("max_retries", "Action is not a financial retry")
 
     # Rule 7: Minimum AI confidence
     if decision.confidence_score < POLICY["min_confidence_score"] or \
        diagnosis.confidence_score < POLICY["min_confidence_score"]:
-        rules.append({"rule": "min_confidence", "passed": False})
-        return reject(
-            f"Blocked: AI confidence too low (decision={decision.confidence_score}, "
-            f"diagnosis={diagnosis.confidence_score}). Escalating.",
-            human=True,
-        )
-
-    rules.append({"rule": "min_confidence", "passed": True})
+        note("min_confidence", False, requires_human=True,
+             reason=f"AI confidence too low (decision={decision.confidence_score}, diagnosis={diagnosis.confidence_score}).")
+    else:
+        note("min_confidence", True)
 
     # Rule 8: RBI pre-debit notice for eNACH/NACH mandates
     if action in financial_actions:
@@ -144,12 +149,29 @@ def evaluate_policy(
         if rail in ("enach", "nach", "emandate", "mandate"):
             delay = params.get("delay_hours", 0)
             if delay < POLICY["pre_debit_notice_hours"]:
-                rules.append({"rule": "rbi_pre_debit", "passed": False})
-                return reject(
-                    f"Blocked: RBI requires {POLICY['pre_debit_notice_hours']}h pre-debit notice "
-                    f"for {rail.upper()}. Proposed delay: {delay}h.",
-                )
+                note("rbi_pre_debit", False,
+                     reason=f"RBI requires {POLICY['pre_debit_notice_hours']}h pre-debit notice for {rail.upper()}. Proposed delay: {delay}h.")
+            else:
+                note("rbi_pre_debit", True)
+        else:
+            skip("rbi_pre_debit", "Not an eNACH/NACH mandate rail")
+    else:
+        skip("rbi_pre_debit", "Action is not a financial charge")
 
-    rules.append({"rule": "rbi_pre_debit", "passed": True})
+    if first_blocker:
+        reason = first_blocker.get("reason", f"Blocked by rule: {first_blocker['rule']}")
+        requires_human = first_blocker.get("requires_human", False)
+        return PolicyResult(
+            allowed=False,
+            reason=f"Blocked: {reason}",
+            requires_human_approval=requires_human,
+            decision=decision,
+            rules_checked=rules,
+        )
 
-    return approve("Action allowed by policy.")
+    return PolicyResult(
+        allowed=True,
+        reason="Action allowed by policy.",
+        decision=decision,
+        rules_checked=rules,
+    )

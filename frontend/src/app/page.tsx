@@ -54,9 +54,10 @@ interface Analytics {
   recovery_rate_percent: number;
   net_recovery_rate_percent: number;
   breakdown_by_case_type: Record<string, { total: number; recovered: number; at_risk_paise: number; recovered_paise: number }>;
-  breakdown_by_channel: Record<string, { total: number; recovered: number; at_risk_paise: number; recovered_paise: number }>;
+  breakdown_by_channel?: Record<string, { total: number; recovered: number; at_risk_paise: number; recovered_paise: number }>;
   breakdown_by_status: Record<string, number>;
   exceptions: { case_id: string; status: string; case_type: string; amount_paise: number }[];
+  stopped_by_rule?: { case_id: string; status: string; case_type: string; amount_paise: number }[];
 }
 
 interface AuditLog {
@@ -654,6 +655,14 @@ export default function Dashboard() {
         {/* ── TAB 3: ANALYTICS & ECONOMICS ── */}
         {tab === "analytics" && analytics && (
           <div className="space-y-6">
+            {/* Transparency Note */}
+            <div className="flex items-center gap-2.5 p-3.5 rounded-xl bg-indigo-500/10 border border-indigo-500/20 text-xs text-indigo-300">
+              <Activity className="w-4 h-4 flex-shrink-0 text-indigo-400" />
+              <span>
+                <strong>Simulation Notice:</strong> Recovery outcomes in synthetic batches are simulated (~60% of contacted cases). Real-world cases are confirmed asynchronously via Razorpay webhooks.
+              </span>
+            </div>
+
             {/* Case Type Breakdown */}
             <Card className="bg-white/[0.02] border-white/10">
               <CardHeader className="p-5 border-b border-white/5">
@@ -766,6 +775,44 @@ export default function Dashboard() {
                             </Badge>
                           </TableCell>
                           <TableCell className="text-xs font-semibold text-rose-300 text-right">{formatINR(ex.amount_paise)}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Stopped by Policy (Legitimate stopping rules) */}
+            {analytics.stopped_by_rule && analytics.stopped_by_rule.length > 0 && (
+              <Card className="bg-white/[0.02] border-white/10">
+                <CardHeader className="p-5 border-b border-white/5 flex flex-row items-center justify-between">
+                  <CardTitle className="text-sm font-semibold text-white">Stopped by Policy (Opt-Outs, Max Pursuit Caps)</CardTitle>
+                  <Badge variant="outline" className="bg-slate-500/10 text-slate-300 border-slate-500/30 text-xs">
+                    {analytics.stopped_by_rule.length} cases
+                  </Badge>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <Table>
+                    <TableHeader>
+                      <TableRow className="border-white/5 hover:bg-transparent">
+                        <TableHead className="text-slate-400 text-xs">Case ID</TableHead>
+                        <TableHead className="text-slate-400 text-xs">Type</TableHead>
+                        <TableHead className="text-slate-400 text-xs">Resolution</TableHead>
+                        <TableHead className="text-slate-400 text-xs text-right">Amount</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {analytics.stopped_by_rule.slice(0, 10).map((cl) => (
+                        <TableRow key={cl.case_id} className="border-white/5">
+                          <TableCell className="text-xs font-mono text-slate-400">{cl.case_id.slice(0, 8)}…</TableCell>
+                          <TableCell className="text-xs text-slate-300">{CASE_LABELS[cl.case_type] || cl.case_type}</TableCell>
+                          <TableCell>
+                            <Badge variant="outline" className="bg-slate-500/10 text-slate-400 border-slate-500/30 text-[10px] uppercase">
+                              Stopped by rule
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="text-xs font-semibold text-slate-300 text-right">{formatINR(cl.amount_paise)}</TableCell>
                         </TableRow>
                       ))}
                     </TableBody>

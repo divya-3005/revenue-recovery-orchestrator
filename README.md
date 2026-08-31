@@ -54,6 +54,7 @@ The app starts immediately with SQLite — no database setup needed.
 | POST | `/api/v1/cases/{id}/close` | Close an escalated case |
 | POST | `/api/v1/cases/{id}/promise-to-pay` | Capture promise-to-pay |
 | POST | `/api/v1/cases/{id}/opt-out` | Customer opt-out |
+| POST | `/api/v1/jobs/run-follow-ups` | Re-engage stale unpaid cases (Feature 7 re-loop; accepts `?force=true`) |
 | POST | `/api/v1/batch` | Run 50+ synthetic cases |
 | GET | `/api/v1/analytics` | Recovery analytics |
 | GET | `/api/v1/policy` | Policy configuration |
@@ -76,7 +77,11 @@ Set these environment variables for production features (optional for local dev)
 | `GEMINI_API_KEY` | Gemini AI for diagnosis/decisions | Rule-based fallback |
 | `RAZORPAY_KEY_ID` | Razorpay test-mode key | Dry-run mode |
 | `RAZORPAY_KEY_SECRET` | Razorpay test-mode secret | Dry-run mode |
-| `DATABASE_URL` | Database connection string | `sqlite:///recovery.db` |
+| `RAZORPAY_WEBHOOK_SECRET` | Secret for HMAC webhook verification | Optional in dev |
+| `ENABLE_FOLLOW_UP_SCHEDULER` | Set to `1` to run background follow-up cron | `0` (off by default) |
+| `FOLLOW_UP_POLL_SECONDS` | Poll interval for background follow-up scheduler | `3600` (1 hour) |
+| `NEXT_PUBLIC_API_BASE` | Frontend API base URL | `http://127.0.0.1:8000/api/v1` |
+| `DATABASE_URL` | Database connection string | `sqlite:///./recovery.db` |
 
 ## Features
 

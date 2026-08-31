@@ -92,11 +92,12 @@ class Executor:
         )
 
     def _send_reminder_only(self, case: RecoveryCase, decision: DecisionResult) -> ExecutionResult:
-        """SEND_REMINDER — a lightweight nudge referencing the case's
-        existing checkout/invoice. Deliberately does NOT create a new
-        Razorpay payment link (avoids spamming duplicate links for the
-        same case); the message itself is generated separately by
-        comms.generate_message and logged to the audit trail."""
+        if self.client:
+            return ExecutionResult(
+                status=ExecutionStatus.FAILED, action_taken=RecoveryActionType.SEND_REMINDER,
+                reason="No standalone messaging integration (SMS/email provider) is wired up — "
+                       "cannot send a link-free reminder. Falling through to a payment link.",
+            )
         channel = decision.action_parameters.get("channel", "email")
         return ExecutionResult(
             status=ExecutionStatus.DRY_RUN, action_taken=RecoveryActionType.SEND_REMINDER,
