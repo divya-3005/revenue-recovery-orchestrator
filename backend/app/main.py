@@ -434,7 +434,7 @@ def opt_out(case_id: str, body: OptOutRequest = OptOutRequest(), db: Session = D
 # ── Batch Processing (Feature 11) ───────────────────────────────────────
 
 @app.post("/api/v1/batch")
-def run_batch(db: Session = Depends(get_db)):
+def run_batch(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """Generate 50+ synthetic cases and process them through the full pipeline."""
     synthetic = generate_batch()
     created_ids = []
@@ -459,30 +459,14 @@ def run_batch(db: Session = Depends(get_db)):
         db.commit()
         created_ids.append(case.id)
 
-    # Run the pipeline for each case
-    results = []
-    for idx, cid in enumerate(created_ids):
-        try:
-            result = run_pipeline(db, cid)
-            # Simulate payment for ~60% of payment_pending cases
-            if result.get("status") == "payment_pending" and idx % 5 < 3:
-                _simulate_payment(db, cid)
-                result = {"status": "recovered", "reason": "Simulated payment received."}
-            results.append({"case_id": cid, **result})
-        except Exception as e:
-            logger.error(f"Batch pipeline error for {cid}: {e}")
-            results.append({"case_id": cid, "status": "error", "reason": str(e)})
-
-    status_counts: dict = {}
-    for r in results:
-        status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+    # Hand off pipeline execution to a background task so the HTTP request
+    # returns immediately, preventing Vercel from timing out at 10 seconds.
+    background_tasks.add_task(_process_batch_background, created_ids)
 
     return {
+        "status": "seeded_and_processing",
         "cases_created": len(created_ids),
         "case_ids": created_ids,
-        "results": results,
-        "status_counts": status_counts,
-        "outcomes_simulated": True,
     }
 
 
@@ -659,6 +643,27 @@ def _run_pipeline_safe(case_id: str):
         run_pipeline(db, case_id)
     except Exception as e:
         logger.error(f"Pipeline error for {case_id}: {e}")
+    finally:
+        db.close()
+
+
+def _process_batch_background(case_ids: list[str]):
+    """Process a batch of cases sequentially with a stagger to prevent
+    burst-limit 429 errors from free-tier AI endpoints."""
+    from app.database import SessionLocal
+    import time
+    db = SessionLocal()
+    try:
+        for idx, cid in enumerate(case_ids):
+            try:
+                result = run_pipeline(db, cid)
+                if result.get("status") == "payment_pending" and idx % 5 < 3:
+                    _simulate_payment(db, cid)
+            except Exception as e:
+                logger.error(f"Batch background error for {cid}: {e}")
+            # Stagger by 1.5 seconds to easily stay under Gemini's 15 RPM
+            # free tier when combined with pipeline execution time.
+            time.sleep(1.5)
     finally:
         db.close()
 
