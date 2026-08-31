@@ -134,10 +134,10 @@ def run_follow_up_check(db: Session, now: Optional[datetime] = None, force: bool
     results = []
     for case in stale_cases:
         if case.scheduled_for:
-            sched = case.scheduled_for
-            if sched.tzinfo is None:
-                sched = sched.replace(tzinfo=timezone.utc)
+            sched = case.scheduled_for.replace(tzinfo=timezone.utc) if case.scheduled_for.tzinfo is None else case.scheduled_for
             if sched > now:
+                results.append({"case_id": case.id, "status": "scheduled",
+                    "reason": f"Still within compliance/delay window until {sched.isoformat()}."})
                 continue
 
         # _check_stopping_rules handles all policy-level blocks (max retries, hard declines).
@@ -258,7 +258,7 @@ def _run_attempt(
         db.commit()
     # ── Execute action (Feature 5) ──────────────────────────────────────
     delay_hours = decision.action_parameters.get("delay_hours", 0)
-    if delay_hours > 0:
+    if delay_hours > 0 and action in CUSTOMER_FACING_ACTIONS:
         case.scheduled_for = datetime.now(timezone.utc) + timedelta(hours=delay_hours)
     else:
         case.scheduled_for = None

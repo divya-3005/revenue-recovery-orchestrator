@@ -391,3 +391,26 @@ def test_payment_link_paid_confirms_via_link_entity_notes():
     assert case.status == CaseStatus.RECOVERED
     db.close()
 
+
+def test_retry_charge_delay_does_not_block_force_reengagement():
+    """RETRY_CHARGE is silent and immediate — it must not pick up the
+    24h delay meant for CREATE_PAYMENT_LINK, or force=True (the whole
+    point of which is instant demo re-engagement) silently does nothing."""
+    case_id = _create_case_direct("subscription_failed", 50_000,
+        payload={"reason": "insufficient_funds"}, payment_rail="card")
+    run_pipeline(SessionLocal(), case_id)
+
+    db = SessionLocal()
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    assert case.latest_action_recommended == "retry_charge"
+    assert case.scheduled_for is None, (
+        "A silent retry_charge should never set scheduled_for — it has no "
+        "delay concept, and a non-null value here freezes it out of "
+        "force=True re-engagement for no reason.")
+    db.close()
+
+    # No _age_case call here — this is the real path the demo button uses.
+    results = run_follow_up_check(SessionLocal(), force=True)
+    assert any(r["case_id"] == case_id for r in results), (
+        "force=True is supposed to re-engage every unpaid case immediately "
+        "for demo purposes — a stray scheduled_for silently defeated it.")

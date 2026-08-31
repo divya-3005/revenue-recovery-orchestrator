@@ -694,6 +694,8 @@ def _execute_approved(case_id: str):
                f"Post-approval re-check {'APPROVED' if policy.allowed else 'REJECTED'}: {policy.reason}",
                json.dumps({"human_approved": True, "rules": policy.rules_checked}))
         if not policy.allowed:
+            # We fail instead of escalating here; a human already reviewed it once,
+            # so re-escalating a hard cap breach would just loop.
             case.status = CaseStatus.FAILED
             _audit(db, case.id, "POLICY_BLOCKED",
                    f"Approved action still breaches a hard cap: {policy.reason}",
