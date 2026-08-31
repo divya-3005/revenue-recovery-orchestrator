@@ -42,19 +42,19 @@ def generate_batch() -> list[dict]:
         cases.append(_case(CaseType.SUBSCRIPTION_FAILED, amount, cid, payload,
                           rail=soft_rails[i % len(soft_rails)]))
 
-    # ── 8 subscription failures: hard declines (should NOT be retried) ──
+    # ── 2 subscription failures: hard declines (should NOT be retried) ──
     hard_reasons = ["lost_card_reported", "stolen_card", "account_closed", "fraud_suspected"]
     hard_amounts = [9900, 29900, 49900]
-    for i in range(8):
+    for i in range(2):
         amount = hard_amounts[i % len(hard_amounts)]
         cid = f"cust_batch_{15 + i:03d}"
         payload = {"reason": hard_reasons[i % len(hard_reasons)],
                    "email": f"{cid}@example.com", "contact": f"+9198765{15 + i:05d}"}
         cases.append(_case(CaseType.SUBSCRIPTION_FAILED, amount, cid, payload, rail="card"))
 
-    # ── 12 checkout abandoned: friction signals ──────────────────────
+    # ── 3 checkout abandoned: friction signals ──────────────────────
     cart_amounts = [19900, 49900, 99900, 249900, 499900]
-    for i in range(12):
+    for i in range(3):
         amount = cart_amounts[i % len(cart_amounts)]
         cid = f"cust_batch_{23 + i:03d}"
         hour = (i * 7) % 24
@@ -68,9 +68,9 @@ def generate_batch() -> list[dict]:
         cases.append(_case(CaseType.CHECKOUT_ABANDONED, amount, cid, payload,
                           rail=["card", "upi"][i % 2]))
 
-    # ── 10 invoice overdue: missed payments ─────────────────────────
+    # ── 3 invoice overdue: missed payments ─────────────────────────
     inv_amounts = [100000, 250000, 500000, 1000000, 2500000]
-    for i in range(10):
+    for i in range(3):
         amount = inv_amounts[i % len(inv_amounts)]
         cid = f"cust_batch_{35 + i:03d}"
         good_history = (i % 2 == 0)
@@ -86,9 +86,9 @@ def generate_batch() -> list[dict]:
         }
         cases.append(_case(CaseType.INVOICE_OVERDUE, amount, cid, payload))
 
-    # ── 5 high-value cases (trigger human approval) ─────────────────
+    # ── 2 high-value cases (trigger human approval) ─────────────────
     hv_amounts = [5500000, 7000000, 10000000]
-    for i in range(5):
+    for i in range(2):
         amount = hv_amounts[i % len(hv_amounts)]
         cid = f"cust_batch_{45 + i:03d}"
         payload = {"reason": "insufficient_funds",
