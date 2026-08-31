@@ -300,7 +300,7 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
             if headroom_pct >= 5:
                 return DecisionResult(
                     recommended_action=RecoveryActionType.OFFER_DISCOUNT,
-                    action_parameters={"discount_percent": min(10, headroom_pct)},
+                    action_parameters={"discount_percent": min(10, headroom_pct), "channel": channel},
                     confidence_score=0.80,
                     reasoning=f"Repeat customer / high-value cart — offering {min(10, headroom_pct)}% "
                               f"within the remaining discount headroom.",

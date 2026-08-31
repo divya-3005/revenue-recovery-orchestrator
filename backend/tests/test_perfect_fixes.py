@@ -414,3 +414,49 @@ def test_retry_charge_delay_does_not_block_force_reengagement():
     assert any(r["case_id"] == case_id for r in results), (
         "force=True is supposed to re-engage every unpaid case immediately "
         "for demo purposes — a stray scheduled_for silently defeated it.")
+
+def test_discount_action_escalates_channel_on_second_contact():
+    """offer_discount is customer-facing, so it must carry a channel and
+    follow the same email->sms escalation as every other contact action."""
+    case_id = _create_case_direct("checkout_abandoned", 200_000,
+        payload={"is_repeat_customer": True, "cart_value": 200_000}, payment_rail="upi")
+    run_pipeline(SessionLocal(), case_id)
+
+    db = SessionLocal()
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    assert case.latest_channel == "email"          # first contact
+    case.scheduled_for = None
+    db.commit(); db.close()
+
+    run_follow_up_check(SessionLocal(), force=True)
+    db = SessionLocal()
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    assert case.contact_count == 2
+    assert case.latest_channel == "sms", (
+        "Second contact must escalate to SMS — offer_discount was omitting "
+        "the channel param, so it silently defaulted to email forever.")
+    db.close()
+
+
+def test_followups_exhausted_escalates_even_while_scheduled():
+    """max_follow_ups is a stopping rule — it must not sit behind a delay
+    window. A case out of follow-up budget has no next action to wait for."""
+    case_id = _create_case_direct("invoice_overdue", 100_000,
+        payload={"days_overdue": 5}, payment_rail="upi")
+    run_pipeline(SessionLocal(), case_id)
+
+    db = SessionLocal()
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    case.follow_up_count = POLICY["max_follow_ups"]        # budget spent
+    case.scheduled_for = datetime.now(timezone.utc) + timedelta(hours=24)  # but scheduled
+    case.status = CaseStatus.PAYMENT_PENDING
+    db.commit(); db.close()
+
+    run_follow_up_check(SessionLocal(), force=True)
+    db = SessionLocal()
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    assert case.status == CaseStatus.ESCALATED, (
+        "A case past max_follow_ups must escalate immediately, not wait out "
+        "a scheduled window for a contact it will never make.")
+    assert "FOLLOWUPS_EXHAUSTED" in _audit_types(case_id)
+    db.close()

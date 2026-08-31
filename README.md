@@ -75,6 +75,7 @@ Set these environment variables for production features (optional for local dev)
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `GEMINI_API_KEY` | Gemini AI for diagnosis/decisions | Rule-based fallback |
+| `GEMINI_MODEL_ID` | Gemini model ID to use (e.g. gemini-2.5-flash) | `gemini-2.5-flash` |
 | `RAZORPAY_KEY_ID` | Razorpay test-mode key | Dry-run mode |
 | `RAZORPAY_KEY_SECRET` | Razorpay test-mode secret | Dry-run mode |
 | `RAZORPAY_WEBHOOK_SECRET` | Secret for HMAC webhook verification | Optional in dev |

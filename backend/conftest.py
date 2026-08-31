@@ -2,7 +2,6 @@
 Test configuration — in-memory SQLite for all tests.
 """
 
-import os
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker

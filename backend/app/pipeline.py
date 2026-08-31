@@ -133,13 +133,6 @@ def run_follow_up_check(db: Session, now: Optional[datetime] = None, force: bool
 
     results = []
     for case in stale_cases:
-        if case.scheduled_for:
-            sched = case.scheduled_for.replace(tzinfo=timezone.utc) if case.scheduled_for.tzinfo is None else case.scheduled_for
-            if sched > now:
-                results.append({"case_id": case.id, "status": "scheduled",
-                    "reason": f"Still within compliance/delay window until {sched.isoformat()}."})
-                continue
-
         # _check_stopping_rules handles all policy-level blocks (max retries, hard declines).
         # We share this with the main pipeline so follow-ups respect the same guardrails.
         stop_result = _check_stopping_rules(db, case)
@@ -155,6 +148,13 @@ def run_follow_up_check(db: Session, now: Optional[datetime] = None, force: bool
             db.commit()
             results.append({"case_id": case.id, "status": "escalated", "reason": "Follow-ups exhausted"})
             continue
+
+        if case.scheduled_for:
+            sched = case.scheduled_for.replace(tzinfo=timezone.utc) if case.scheduled_for.tzinfo is None else case.scheduled_for
+            if sched > now:
+                results.append({"case_id": case.id, "status": "scheduled",
+                    "reason": f"Still within compliance/delay window until {sched.isoformat()}."})
+                continue
 
         case.follow_up_count += 1
         if force:

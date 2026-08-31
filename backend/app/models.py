@@ -170,6 +170,7 @@ class DecisionResult(BaseModel):
         a = self.recommended_action
         if a == RecoveryActionType.OFFER_DISCOUNT:
             p.setdefault("discount_percent", 10)
+            p.setdefault("channel", "email")
         # RETRY_CHARGE is a silent, immediate saved-method attempt — it has
         # no "wait before contacting the customer" concept, so it must not
         # inherit the 24h default meant for CREATE_PAYMENT_LINK.
