@@ -20,6 +20,12 @@ POLICY = {
     "min_confidence_score": 0.7,
     "pre_debit_notice_hours": 72,  # RBI eNACH/NACH minimum
     "max_days_pursued": 14,
+    # Feature 7 (re-loop): how long a PAYMENT_PENDING case can sit unpaid
+    # before it's re-engaged with a firmer message, and how many such
+    # follow-up passes are allowed before it's escalated instead (this is
+    # itself a stopping rule — see run_follow_up_check in pipeline.py).
+    "follow_up_after_hours": 48,
+    "max_follow_ups": 2,
 }
 
 

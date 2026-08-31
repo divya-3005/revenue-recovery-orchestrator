@@ -88,6 +88,13 @@ class RecoveryCase(Base):
     # Recovery tracking
     recovered_amount_paise = Column(Integer, nullable=False, default=0)
     retry_count = Column(Integer, nullable=False, default=0)
+    # Distinct from retry_count (which only counts *execution* failures, e.g.
+    # a Razorpay API error): follow_up_count counts real-time re-engagement
+    # passes on a case that is PAYMENT_PENDING but the customer hasn't paid
+    # yet. This is what actually drives Feature 7's re-loop and Feature 6's
+    # gentle->firm->final tone ramp across repeated contacts — see
+    # pipeline.run_follow_up_check().
+    follow_up_count = Column(Integer, nullable=False, default=0)
     cumulative_discount_paise = Column(Integer, nullable=False, default=0)
     cumulative_comms_cost_paise = Column(Integer, nullable=False, default=0)
     opted_out = Column(Boolean, nullable=False, default=False)
@@ -168,6 +175,7 @@ class DecisionResult(BaseModel):
         if a == RecoveryActionType.SWITCH_RAIL:
             p.setdefault("target_rail", "upi")
             p.setdefault("channel", "email")
+            p.setdefault("delay_hours", 24)
         return self
 
     def canonical_json(self) -> str:

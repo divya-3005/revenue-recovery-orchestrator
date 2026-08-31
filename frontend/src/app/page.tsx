@@ -10,7 +10,7 @@ import {
   RefreshCw, Play, Search, Activity, ShieldCheck,
   Users, CheckCircle2,
   Inbox, Minus, ArrowUpRight,
-  CalendarClock, XCircle
+  CalendarClock, XCircle, RotateCw, AlertTriangle
 } from "lucide-react";
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -25,6 +25,7 @@ interface RecoveryCase {
   priority_score: number;
   status: CaseStatus;
   retry_count: number;
+  follow_up_count: number;
   cumulative_discount_paise: number;
   latest_diagnosis_category: string | null;
   latest_diagnosis_reasoning: string | null;
@@ -35,6 +36,11 @@ interface RecoveryCase {
   pending_decision_json: { recommended_action: string; reasoning: string; action_parameters?: Record<string, unknown> } | null;
   pending_decision_id?: string | null;
   pending_decision_hash?: string | null;
+  // "pending" = this case is actually gated behind Approve/Reject (Feature
+  // 15). A case can be status "escalated" (Feature 9 — handed to a human,
+  // e.g. a hard decline) without ever having been approval-gated, in which
+  // case this is null/"not_required" and Approve/Reject don't apply to it.
+  approval_status?: string | null;
   created_at: string;
 }
 
@@ -70,7 +76,7 @@ interface PolicyConfig {
   max_days_pursued?: number;
 }
 
-const API_BASE = "http://127.0.0.1:8000/api/v1";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000/api/v1";
 
 const formatINR = (paise: number) =>
   (paise / 100).toLocaleString("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
@@ -102,6 +108,18 @@ export default function Dashboard() {
   const [policy, setPolicy] = useState<PolicyConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const reportError = async (res: Response, fallback: string) => {
+    let detail = fallback;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = typeof body.detail === "string" ? body.detail : fallback;
+    } catch {
+      // response wasn't JSON — stick with fallback
+    }
+    setErrorMsg(detail);
+  };
 
   // Modals state
   const [auditCaseId, setAuditCaseId] = useState<string | null>(null);
@@ -143,9 +161,13 @@ export default function Dashboard() {
   // Actions
   const runBatch = async () => {
     setActionBusy("batch");
+    setErrorMsg(null);
     try {
-      await fetch(`${API_BASE}/batch`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/batch`, { method: "POST" });
+      if (!res.ok) return reportError(res, "Failed to run the batch.");
       await refreshData();
+    } catch {
+      setErrorMsg("Couldn't reach the server to run the batch.");
     } finally {
       setActionBusy(null);
     }
@@ -153,9 +175,27 @@ export default function Dashboard() {
 
   const seedDemo = async () => {
     setActionBusy("demo");
+    setErrorMsg(null);
     try {
-      await fetch(`${API_BASE}/demo/seed`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/demo/seed`, { method: "POST" });
+      if (!res.ok) return reportError(res, "Failed to seed demo cases.");
       await refreshData();
+    } catch {
+      setErrorMsg("Couldn't reach the server to seed demo cases.");
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const runFollowUps = async () => {
+    setActionBusy("followups");
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`${API_BASE}/jobs/run-follow-ups`, { method: "POST" });
+      if (!res.ok) return reportError(res, "Failed to run follow-ups.");
+      await refreshData();
+    } catch {
+      setErrorMsg("Couldn't reach the server to run follow-ups.");
     } finally {
       setActionBusy(null);
     }
@@ -166,7 +206,13 @@ export default function Dashboard() {
     setAuditLoading(true);
     try {
       const res = await fetch(`${API_BASE}/cases/${caseId}/audit`);
-      if (res.ok) setAuditLogs(await res.json());
+      if (res.ok) {
+        setAuditLogs(await res.json());
+      } else {
+        await reportError(res, "Failed to load the audit trail.");
+      }
+    } catch {
+      setErrorMsg("Couldn't reach the server to load the audit trail.");
     } finally {
       setAuditLoading(false);
     }
@@ -174,8 +220,9 @@ export default function Dashboard() {
 
   const approveCase = async (c: RecoveryCase) => {
     setActionBusy(c.id);
+    setErrorMsg(null);
     try {
-      await fetch(`${API_BASE}/cases/${c.id}/approve`, {
+      const res = await fetch(`${API_BASE}/cases/${c.id}/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -184,7 +231,10 @@ export default function Dashboard() {
           reviewer_id: "operations_admin",
         }),
       });
+      if (!res.ok) return reportError(res, "Failed to approve this case.");
       await refreshData();
+    } catch {
+      setErrorMsg("Couldn't reach the server to approve this case.");
     } finally {
       setActionBusy(null);
     }
@@ -192,8 +242,9 @@ export default function Dashboard() {
 
   const rejectCase = async (c: RecoveryCase) => {
     setActionBusy(c.id);
+    setErrorMsg(null);
     try {
-      await fetch(`${API_BASE}/cases/${c.id}/reject`, {
+      const res = await fetch(`${API_BASE}/cases/${c.id}/reject`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -202,7 +253,10 @@ export default function Dashboard() {
           reviewer_id: "operations_admin",
         }),
       });
+      if (!res.ok) return reportError(res, "Failed to reject this case.");
       await refreshData();
+    } catch {
+      setErrorMsg("Couldn't reach the server to reject this case.");
     } finally {
       setActionBusy(null);
     }
@@ -210,9 +264,13 @@ export default function Dashboard() {
 
   const closeCase = async (caseId: string) => {
     setActionBusy(caseId);
+    setErrorMsg(null);
     try {
-      await fetch(`${API_BASE}/cases/${caseId}/close`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/cases/${caseId}/close`, { method: "POST" });
+      if (!res.ok) return reportError(res, "Failed to close this case.");
       await refreshData();
+    } catch {
+      setErrorMsg("Couldn't reach the server to close this case.");
     } finally {
       setActionBusy(null);
     }
@@ -221,14 +279,18 @@ export default function Dashboard() {
   const submitPtp = async () => {
     if (!ptpCaseId || !ptpDate) return;
     setActionBusy("ptp");
+    setErrorMsg(null);
     try {
-      await fetch(`${API_BASE}/cases/${ptpCaseId}/promise-to-pay`, {
+      const res = await fetch(`${API_BASE}/cases/${ptpCaseId}/promise-to-pay`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ date: ptpDate, note: ptpNote || "Customer payment promise" }),
       });
+      if (!res.ok) return reportError(res, "Failed to record the promise-to-pay.");
       setPtpCaseId(null);
       await refreshData();
+    } catch {
+      setErrorMsg("Couldn't reach the server to record the promise-to-pay.");
     } finally {
       setActionBusy(null);
     }
@@ -288,8 +350,28 @@ export default function Dashboard() {
             >
               <Play className="w-3.5 h-3.5 mr-1.5" /> {actionBusy === "batch" ? "Processing Batch…" : "Run 50+ Case Batch"}
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={runFollowUps}
+              disabled={actionBusy === "followups"}
+              title="Re-engage any PAYMENT_PENDING case that's gone stale past the follow-up window, with an escalated tone/channel"
+              className="bg-white/5 border-white/10 text-slate-300 hover:bg-white/10"
+            >
+              <RotateCw className="w-3.5 h-3.5 mr-1.5" /> {actionBusy === "followups" ? "Checking…" : "Run Follow-Ups"}
+            </Button>
           </div>
         </header>
+
+        {errorMsg && (
+          <div className="flex items-start gap-2.5 p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-200 text-sm">
+            <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0 text-rose-400" />
+            <p className="flex-1">{errorMsg}</p>
+            <button onClick={() => setErrorMsg(null)} className="text-rose-400 hover:text-rose-200">
+              <XCircle className="w-4 h-4" />
+            </button>
+          </div>
+        )}
 
         {/* KPI Strip */}
         <section className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -494,6 +576,11 @@ export default function Dashboard() {
                     <p className="text-xs text-slate-400 italic">
                       &quot;{c.pending_decision_json?.reasoning || c.latest_diagnosis_reasoning || "Awaiting manager sign-off for high value transaction."}&quot;
                     </p>
+                    {c.approval_status !== "pending" && (
+                      <p className="text-[11px] text-slate-500">
+                        Escalated for review — this case wasn&apos;t gated behind an approval, so there&apos;s no pending decision to approve or reject. Close it once handled.
+                      </p>
+                    )}
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -505,23 +592,31 @@ export default function Dashboard() {
                     >
                       <Search className="w-3.5 h-3.5 mr-1.5" /> Trace
                     </Button>
-                    <Button
-                      size="sm"
-                      onClick={() => approveCase(c)}
-                      disabled={actionBusy === c.id}
-                      className="bg-emerald-600 hover:bg-emerald-500 text-white"
-                    >
-                      <CheckCircle2 className="w-3.5 h-3.5 mr-1.5" /> Approve &amp; Execute
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => rejectCase(c)}
-                      disabled={actionBusy === c.id}
-                      className="bg-rose-500/10 border-rose-500/30 text-rose-300 hover:bg-rose-500/20"
-                    >
-                      <XCircle className="w-3.5 h-3.5 mr-1.5" /> Reject
-                    </Button>
+                    {c.approval_status === "pending" ? (
+                      <>
+                        <Button
+                          size="sm"
+                          onClick={() => approveCase(c)}
+                          disabled={actionBusy === c.id}
+                          className="bg-emerald-600 hover:bg-emerald-500 text-white"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5 mr-1.5" /> Approve &amp; Execute
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => rejectCase(c)}
+                          disabled={actionBusy === c.id}
+                          className="bg-rose-500/10 border-rose-500/30 text-rose-300 hover:bg-rose-500/20"
+                        >
+                          <XCircle className="w-3.5 h-3.5 mr-1.5" /> Reject
+                        </Button>
+                      </>
+                    ) : (
+                      <Badge variant="outline" className="bg-white/5 border-white/10 text-slate-400 text-[10px]">
+                        No approval gate
+                      </Badge>
+                    )}
                     <Button
                       variant="ghost"
                       size="sm"
@@ -683,7 +778,7 @@ export default function Dashboard() {
                   </div>
                   <div className="p-3 bg-white/5 rounded-xl border border-white/5">
                     <span className="text-slate-400 block mb-1">Hard Decline Handling:</span>
-                    <span className="text-sm font-bold text-emerald-300">Immediate Stop</span>
+                    <span className="text-sm font-bold text-emerald-300">Escalate, Never Retry</span>
                   </div>
                 </div>
               </Card>

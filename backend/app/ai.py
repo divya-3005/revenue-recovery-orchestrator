@@ -156,13 +156,17 @@ def decide(case: RecoveryCase, diagnosis: DiagnosisResult, provider: AIProvider)
             f">= {POLICY['pre_debit_notice_hours']}."
         )
 
+    total_attempts = case.retry_count + case.follow_up_count
+
     prompt = f"""You are an expert payments and revenue recovery AI.
 Based on the diagnosis and case state, propose the NEXT BEST recovery action.
 
 [CASE STATE]
 Amount: {case.amount_paise} paise
 Payment Rail: {case.payment_rail or "Not specified"}
-Retry Count: {case.retry_count} (Max: {POLICY['max_retries']})
+Failed Execution Attempts: {case.retry_count} (Max: {POLICY['max_retries']})
+Follow-Up Passes (re-engaged after no payment): {case.follow_up_count}
+Total Contacts So Far: {total_attempts}
 Cumulative Discount: {case.cumulative_discount_paise} paise
 
 [DIAGNOSIS]
@@ -171,16 +175,30 @@ Reason: {diagnosis.specific_reason}
 Confidence: {diagnosis.confidence_score}
 
 [ACTIONS]
-1. create_payment_link — for soft declines, abandoned checkouts, overdue invoices. Params: {{"delay_hours": int, "channel": "email"|"sms"}}.{mandate_note}
-2. offer_discount — for friction/pricing drop-offs. Params: {{"discount_percent": int}} (max {POLICY['max_discount_percent']}%)
-3. escalate_to_human — for disputes, hard declines, high-value, unknown/low-confidence
-4. stop — unrecoverable case (fraud confirmed)
+1. retry_charge — silently re-attempt the customer's saved payment method. No customer contact. Use this as the FIRST response to a fresh soft decline (Total Contacts So Far == 0) UNLESS the case is on an eNACH/NACH mandate rail — RBI pre-debit notice applies to ANY debit attempt on a mandate, so there's no such thing as an immediate silent retry there; use create_payment_link with the compliant delay instead. Params: {{}}.
+2. switch_rail — move to a different, more reliable payment rail (e.g. card->upi). Use after one retry_charge has already failed on the current rail. Params: {{"target_rail": "upi"|"card"|"enach", "delay_hours": int, "channel": "email"|"sms"}}.{mandate_note}
+3. create_payment_link — ask the customer to pay via a link. For soft declines (after retry_charge/switch_rail have been tried), abandoned checkouts, overdue invoices. Params: {{"delay_hours": int, "channel": "email"|"sms"}}.{mandate_note}
+4. send_reminder — a lightweight nudge referencing an existing link/invoice, no new link created. Use for a LOW-VALUE first-contact abandoned checkout. Params: {{"channel": "email"|"sms"}}.
+5. offer_discount — for friction/pricing drop-offs from a repeat customer or high-value cart. Params: {{"discount_percent": int}} (max {POLICY['max_discount_percent']}%)
+6. escalate_to_human — for disputes, hard declines, high-value, unknown/low-confidence
+7. stop — unrecoverable case (fraud confirmed)
+
+Prefer "email" for a customer's first contact and "sms" for any follow-up contact (Total Contacts So Far >= 1) — a second nudge is more urgent and more likely to be read as a text.
 
 Output: recommended_action, action_parameters, confidence_score (0-1), reasoning (1-2 sentences)."""
 
     if provider.client:
         return provider.ask_structured(prompt, DecisionResult)
     return _fallback_decide(case, diagnosis)
+
+
+def _pick_channel(total_attempts: int) -> str:
+    """First contact goes out over email; any re-engagement after that
+    switches to SMS, which is more urgent and more likely to be read.
+    This is what actually makes 'Multi-Channel Recovery Execution'
+    (Feature 5) exercise more than one channel in practice — previously
+    every fallback branch hardcoded "email" and SMS was never selected."""
+    return "email" if total_attempts == 0 else "sms"
 
 
 def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> DecisionResult:
@@ -190,6 +208,14 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
     cat = diagnosis.root_cause_category
     rail = (case.payment_rail or "").lower()
     is_mandate_rail = rail in ("enach", "nach", "emandate", "mandate")
+    # retry_count = failed *execution* attempts (e.g. a Razorpay API error).
+    # follow_up_count = real-time re-engagement passes on an unpaid,
+    # PAYMENT_PENDING case (see pipeline.run_follow_up_check). Together they
+    # tell us how many times this case has already been worked, which is
+    # what stages retry_charge -> switch_rail -> create_payment_link below
+    # and what picks the channel via _pick_channel.
+    total_attempts = case.retry_count + case.follow_up_count
+    channel = _pick_channel(total_attempts)
 
     if cat == RootCauseCategory.HARD_DECLINE:
         return DecisionResult(
@@ -206,15 +232,42 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
         )
 
     if cat == RootCauseCategory.SOFT_DECLINE:
+        if total_attempts == 0 and not is_mandate_rail:
+            # First response to a fresh soft decline: silently retry the
+            # saved payment method before ever bothering the customer.
+            # NOT available on mandate rails (enach/nach) — RBI's
+            # pre-debit notice window applies to any debit attempt on a
+            # mandate, not just a customer-facing payment link, so
+            # there's no such thing as an immediate *silent* retry there.
+            # Those cases fall through to the compliant, delayed
+            # create_payment_link below instead.
+            return DecisionResult(
+                recommended_action=RecoveryActionType.RETRY_CHARGE,
+                confidence_score=0.85,
+                reasoning="Soft decline, first attempt — silently retrying the saved payment method before contacting the customer.",
+            )
+        if total_attempts == 1 and rail in ("card", "upi"):
+            # The silent retry didn't clear the case (it's back for another
+            # pass) — try a different rail before asking for a brand-new
+            # payment link on the one that just failed.
+            target_rail = "upi" if rail == "card" else "card"
+            delay = POLICY["pre_debit_notice_hours"] if target_rail in ("enach", "nach") else 24
+            return DecisionResult(
+                recommended_action=RecoveryActionType.SWITCH_RAIL,
+                action_parameters={"target_rail": target_rail, "delay_hours": delay, "channel": channel},
+                confidence_score=0.80,
+                reasoning=f"Retry on {rail} didn't clear — switching to {target_rail}, a more reliable rail for this customer.",
+            )
         delay = POLICY["pre_debit_notice_hours"] if is_mandate_rail else 24
         reasoning = (
-            f"Soft decline on {case.payment_rail} — using RBI-compliant {delay}h pre-debit delay."
+            f"Soft decline on {case.payment_rail} — RBI pre-debit notice applies to any debit "
+            f"attempt on this mandate, so using a compliant {delay}h delay instead of a silent retry."
             if is_mandate_rail else
             "Soft decline — creating payment link for customer-initiated retry."
         )
         return DecisionResult(
             recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
-            action_parameters={"delay_hours": delay},
+            action_parameters={"delay_hours": delay, "channel": channel},
             confidence_score=0.85,
             reasoning=reasoning,
         )
@@ -223,7 +276,9 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
         payload = case.raw_signal_payload or {}
         # Mirror the real prompt's guidance ("offer_discount — for
         # friction/pricing drop-offs"): a repeat customer or high-value
-        # cart is worth a discount; otherwise a plain nudge link is enough.
+        # cart is worth a discount; otherwise a plain nudge is enough
+        # on first contact, escalating to a full payment link if the
+        # customer still hasn't converted.
         cart_value = payload.get("cart_value", case.amount_paise)
         is_repeat = payload.get("is_repeat_customer", False)
         if is_repeat or cart_value >= 500_00:  # >= ₹500
@@ -233,19 +288,32 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
                 confidence_score=0.80,
                 reasoning="Repeat customer / high-value cart abandoned — offering a bounded discount to recover it.",
             )
+        if total_attempts == 0:
+            return DecisionResult(
+                recommended_action=RecoveryActionType.SEND_REMINDER,
+                action_parameters={"channel": channel},
+                confidence_score=0.75,
+                reasoning="Low-value, first-time cart abandonment — a lightweight nudge before committing to a full payment link.",
+            )
         return DecisionResult(
             recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
-            action_parameters={"delay_hours": 1},
+            action_parameters={"delay_hours": 1, "channel": channel},
             confidence_score=0.80,
-            reasoning="Checkout abandoned — sending payment link to recover cart.",
+            reasoning="Checkout abandoned and the earlier reminder didn't convert — sending a payment link to recover the cart.",
         )
 
     if cat == RootCauseCategory.MISSED_PAYMENT:
+        delay = POLICY["pre_debit_notice_hours"] if is_mandate_rail else 24
+        reasoning = (
+            f"Invoice overdue on {case.payment_rail} — using RBI-compliant {delay}h pre-debit delay."
+            if is_mandate_rail else
+            "Invoice overdue — sending payment link to recover funds."
+        )
         return DecisionResult(
             recommended_action=RecoveryActionType.CREATE_PAYMENT_LINK,
-            action_parameters={"channel": "email"},
+            action_parameters={"delay_hours": delay, "channel": channel},
             confidence_score=0.80,
-            reasoning="Invoice overdue — sending payment link to recover funds.",
+            reasoning=reasoning,
         )
 
     return DecisionResult(

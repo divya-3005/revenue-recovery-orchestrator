@@ -24,6 +24,7 @@ Endpoints:
   GET  /health                    — Health check
 """
 
+import asyncio
 import json
 import logging
 import hmac
@@ -31,6 +32,8 @@ import hashlib
 import os
 from datetime import date
 from typing import List
+
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,7 +46,7 @@ from app.schemas import (
     PromiseToPayRequest, ApprovalRequest, OptOutRequest,
 )
 from app.policy import POLICY
-from app.pipeline import run_pipeline, _audit
+from app.pipeline import run_pipeline, run_follow_up_check, _audit
 from app.synthetic import generate_batch, generate_demo_scenarios, compute_priority_score
 from app.executor import Executor
 
@@ -53,7 +56,26 @@ Base.metadata.create_all(bind=engine)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Revenue Recovery Orchestrator", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Off by default (and always off under pytest, which spins up TestClient
+    # instances against a swapped-out SessionLocal — a background loop
+    # started at import time would keep using the pre-swap engine and could
+    # interleave with test transactions). Set ENABLE_FOLLOW_UP_SCHEDULER=1
+    # to turn it on for a real long-running deployment;
+    # POST /api/v1/jobs/run-follow-ups covers the same job for
+    # cron/manual/demo use without it.
+    if os.getenv("ENABLE_FOLLOW_UP_SCHEDULER") == "1" and not os.getenv("PYTEST_CURRENT_TEST"):
+        task = asyncio.create_task(_follow_up_scheduler_loop())
+        logger.info("Follow-up scheduler started.")
+        yield
+        task.cancel()
+    else:
+        yield
+
+
+app = FastAPI(title="Revenue Recovery Orchestrator", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -62,6 +84,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Optional background scheduler for the follow-up re-loop ─────────────
+# Wired up from lifespan() above, gated behind ENABLE_FOLLOW_UP_SCHEDULER.
+
+async def _follow_up_scheduler_loop():
+    from app.database import SessionLocal
+    interval = int(os.getenv("FOLLOW_UP_POLL_SECONDS", "3600"))
+    while True:
+        await asyncio.sleep(interval)
+        db = SessionLocal()
+        try:
+            results = run_follow_up_check(db)
+            if results:
+                logger.info(f"Follow-up scheduler: re-engaged {len(results)} case(s).")
+        except Exception as e:
+            logger.error(f"Follow-up scheduler error: {e}")
+        finally:
+            db.close()
 
 
 # ── Health ───────────────────────────────────────────────────────────────
@@ -406,12 +447,47 @@ def run_batch(db: Session = Depends(get_db)):
             # Simulate payment for ~60% of payment_pending cases
             if result.get("status") == "payment_pending" and idx % 5 < 3:
                 _simulate_payment(db, cid)
-            results.append(result)
+                result = {"status": "recovered", "reason": "Simulated payment received."}
+            results.append({"case_id": cid, **result})
         except Exception as e:
             logger.error(f"Batch pipeline error for {cid}: {e}")
-            results.append({"status": "error", "case_id": cid, "reason": str(e)})
+            results.append({"case_id": cid, "status": "error", "reason": str(e)})
 
-    return {"cases_created": len(created_ids), "case_ids": created_ids}
+    status_counts: dict = {}
+    for r in results:
+        status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+
+    return {
+        "cases_created": len(created_ids),
+        "case_ids": created_ids,
+        "results": results,
+        "status_counts": status_counts,
+    }
+
+
+# ── Follow-Up Re-loop (Feature 6 tone ramp + Feature 7 re-loop) ─────────
+
+@app.post("/api/v1/jobs/run-follow-ups")
+def run_follow_ups(db: Session = Depends(get_db)):
+    """
+    Re-engage PAYMENT_PENDING cases that have sat unpaid for longer than
+    POLICY['follow_up_after_hours'] with an escalated tone/channel, bounded
+    by POLICY['max_follow_ups']. This is what actually makes Feature 7's
+    "system with memory, not a one-shot script" true at runtime, and what
+    exercises Feature 6's gentle->firm->final tone ramp beyond a single
+    contact.
+
+    Point a cron / Celery-beat / GitHub Actions schedule at this endpoint in
+    production. It's also called automatically by the background loop below
+    when ENABLE_FOLLOW_UP_SCHEDULER=1, and can be triggered manually here at
+    any time — e.g. right after a demo batch, instead of waiting out the
+    real follow_up_after_hours window, to show the re-loop working live.
+    """
+    results = run_follow_up_check(db)
+    status_counts: dict = {}
+    for r in results:
+        status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+    return {"cases_checked": len(results), "results": results, "status_counts": status_counts}
 
 
 # ── Demo Endpoints ──────────────────────────────────────────────────────
@@ -548,6 +624,8 @@ def get_policy():
         min_confidence_score=POLICY["min_confidence_score"],
         pre_debit_notice_hours=POLICY["pre_debit_notice_hours"],
         max_days_pursued=POLICY["max_days_pursued"],
+        follow_up_after_hours=POLICY["follow_up_after_hours"],
+        max_follow_ups=POLICY["max_follow_ups"],
     )
 
 

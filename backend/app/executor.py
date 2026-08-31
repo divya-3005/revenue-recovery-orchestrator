@@ -43,7 +43,7 @@ class Executor:
         """Execute the approved recovery action."""
         action = decision.recommended_action
 
-        # Internal actions — no external API call needed
+        # Internal actions — no external API call, no customer contact
         if action == RecoveryActionType.ESCALATE_TO_HUMAN:
             return ExecutionResult(
                 status=ExecutionStatus.SUCCESS, action_taken=action,
@@ -56,8 +56,53 @@ class Executor:
                 reason="Case closed — recovery stopped.",
             )
 
-        # All other actions create a payment link
+        if action == RecoveryActionType.RETRY_CHARGE:
+            return self._retry_saved_method(case, decision)
+
+        if action == RecoveryActionType.SEND_REMINDER:
+            return self._send_reminder_only(case, decision)
+
+        # CREATE_PAYMENT_LINK, OFFER_DISCOUNT, SWITCH_RAIL all put a real
+        # payment link in front of the customer
         return self._create_payment_link(case, decision)
+
+    def _retry_saved_method(self, case: RecoveryCase, decision: DecisionResult) -> ExecutionResult:
+        """RETRY_CHARGE — silently re-attempt the customer's saved payment
+        method. No customer contact, so this never reaches comms (see
+        pipeline.CUSTOMER_FACING_ACTIONS).
+
+        This schema doesn't store a saved payment-method token, so in dry-run
+        we simulate the silent retry the same way a real saved-mandate retry
+        would behave (no customer contact, outcome confirmed asynchronously).
+        In real (non-dry-run) mode we don't have a token to charge, so we
+        fail loudly and honestly instead of pretending to have retried —
+        the decision engine sees the failure via retry_count and falls
+        through to a customer-facing action (switch_rail / payment link) on
+        the next attempt."""
+        if not self.client:
+            return ExecutionResult(
+                status=ExecutionStatus.DRY_RUN, action_taken=RecoveryActionType.RETRY_CHARGE,
+                reason="Dry run — simulated silent retry of the saved payment method (no customer contact).",
+                action_parameters_used=dict(decision.action_parameters),
+            )
+        return ExecutionResult(
+            status=ExecutionStatus.FAILED, action_taken=RecoveryActionType.RETRY_CHARGE,
+            reason="No stored payment-method token on file — cannot silently retry. "
+                   "Falling through to a customer-facing recovery action.",
+        )
+
+    def _send_reminder_only(self, case: RecoveryCase, decision: DecisionResult) -> ExecutionResult:
+        """SEND_REMINDER — a lightweight nudge referencing the case's
+        existing checkout/invoice. Deliberately does NOT create a new
+        Razorpay payment link (avoids spamming duplicate links for the
+        same case); the message itself is generated separately by
+        comms.generate_message and logged to the audit trail."""
+        channel = decision.action_parameters.get("channel", "email")
+        return ExecutionResult(
+            status=ExecutionStatus.DRY_RUN, action_taken=RecoveryActionType.SEND_REMINDER,
+            reason=f"Reminder queued via {channel} — no new payment link created.",
+            action_parameters_used=dict(decision.action_parameters),
+        )
 
     def _create_payment_link(self, case: RecoveryCase, decision: DecisionResult) -> ExecutionResult:
         """Create a Razorpay payment link (or dry-run if SDK unavailable)."""
@@ -85,8 +130,10 @@ class Executor:
         if not email:
             email = f"{case.customer_id}@example.com"
 
-        # Idempotency key based on case + retry count
-        ref_id = f"{case.id[:20]}_{case.retry_count}"
+        # Idempotency key based on case + execution retries + follow-up
+        # passes, so a follow-up re-engagement (Feature 7) generates a fresh
+        # link instead of Razorpay silently handing back the original one.
+        ref_id = f"{case.id[:20]}_{case.retry_count}_{case.follow_up_count}"
 
         # Dry-run mode
         if not self.client:
@@ -111,17 +158,33 @@ class Executor:
                 "notes": {"case_id": case.id, "action": action.value},
             }
 
-            # Set notification channel
+            # Set notification channel. Razorpay's payment_link.notify only
+            # supports email/sms — there's no WhatsApp delivery integration
+            # in this codebase. Rather than silently creating a link with no
+            # notify method at all (which looked like success while nobody
+            # was actually contacted), we downgrade to SMS and record the
+            # downgrade in the audit trail so it's visible, not hidden.
             channel = params.get("channel", "email")
+            channel_downgraded_from = None
+            if channel == "whatsapp":
+                logger.warning(
+                    f"Case {case.id}: WhatsApp requested but not integrated — downgrading to SMS."
+                )
+                channel_downgraded_from = "whatsapp"
+                channel = "sms"
+
             if channel == "sms":
                 link_data["notify"] = {"sms": 1, "email": 0}
-            elif channel != "whatsapp":  # WhatsApp not natively supported by Razorpay
+            else:
                 link_data["notify"] = {"email": 1, "sms": 0}
 
             payment_link = self.client.payment_link.create(data=link_data)
 
             result_params = dict(params)
             result_params["amount_charged_paise"] = amount
+            result_params["channel"] = channel
+            if channel_downgraded_from:
+                result_params["channel_downgraded_from"] = channel_downgraded_from
             if action == RecoveryActionType.OFFER_DISCOUNT:
                 result_params["discount_applied_paise"] = case.amount_paise - amount
 
