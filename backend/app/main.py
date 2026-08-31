@@ -738,10 +738,11 @@ def _execute_approved(case_id: str):
                    f"Approved action complete — awaiting payment. "
                    f"Next follow-up in {POLICY['follow_up_after_hours']}h.", exec_result.reason)
         else:
-            case.status = CaseStatus.ESCALATED
+            case.status = CaseStatus.AWAITING_APPROVAL
+            case.approval_status = ApprovalStatus.PENDING
             _audit(db, case.id, "EXECUTION_FAILED",
                    f"Approved action failed to execute: {exec_result.reason}",
-                   "Returned to the escalation queue for manual handling.")
+                   "Reverted to awaiting approval to allow manual retry.")
         db.commit()
 
     except Exception as e:
@@ -750,10 +751,11 @@ def _execute_approved(case_id: str):
         try:
             case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
             if case:
-                case.status = CaseStatus.ESCALATED
+                case.status = CaseStatus.AWAITING_APPROVAL
+                case.approval_status = ApprovalStatus.PENDING
                 _audit(db, case.id, "EXECUTION_ERROR",
                        f"Approved action could not be executed: {e}",
-                       "Case returned to the escalation queue.")
+                       "Reverted to awaiting approval to allow manual retry.")
                 db.commit()
         except Exception:
             pass

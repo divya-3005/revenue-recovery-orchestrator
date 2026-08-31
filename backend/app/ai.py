@@ -307,6 +307,13 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
                     reasoning=f"Repeat customer / high-value cart — offering {new_discount_pct}% discount "
                               f"(stepped up by {step_up}% from previous best offer).",
                 )
+            elif current_discount_pct > 0:
+                return DecisionResult(
+                    recommended_action=RecoveryActionType.OFFER_DISCOUNT,
+                    action_parameters={"discount_percent": current_discount_pct, "channel": channel},
+                    confidence_score=0.80,
+                    reasoning=f"Max discount reached — sending a final reminder with the best {current_discount_pct}% discount.",
+                )
         if total_attempts == 0:
             return DecisionResult(
                 recommended_action=RecoveryActionType.SEND_REMINDER,
