@@ -72,9 +72,15 @@ def run_pipeline(db: Session, case_id: str) -> dict:
         if not case:
             return {"status": "error", "reason": f"Case {case_id} not found"}
 
-        # Skip if case is already in a terminal state
-        if case.status in (CaseStatus.RECOVERED, CaseStatus.CLOSED, CaseStatus.FAILED):
-            return {"status": case.status.value, "reason": "Case already resolved"}
+        # Skip if case is already in a terminal state, or sitting with a
+        # human (escalated / awaiting approval) — those only advance via
+        # the approve/reject/close endpoints, never by re-running the
+        # pipeline from the top.
+        if case.status in (
+            CaseStatus.RECOVERED, CaseStatus.CLOSED, CaseStatus.FAILED,
+            CaseStatus.ESCALATED, CaseStatus.AWAITING_APPROVAL,
+        ):
+            return {"status": case.status.value, "reason": "Case already resolved or awaiting human action"}
 
         # Mark in-progress on first attempt
         if attempt == 0 and case.status == CaseStatus.OPEN:

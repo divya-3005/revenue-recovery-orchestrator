@@ -136,10 +136,30 @@ class Executor:
         # link instead of Razorpay silently handing back the original one.
         ref_id = f"{case.id[:20]}_{case.retry_count}_{case.follow_up_count}"
 
+        # Resolve the notification channel BEFORE branching on dry-run vs.
+        # live, so dry-run results reflect the same behavior a live call
+        # would have. Razorpay's payment_link.notify only supports
+        # email/sms — there's no WhatsApp delivery integration in this
+        # codebase. Rather than silently creating a link with no notify
+        # method at all (which looked like success while nobody was
+        # actually contacted), we downgrade to SMS and record the downgrade
+        # so it's visible, not hidden — in dry-run and live alike.
+        channel = params.get("channel", "email")
+        channel_downgraded_from = None
+        if channel == "whatsapp":
+            logger.warning(
+                f"Case {case.id}: WhatsApp requested but not integrated — downgrading to SMS."
+            )
+            channel_downgraded_from = "whatsapp"
+            channel = "sms"
+
         # Dry-run mode
         if not self.client:
             result_params = dict(params)
             result_params["amount_charged_paise"] = amount
+            result_params["channel"] = channel
+            if channel_downgraded_from:
+                result_params["channel_downgraded_from"] = channel_downgraded_from
             if action == RecoveryActionType.OFFER_DISCOUNT:
                 result_params["discount_applied_paise"] = case.amount_paise - amount
             return ExecutionResult(
@@ -158,21 +178,6 @@ class Executor:
                 "customer": {"email": email, "contact": phone},
                 "notes": {"case_id": case.id, "action": action.value},
             }
-
-            # Set notification channel. Razorpay's payment_link.notify only
-            # supports email/sms — there's no WhatsApp delivery integration
-            # in this codebase. Rather than silently creating a link with no
-            # notify method at all (which looked like success while nobody
-            # was actually contacted), we downgrade to SMS and record the
-            # downgrade in the audit trail so it's visible, not hidden.
-            channel = params.get("channel", "email")
-            channel_downgraded_from = None
-            if channel == "whatsapp":
-                logger.warning(
-                    f"Case {case.id}: WhatsApp requested but not integrated — downgrading to SMS."
-                )
-                channel_downgraded_from = "whatsapp"
-                channel = "sms"
 
             if channel == "sms":
                 link_data["notify"] = {"sms": 1, "email": 0}

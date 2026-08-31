@@ -688,8 +688,9 @@ def _execute_approved(case_id: str):
             db.commit()
             return
 
-        # Re-run the guardrails. Human approval clears the high-value gate
-        # only — it cannot override the discount cap or the hard-decline block.
+        # Re-run the guardrails. Human approval clears the human-in-the-loop
+        # gates (dispute, high value, low confidence) — it cannot override
+        # the discount cap or the hard-decline block, which are absolute.
         diagnosis = DiagnosisResult.model_validate(case.pending_diagnosis_json)
         policy = evaluate_policy(case, decision, diagnosis, human_approved=True)
         _audit(db, case.id, "POLICY_EVALUATED",

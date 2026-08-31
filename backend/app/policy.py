@@ -41,10 +41,12 @@ def evaluate_policy(
     Evaluates all 8 rules and tags each with status: 'passed', 'failed', or 'not_applicable'.
     Returns PolicyResult with allowed=True/False and the reason.
 
-    human_approved=True bypasses the high-value gate only (a human already
-    signed off on the amount). It does NOT override hard caps like
-    discount_cap or block_hard_decline — those are deterministic money
-    constraints no human should be able to wave through.
+    human_approved=True means a human has already reviewed and signed off
+    on this specific decision, so it clears every gate that exists purely
+    to get a human in the loop (dispute_gate, high_value_gate,
+    min_confidence). It does NOT override hard caps like discount_cap or
+    block_hard_decline — those are deterministic money constraints no
+    human should be able to wave through, approval or not.
     """
     action = decision.recommended_action
     params = decision.action_parameters
@@ -83,7 +85,10 @@ def evaluate_policy(
 
     # Rule 2: Disputes require human review
     if diagnosis.root_cause_category == RootCauseCategory.DISPUTE:
-        note("dispute_gate", False, reason="Dispute detected — requires human intervention", requires_human=True)
+        if human_approved:
+            note("dispute_gate", True, human_approved=True)
+        else:
+            note("dispute_gate", False, reason="Dispute detected — requires human intervention", requires_human=True)
     else:
         note("dispute_gate", True)
 
@@ -138,8 +143,11 @@ def evaluate_policy(
     # Rule 7: Minimum AI confidence
     if decision.confidence_score < POLICY["min_confidence_score"] or \
        diagnosis.confidence_score < POLICY["min_confidence_score"]:
-        note("min_confidence", False, requires_human=True,
-             reason=f"AI confidence too low (decision={decision.confidence_score}, diagnosis={diagnosis.confidence_score}).")
+        if human_approved:
+            note("min_confidence", True, human_approved=True)
+        else:
+            note("min_confidence", False, requires_human=True,
+                 reason=f"AI confidence too low (decision={decision.confidence_score}, diagnosis={diagnosis.confidence_score}).")
     else:
         note("min_confidence", True)
 
