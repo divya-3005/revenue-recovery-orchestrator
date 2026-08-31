@@ -494,6 +494,15 @@ def run_follow_ups(force: bool = False, db: Session = Depends(get_db)):
 
 # ── Demo Endpoints ──────────────────────────────────────────────────────
 
+@app.post("/api/v1/demo/reset")
+def reset_demo(db: Session = Depends(get_db)):
+    """Wipe all cases and audit logs (for demo purposes)."""
+    db.query(AuditLog).delete()
+    db.query(RecoveryCase).delete()
+    db.commit()
+    return {"status": "cleared"}
+
+
 @app.post("/api/v1/demo/seed")
 def seed_demo(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """Seed 5 canonical demo scenarios."""

@@ -10,7 +10,7 @@ import {
   RefreshCw, Play, Search, Activity, ShieldCheck,
   Users, CheckCircle2,
   Inbox, Minus, ArrowUpRight,
-  CalendarClock, XCircle, RotateCw, AlertTriangle
+  CalendarClock, XCircle, RotateCw, AlertTriangle, Trash2
 } from "lucide-react";
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -194,6 +194,21 @@ export default function Dashboard() {
     }
   };
 
+  const resetData = async () => {
+    if (!confirm("Are you sure you want to delete all cases?")) return;
+    setActionBusy("reset");
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`${API_BASE}/demo/reset`, { method: "POST" });
+      if (!res.ok) return reportError(res, "Failed to reset data.");
+      await refreshData();
+    } catch {
+      setErrorMsg("Couldn't reach the server to reset data.");
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
   const runFollowUps = async () => {
     setActionBusy("followups");
     setErrorMsg(null);
@@ -351,6 +366,15 @@ export default function Dashboard() {
               className="bg-white/5 border-white/10 text-slate-300 hover:bg-white/10"
             >
               <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${loading ? "animate-spin" : ""}`} /> Refresh
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={resetData}
+              disabled={actionBusy === "reset"}
+              className="bg-red-500/10 border-red-500/30 text-red-400 hover:bg-red-500/20"
+            >
+              <Trash2 className="w-3.5 h-3.5 mr-1.5" /> {actionBusy === "reset" ? "Resetting…" : "Reset All Data"}
             </Button>
             <Button
               variant="outline"
