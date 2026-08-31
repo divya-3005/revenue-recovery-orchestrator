@@ -540,6 +540,11 @@ export default function Dashboard() {
                             PTP {c.promise_to_pay_date}
                           </Badge>
                         )}
+                        {c.scheduled_for && new Date(c.scheduled_for) > new Date() && (
+                          <Badge variant="outline" className="bg-sky-500/10 text-sky-300 border-sky-500/30 text-[10px]">
+                            Scheduled {new Date(c.scheduled_for).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                          </Badge>
+                        )}
                         <Button
                           variant="ghost"
                           size="sm"
