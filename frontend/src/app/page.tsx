@@ -26,6 +26,8 @@ interface RecoveryCase {
   status: CaseStatus;
   retry_count: number;
   follow_up_count: number;
+  contact_count: number;
+  scheduled_for: string | null;
   cumulative_discount_paise: number;
   latest_diagnosis_category: string | null;
   latest_diagnosis_reasoning: string | null;
@@ -75,6 +77,8 @@ interface PolicyConfig {
   block_hard_declines: boolean;
   pre_debit_notice_hours?: number;
   max_days_pursued?: number;
+  follow_up_after_hours?: number;
+  max_follow_ups?: number;
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000/api/v1";
@@ -135,6 +139,7 @@ export default function Dashboard() {
     const d = new Date(); d.setDate(d.getDate() + 2);
     return d.toISOString().split("T")[0];
   });
+  const [rejectNotes, setRejectNotes] = useState<Record<string, string>>({});
   const [ptpNote, setPtpNote] = useState("");
 
   const refreshData = useCallback(async () => {
@@ -197,10 +202,14 @@ export default function Dashboard() {
       const res = await fetch(`${API_BASE}/jobs/run-follow-ups?force=true`, { method: "POST" });
       if (!res.ok) return reportError(res, "Failed to run follow-ups.");
       const data = await res.json();
+      const scheduled = data.status_counts?.scheduled ?? 0;
       setNoticeMsg(
-        data.cases_checked === 0
-          ? "No unpaid cases to re-engage right now."
-          : `Re-engaged ${data.cases_checked} unpaid case(s) with an escalated message.`
+        data.cases_engaged === 0
+          ? scheduled > 0
+            ? `No cases re-engaged — ${scheduled} case(s) still within their delay window.`
+            : "No unpaid cases to re-engage right now."
+          : `Re-engaged ${data.cases_engaged} unpaid case(s) with an escalated message` +
+            (scheduled > 0 ? `; ${scheduled} more still within their delay window.` : ".")
       );
       await refreshData();
     } catch {
@@ -260,6 +269,7 @@ export default function Dashboard() {
           decision_id: c.pending_decision_id || "dec_human",
           decision_hash: c.pending_decision_hash || "hash_human",
           reviewer_id: "operations_admin",
+          note: rejectNotes[c.id] || "Reviewer rejected the proposed action."
         }),
       });
       if (!res.ok) return reportError(res, "Failed to reject this case.");
@@ -612,7 +622,7 @@ export default function Dashboard() {
                       <Search className="w-3.5 h-3.5 mr-1.5" /> Trace
                     </Button>
                     {c.approval_status === "pending" ? (
-                      <>
+                      <div className="flex items-center gap-2 ml-auto">
                         <Button
                           size="sm"
                           onClick={() => approveCase(c)}
@@ -621,6 +631,13 @@ export default function Dashboard() {
                         >
                           <CheckCircle2 className="w-3.5 h-3.5 mr-1.5" /> Approve &amp; Execute
                         </Button>
+                        <input
+                          type="text"
+                          placeholder="Rejection reason..."
+                          value={rejectNotes[c.id] || ""}
+                          onChange={(e) => setRejectNotes(prev => ({ ...prev, [c.id]: e.target.value }))}
+                          className="bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-xs text-slate-300 w-48"
+                        />
                         <Button
                           variant="outline"
                           size="sm"
@@ -630,7 +647,7 @@ export default function Dashboard() {
                         >
                           <XCircle className="w-3.5 h-3.5 mr-1.5" /> Reject
                         </Button>
-                      </>
+                      </div>
                     ) : (
                       <Badge variant="outline" className="bg-white/5 border-white/10 text-slate-400 text-[10px]">
                         No approval gate
@@ -828,7 +845,7 @@ export default function Dashboard() {
                   <ShieldCheck className="w-4 h-4 text-indigo-400" />
                   <h3 className="text-sm font-semibold text-white">Active Deterministic Guardrails (Policy Layer)</h3>
                 </div>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-xs">
                   <div className="p-3 bg-white/5 rounded-xl border border-white/5">
                     <span className="text-slate-400 block mb-1">Max Retry Cap:</span>
                     <span className="text-sm font-bold text-indigo-300">{policy.max_retries} attempts</span>
@@ -844,6 +861,14 @@ export default function Dashboard() {
                   <div className="p-3 bg-white/5 rounded-xl border border-white/5">
                     <span className="text-slate-400 block mb-1">Hard Decline Handling:</span>
                     <span className="text-sm font-bold text-emerald-300">Escalate, Never Retry</span>
+                  </div>
+                  <div className="p-3 bg-white/5 rounded-xl border border-white/5">
+                    <span className="text-slate-400 block mb-1">Staleness Window:</span>
+                    <span className="text-sm font-bold text-sky-300">{policy.follow_up_after_hours}h</span>
+                  </div>
+                  <div className="p-3 bg-white/5 rounded-xl border border-white/5">
+                    <span className="text-slate-400 block mb-1">Max Follow-ups:</span>
+                    <span className="text-sm font-bold text-purple-300">{policy.max_follow_ups} passes</span>
                   </div>
                 </div>
               </Card>

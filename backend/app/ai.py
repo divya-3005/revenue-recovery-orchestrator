@@ -156,7 +156,9 @@ def decide(case: RecoveryCase, diagnosis: DiagnosisResult, provider: AIProvider)
             f">= {POLICY['pre_debit_notice_hours']}."
         )
 
-    total_attempts = case.retry_count + case.follow_up_count
+    total_attempts = case.retry_count + case.follow_up_count  # for attempt-staging guidance
+    contact_count = case.contact_count  # for channel selection — excludes silent retries
+
 
     rejection_note = ""
     if case.last_rejection_note:
@@ -170,7 +172,8 @@ Amount: {case.amount_paise} paise
 Payment Rail: {case.payment_rail or "Not specified"}
 Failed Execution Attempts: {case.retry_count} (Max: {POLICY['max_retries']})
 Follow-Up Passes (re-engaged after no payment): {case.follow_up_count}
-Total Contacts So Far: {total_attempts}
+Total Attempts So Far (includes silent retries): {total_attempts}
+Customer Contacts So Far (real messages sent, excludes silent retries): {contact_count}
 Cumulative Discount: {case.cumulative_discount_paise} paise
 
 [DIAGNOSIS]
@@ -179,7 +182,7 @@ Reason: {diagnosis.specific_reason}
 Confidence: {diagnosis.confidence_score}
 
 [ACTIONS]
-1. retry_charge — silently re-attempt the customer's saved payment method. No customer contact. Use this as the FIRST response to a fresh soft decline (Total Contacts So Far == 0) UNLESS the case is on an eNACH/NACH mandate rail — RBI pre-debit notice applies to ANY debit attempt on a mandate, so there's no such thing as an immediate silent retry there; use create_payment_link with the compliant delay instead. Params: {{}}.
+1. retry_charge — silently re-attempt the customer's saved payment method. No customer contact. Use this as the FIRST response to a fresh soft decline (Total Attempts So Far == 0) UNLESS the case is on an eNACH/NACH mandate rail — RBI pre-debit notice applies to ANY debit attempt on a mandate, so there's no such thing as an immediate silent retry there; use create_payment_link with the compliant delay instead. Params: {{}}.
 2. switch_rail — move to a different, more reliable payment rail (e.g. card->upi). Use after one retry_charge has already failed on the current rail. Params: {{"target_rail": "upi"|"card"|"enach", "delay_hours": int, "channel": "email"|"sms"}}.{mandate_note}
 3. create_payment_link — ask the customer to pay via a link. For soft declines (after retry_charge/switch_rail have been tried), abandoned checkouts, overdue invoices. Params: {{"delay_hours": int, "channel": "email"|"sms"}}.{mandate_note}
 4. send_reminder — a lightweight nudge referencing an existing link/invoice, no new link created. Use for a LOW-VALUE first-contact abandoned checkout. Params: {{"channel": "email"|"sms"}}.
@@ -187,7 +190,7 @@ Confidence: {diagnosis.confidence_score}
 6. escalate_to_human — for disputes, hard declines, high-value, unknown/low-confidence
 7. stop — unrecoverable case (fraud confirmed)
 
-Prefer "email" for a customer's first contact and "sms" for any follow-up contact (Total Contacts So Far >= 1) — a second nudge is more urgent and more likely to be read as a text.{rejection_note}
+Prefer "email" for a customer's first REAL contact and "sms" for any follow-up contact (Customer Contacts So Far >= 1) — a second nudge is more urgent. A silent retry_charge does NOT count as a contact.{rejection_note}
 
 Output: recommended_action, action_parameters, confidence_score (0-1), reasoning (1-2 sentences)."""
 

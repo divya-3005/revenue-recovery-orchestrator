@@ -56,6 +56,7 @@ class CaseResponse(BaseModel):
     retry_count: int
     follow_up_count: int = 0
     contact_count: int = 0
+    scheduled_for: Optional[datetime] = None
     cumulative_discount_paise: int
     cumulative_comms_cost_paise: int
     recovered_amount_paise: int = 0

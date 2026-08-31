@@ -31,7 +31,7 @@ import logging
 import hmac
 import hashlib
 import os
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from typing import List
 
 from contextlib import asynccontextmanager
@@ -498,8 +498,10 @@ def run_follow_ups(force: bool = False, db: Session = Depends(get_db)):
     status_counts: dict = {}
     for r in results:
         status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+    engaged = len(results) - status_counts.get("scheduled", 0)
     return {
         "cases_checked": len(results),
+        "cases_engaged": engaged,
         "forced": force,
         "results": results,
         "status_counts": status_counts,
@@ -726,6 +728,9 @@ def _execute_approved(case_id: str):
                 case.cumulative_discount_paise += exec_result.action_parameters_used.get(
                     "discount_applied_paise", 0)
             case.status = CaseStatus.PAYMENT_PENDING
+            delay_hours = decision.action_parameters.get("delay_hours", 0)
+            if delay_hours > 0 and action in CUSTOMER_FACING_ACTIONS:
+                case.scheduled_for = datetime.now(timezone.utc) + timedelta(hours=delay_hours)
             _audit(db, case.id, "AWAITING_PAYMENT",
                    f"Approved action complete — awaiting payment. "
                    f"Next follow-up in {POLICY['follow_up_after_hours']}h.", exec_result.reason)

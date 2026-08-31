@@ -6,8 +6,6 @@ Tests the full pipeline: Case → Diagnosis → Decision → Policy → Comms �
 
 from datetime import date, timedelta
 from fastapi.testclient import TestClient
-from unittest.mock import patch
-
 from app.main import app, get_db
 import app.database as db_module
 from app.models import (
@@ -102,7 +100,7 @@ def test_pipeline_hard_decline_blocked():
     from app.pipeline import run_pipeline
     db = SessionLocal()
     try:
-        result = run_pipeline(db, case_id)
+        run_pipeline(db, case_id)
 
         # Hard decline should either be escalated (AI chose escalate) or failed (policy blocked)
         case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
@@ -340,7 +338,7 @@ def test_high_value_requires_approval():
     from app.pipeline import run_pipeline
     db = SessionLocal()
     try:
-        result = run_pipeline(db, case_id)
+        run_pipeline(db, case_id)
 
         case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
         # Should be awaiting approval or escalated

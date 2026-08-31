@@ -18,7 +18,7 @@ Regression tests for two logic bugs found in commit bbc26cb
 """
 from unittest.mock import patch
 
-from tests.test_pipeline import SessionLocal, client, _create_case
+from tests.test_pipeline import SessionLocal, client
 from app.models import (
     CaseStatus, RecoveryCase, CaseType, DiagnosisResult, DecisionResult,
     RootCauseCategory, RecoveryActionType, ExecutionResult, ExecutionStatus,

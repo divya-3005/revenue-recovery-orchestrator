@@ -118,7 +118,7 @@ def test_follow_up_reengages_stale_payment_pending_case():
 
     # Pass 0: fresh case, first response should be a silent retry_charge —
     # no customer contact, so no comms generated.
-    result = run_pipeline(SessionLocal(), case_id)
+    run_pipeline(SessionLocal(), case_id)
     db = SessionLocal()
     case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
     assert case.status == CaseStatus.PAYMENT_PENDING
