@@ -133,6 +133,15 @@ def run_follow_up_check(db: Session, now: Optional[datetime] = None, force: bool
 
     results = []
     for case in stale_cases:
+        if case.scheduled_for:
+            sched = case.scheduled_for
+            if sched.tzinfo is None:
+                sched = sched.replace(tzinfo=timezone.utc)
+            if sched > now:
+                continue
+
+        # _check_stopping_rules handles all policy-level blocks (max retries, hard declines).
+        # We share this with the main pipeline so follow-ups respect the same guardrails.
         stop_result = _check_stopping_rules(db, case)
         if stop_result is not None:
             results.append({"case_id": case.id, **stop_result})
@@ -210,8 +219,8 @@ def _run_attempt(
             # Route to human approval queue (Feature 9 + 15)
             case.status = CaseStatus.AWAITING_APPROVAL
             case.approval_status = ApprovalStatus.PENDING
-            # Bug #1 fix: store full model_dump so _execute_approved can
-            # validate it (canonical_json() omits confidence_score).
+            # store full model_dump so _execute_approved can validate it 
+            # (canonical_json() omits confidence_score).
             case.pending_decision_json = decision.model_dump(mode="json")
             case.pending_diagnosis_json = diagnosis.model_dump(mode="json")
             case.pending_decision_id = decision.decision_id
@@ -222,16 +231,19 @@ def _run_attempt(
             result = {"status": "awaiting_approval", "reason": policy.reason}
             return {"status": "awaiting_approval", "result": result}
         else:
-            # Policy blocked — case fails
-            case.status = CaseStatus.FAILED
-            _audit(db, case.id, "POLICY_BLOCKED", f"Recovery stopped: {policy.reason}", "")
+            # A hard policy block means "not this action", not "give up on the money".
+            # Escalate so a human can work it, rather than writing the case off.
+            case.status = CaseStatus.ESCALATED
+            _audit(db, case.id, "POLICY_BLOCKED",
+                f"Action blocked, case handed to human review: {policy.reason}",
+                "A guardrail rejected the proposed action; the case is still recoverable.")
             db.commit()
-            result = {"status": "failed", "reason": policy.reason}
-            return {"status": "failed", "result": result}
+            result = {"status": "escalated", "reason": policy.reason}
+            return {"status": "escalated", "result": result}
 
     # ── Generate communication (Feature 6) ──────────────────────────────
     # Only for actions that actually reach the customer.
-    # Bug #3 fix: use case.contact_count (customer-facing contacts only),
+    # use case.contact_count (customer-facing contacts only),
     # not attempt-based count that includes silent retry_charge.
     action = decision.recommended_action
     if action in CUSTOMER_FACING_ACTIONS:
@@ -244,8 +256,13 @@ def _run_attempt(
         _audit(db, case.id, "COMMUNICATION_GENERATED",
             f"Message generated (contact #{case.contact_count}, channel: {channel})", message)
         db.commit()
-
     # ── Execute action (Feature 5) ──────────────────────────────────────
+    delay_hours = decision.action_parameters.get("delay_hours", 0)
+    if delay_hours > 0:
+        case.scheduled_for = datetime.now(timezone.utc) + timedelta(hours=delay_hours)
+    else:
+        case.scheduled_for = None
+        
     exec_result = executor.execute(case, decision)
     _audit(db, case.id, "ACTION_EXECUTED",
         f"Execution {exec_result.status.value}: {exec_result.action_taken.value}",
@@ -286,9 +303,13 @@ def _run_attempt(
 
         # All other successful actions land here: awaiting async payment.
         case.status = CaseStatus.PAYMENT_PENDING
-        _audit(db, case.id, "AWAITING_PAYMENT",
-            f"Action complete — awaiting customer payment. "
-            f"Next follow-up in {POLICY['follow_up_after_hours']}h.", exec_result.reason)
+        if case.scheduled_for:
+            _audit(db, case.id, "SCHEDULED",
+                f"Action complete — next step scheduled for {case.scheduled_for.strftime('%Y-%m-%d %H:%M:%S UTC')}.", exec_result.reason)
+        else:
+            _audit(db, case.id, "AWAITING_PAYMENT",
+                f"Action complete — awaiting customer payment. "
+                f"Next follow-up in {POLICY['follow_up_after_hours']}h.", exec_result.reason)
         db.commit()
         result = {"status": "payment_pending", "reason": exec_result.reason}
         return {"status": "payment_pending", "result": result}

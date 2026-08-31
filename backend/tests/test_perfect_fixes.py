@@ -51,12 +51,14 @@ def _create_case_direct(case_type, amount, payload=None, payment_rail=None):
 
 
 def _age_case(case_id, hours):
-    """Force a case's updated_at into the past, simulating real elapsed
+    """Force a case's updated_at and scheduled_for into the past, simulating real elapsed
     time without needing the test to actually sleep."""
     db = SessionLocal()
     try:
         case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
         case.updated_at = datetime.now(timezone.utc) - timedelta(hours=hours)
+        if getattr(case, "scheduled_for", None):
+            case.scheduled_for = case.scheduled_for - timedelta(hours=hours)
         db.commit()
     finally:
         db.close()

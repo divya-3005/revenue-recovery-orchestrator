@@ -58,12 +58,27 @@ from app.comms import generate_message
 # Create all tables on startup (no Alembic needed for a hackathon project)
 Base.metadata.create_all(bind=engine)
 
+# No Alembic in scope — add any columns missing from an older SQLite file
+# so a stale recovery.db doesn't 500 on the first insert.
+if engine.url.get_backend_name() == "sqlite":
+    from sqlalchemy import inspect, text
+    existing = {c["name"] for c in inspect(engine).get_columns("recovery_cases")}
+    for col, ddl in [("contact_count", "INTEGER NOT NULL DEFAULT 0"),
+                     ("follow_up_count", "INTEGER NOT NULL DEFAULT 0"),
+                     ("last_rejection_note", "VARCHAR"),
+                     ("scheduled_for", "DATETIME")]:
+        if col not in existing:
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE recovery_cases ADD COLUMN {col} {ddl}"))
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The scheduler is disabled during pytest runs because background async loops 
+    # conflict with pytest-asyncio's strict event loop lifecycle management.
     if os.getenv("ENABLE_FOLLOW_UP_SCHEDULER") == "1" and not os.getenv("PYTEST_CURRENT_TEST"):
         task = asyncio.create_task(_follow_up_scheduler_loop())
         logger.info("Follow-up scheduler started.")
@@ -171,8 +186,6 @@ async def razorpay_webhook(
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON body")
 
-    # Bug #4 fix: Razorpay sends the unique event id as a header, not a
-    # body field. The body fallback keeps hand-crafted test payloads working.
     event_id = request.headers.get("x-razorpay-event-id") or event_payload.get("id")
     if not event_id:
         return {"status": "ignored", "reason": "no event id"}
@@ -187,8 +200,6 @@ async def razorpay_webhook(
 
     # ── Payment success → close the linked case ──
     if event_name in ("payment.captured", "order.paid", "invoice.paid", "payment_link.paid"):
-        # Bug #4 fix: Check every entity the event may carry — the case_id
-        # lives in the notes of whichever entity we created.
         case_id = None
         for key in ("payment_link", "payment", "invoice", "order"):
             notes = (data.get(key, {}).get("entity", {}) or {}).get("notes", {}) or {}
@@ -328,6 +339,7 @@ def approve_case(
     case.approval_status = ApprovalStatus.APPROVED
     case.approved_decision_id = body.decision_id
     case.approved_decision_hash = body.decision_hash
+    case.last_rejection_note = None
     _audit(db, case.id, "APPROVED", f"Approved by {body.reviewer_id}",
            f"Decision {body.decision_id} approved for execution.")
     db.commit()
@@ -344,7 +356,7 @@ def reject_case(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    """Reject an escalated action — stores feedback and re-runs the AI pipeline."""
+    """Reject an escalated action — stores feedback, stops automating this case, and re-runs the AI pipeline."""
     case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
     if not case:
         raise HTTPException(404, "Case not found")
@@ -376,6 +388,7 @@ def close_case(case_id: str, db: Session = Depends(get_db)):
         raise HTTPException(400, "Can only close escalated or approval-pending cases")
 
     case.status = CaseStatus.CLOSED
+    case.last_rejection_note = None
     _audit(db, case.id, "MANUAL_CLOSE", "Case closed by human reviewer.", "")
     db.commit()
     return {"status": "closed", "case_id": case_id}

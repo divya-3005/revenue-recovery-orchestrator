@@ -97,7 +97,7 @@ class RecoveryCase(Base):
     cumulative_discount_paise = Column(Integer, nullable=False, default=0)
     cumulative_comms_cost_paise = Column(Integer, nullable=False, default=0)
     opted_out = Column(Boolean, nullable=False, default=False)
-
+    scheduled_for = Column(DateTime(timezone=True), nullable=True)
     # Rejection feedback — fed back to the AI to avoid re-proposing the
     # same action the human just rejected.
     last_rejection_note = Column(String, nullable=True)

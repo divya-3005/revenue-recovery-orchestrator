@@ -159,7 +159,7 @@ def decide(case: RecoveryCase, diagnosis: DiagnosisResult, provider: AIProvider)
     total_attempts = case.retry_count + case.follow_up_count
 
     rejection_note = ""
-    if hasattr(case, 'last_rejection_note') and case.last_rejection_note:
+    if case.last_rejection_note:
         rejection_note = f"""\n\n[REVIEWER FEEDBACK]\nA human reviewer rejected the previous proposal: \"{case.last_rejection_note}\"\nPropose a DIFFERENT action that addresses this objection."""
 
     prompt = f"""You are an expert payments and revenue recovery AI.
@@ -214,12 +214,12 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
     total_attempts = case.retry_count + case.follow_up_count
     # Use contact_count (customer-facing messages sent) for channel picking,
     # not total_attempts (which includes silent retry_charge).
-    contact_count = getattr(case, 'contact_count', 0) or 0
+    contact_count = case.contact_count
     channel = _pick_channel(contact_count)
 
     # If a human rejected the previous proposal, escalate rather than
     # re-proposing the same action.
-    if hasattr(case, 'last_rejection_note') and case.last_rejection_note:
+    if case.last_rejection_note:
         return DecisionResult(
             recommended_action=RecoveryActionType.ESCALATE_TO_HUMAN,
             confidence_score=0.60,
@@ -292,12 +292,16 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
         cart_value = payload.get("cart_value", case.amount_paise)
         is_repeat = payload.get("is_repeat_customer", False)
         if is_repeat or cart_value >= 500_00:  # >= ₹500
-            return DecisionResult(
-                recommended_action=RecoveryActionType.OFFER_DISCOUNT,
-                action_parameters={"discount_percent": min(10, POLICY["max_discount_percent"])},
-                confidence_score=0.80,
-                reasoning="Repeat customer / high-value cart abandoned — offering a bounded discount to recover it.",
-            )
+            max_discount = int(case.amount_paise * POLICY["max_discount_percent"] / 100)
+            headroom_pct = int((max_discount - case.cumulative_discount_paise) * 100 / case.amount_paise)
+            if headroom_pct >= 5:
+                return DecisionResult(
+                    recommended_action=RecoveryActionType.OFFER_DISCOUNT,
+                    action_parameters={"discount_percent": min(10, headroom_pct)},
+                    confidence_score=0.80,
+                    reasoning=f"Repeat customer / high-value cart — offering {min(10, headroom_pct)}% "
+                              f"within the remaining discount headroom.",
+                )
         if total_attempts == 0:
             return DecisionResult(
                 recommended_action=RecoveryActionType.SEND_REMINDER,
