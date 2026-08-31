@@ -282,7 +282,7 @@ def _run_attempt(
     if exec_result.action_taken == RecoveryActionType.OFFER_DISCOUNT:
         discount = exec_result.action_parameters_used.get("discount_applied_paise", 0)
         if discount:
-            case.cumulative_discount_paise += discount
+            case.cumulative_discount_paise = max(case.cumulative_discount_paise, discount)
 
     # If the executor downgraded the channel (e.g. whatsapp -> sms),
     # keep the recorded channel truthful.
@@ -346,7 +346,7 @@ def _check_stopping_rules(db: Session, case: RecoveryCase) -> Optional[dict]:
     # Stop C: Promise-to-pay still in future — suppress recovery
     if case.promise_to_pay_date:
         today = datetime.now(timezone.utc).date()
-        if case.promise_to_pay_date > today:
+        if case.promise_to_pay_date >= today:
             _audit(db, case.id, "PTP_WAIT",
                 f"Suppressing recovery — customer promised to pay by {case.promise_to_pay_date}.",
                 "Recovery actions suspended until promise date.")

@@ -104,14 +104,14 @@ def evaluate_policy(
     else:
         note("high_value_gate", True)
 
-    # Rule 4: Cap cumulative discount
+    # Rule 4: Cap absolute discount
     if action == RecoveryActionType.OFFER_DISCOUNT:
         pct = params.get("discount_percent", 0)
         proposed_paise = int(case.amount_paise * pct / 100)
         max_paise = int(case.amount_paise * POLICY["max_discount_percent"] / 100)
-        if case.cumulative_discount_paise + proposed_paise > max_paise:
+        if proposed_paise > max_paise:
             note("discount_cap", False,
-                 reason=f"Cumulative discount would exceed {POLICY['max_discount_percent']}%.")
+                 reason=f"Proposed discount ({pct}%) exceeds cap of {POLICY['max_discount_percent']}%.")
         else:
             note("discount_cap", True)
     else:

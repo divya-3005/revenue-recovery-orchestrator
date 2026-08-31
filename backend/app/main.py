@@ -726,8 +726,10 @@ def _execute_approved(case_id: str):
 
         if exec_result.status in (ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN):
             if exec_result.action_taken == RecoveryActionType.OFFER_DISCOUNT:
-                case.cumulative_discount_paise += exec_result.action_parameters_used.get(
-                    "discount_applied_paise", 0)
+                case.cumulative_discount_paise = max(
+                    case.cumulative_discount_paise,
+                    exec_result.action_parameters_used.get("discount_applied_paise", 0)
+                )
             case.status = CaseStatus.PAYMENT_PENDING
             delay_hours = decision.action_parameters.get("delay_hours", 0)
             if delay_hours > 0 and action in CUSTOMER_FACING_ACTIONS:

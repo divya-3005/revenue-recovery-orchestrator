@@ -460,3 +460,25 @@ def test_followups_exhausted_escalates_even_while_scheduled():
         "a scheduled window for a contact it will never make.")
     assert "FOLLOWUPS_EXHAUSTED" in _audit_types(case_id)
     db.close()
+
+
+def test_discount_step_up_uses_absolute_percentage():
+    """Verify that AI correctly steps up the absolute discount, and the orchestrator
+    tracks the max discount offered rather than double-counting it."""
+    case_id = _create_case_direct("checkout_abandoned", 100_000,
+        payload={"is_repeat_customer": True, "cart_value": 100_000})
+
+    db = SessionLocal()
+    # First pass
+    run_pipeline(db, case_id)
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    # AI should offer 10% (10,000 paise)
+    assert case.cumulative_discount_paise == 10_000
+    
+    # Second pass (follow-up)
+    run_follow_up_check(db, force=True)
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    # AI should step up by 5%, making absolute discount 15% (15,000 paise)
+    # The cumulative should be max(10_000, 15_000) = 15_000
+    assert case.cumulative_discount_paise == 15_000
+    db.close()

@@ -295,15 +295,17 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
         cart_value = payload.get("cart_value", case.amount_paise)
         is_repeat = payload.get("is_repeat_customer", False)
         if is_repeat or cart_value >= 500_00:  # >= ₹500
-            max_discount = int(case.amount_paise * POLICY["max_discount_percent"] / 100)
-            headroom_pct = int((max_discount - case.cumulative_discount_paise) * 100 / case.amount_paise)
+            current_discount_pct = int(case.cumulative_discount_paise * 100 / case.amount_paise)
+            headroom_pct = POLICY["max_discount_percent"] - current_discount_pct
             if headroom_pct >= 5:
+                step_up = min(10, headroom_pct)
+                new_discount_pct = current_discount_pct + step_up
                 return DecisionResult(
                     recommended_action=RecoveryActionType.OFFER_DISCOUNT,
-                    action_parameters={"discount_percent": min(10, headroom_pct), "channel": channel},
+                    action_parameters={"discount_percent": new_discount_pct, "channel": channel},
                     confidence_score=0.80,
-                    reasoning=f"Repeat customer / high-value cart — offering {min(10, headroom_pct)}% "
-                              f"within the remaining discount headroom.",
+                    reasoning=f"Repeat customer / high-value cart — offering {new_discount_pct}% discount "
+                              f"(stepped up by {step_up}% from previous best offer).",
                 )
         if total_attempts == 0:
             return DecisionResult(
