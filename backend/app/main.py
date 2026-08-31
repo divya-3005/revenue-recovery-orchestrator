@@ -17,6 +17,7 @@ Endpoints:
   POST /api/v1/cases/{id}/promise-to-pay — Capture promise-to-pay date
   POST /api/v1/cases/{id}/opt-out — Customer opt-out
   POST /api/v1/batch              — Generate & process 50+ synthetic cases
+  POST /api/v1/jobs/run-follow-ups — Re-engage stale unpaid cases
   GET  /api/v1/analytics          — Recovery analytics dashboard
   GET  /api/v1/policy             — Current policy configuration
   POST /api/v1/demo/seed          — Seed 5 demo scenarios
@@ -40,15 +41,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from app.database import Base, engine, get_db
-from app.models import RecoveryCase, AuditLog, CaseType, CaseStatus, ApprovalStatus, DecisionResult
+from app.models import (
+    RecoveryCase, AuditLog, CaseType, CaseStatus, ApprovalStatus,
+    DecisionResult, DiagnosisResult, ExecutionStatus, RecoveryActionType,
+)
 from app.schemas import (
     CaseCreateRequest, CaseResponse, AuditLogResponse, PolicyConfigResponse,
     PromiseToPayRequest, ApprovalRequest, OptOutRequest,
 )
-from app.policy import POLICY
-from app.pipeline import run_pipeline, run_follow_up_check, _audit
+from app.policy import POLICY, evaluate_policy
+from app.pipeline import run_pipeline, run_follow_up_check, _audit, CUSTOMER_FACING_ACTIONS
 from app.synthetic import generate_batch, generate_demo_scenarios, compute_priority_score
 from app.executor import Executor
+from app.comms import generate_message
 
 # Create all tables on startup (no Alembic needed for a hackathon project)
 Base.metadata.create_all(bind=engine)
@@ -59,13 +64,6 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Off by default (and always off under pytest, which spins up TestClient
-    # instances against a swapped-out SessionLocal — a background loop
-    # started at import time would keep using the pre-swap engine and could
-    # interleave with test transactions). Set ENABLE_FOLLOW_UP_SCHEDULER=1
-    # to turn it on for a real long-running deployment;
-    # POST /api/v1/jobs/run-follow-ups covers the same job for
-    # cron/manual/demo use without it.
     if os.getenv("ENABLE_FOLLOW_UP_SCHEDULER") == "1" and not os.getenv("PYTEST_CURRENT_TEST"):
         task = asyncio.create_task(_follow_up_scheduler_loop())
         logger.info("Follow-up scheduler started.")
@@ -87,7 +85,6 @@ app.add_middleware(
 
 
 # ── Optional background scheduler for the follow-up re-loop ─────────────
-# Wired up from lifespan() above, gated behind ENABLE_FOLLOW_UP_SCHEDULER.
 
 async def _follow_up_scheduler_loop():
     from app.database import SessionLocal
@@ -138,12 +135,10 @@ def create_case(
     db.commit()
     db.refresh(case)
 
-    # Audit: signal received + normalized
     _audit(db, case.id, "SIGNAL_RECEIVED",
            f"Case created: {body.case_type.value}", "New recovery case ingested")
     db.commit()
 
-    # Run the recovery pipeline in the background
     background_tasks.add_task(_run_pipeline_safe, case.id)
 
     logger.info(f"Created case {case.id} for {case.customer_id}")
@@ -165,34 +160,41 @@ async def razorpay_webhook(
     body = await request.body()
     signature = request.headers.get("X-Razorpay-Signature", "")
     secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
-    
+
     if secret:
         expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, signature):
             raise HTTPException(400, "Invalid webhook signature")
-            
+
     try:
         event_payload = json.loads(body)
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON body")
-        
-    event_id = event_payload.get("id")
+
+    # Bug #4 fix: Razorpay sends the unique event id as a header, not a
+    # body field. The body fallback keeps hand-crafted test payloads working.
+    event_id = request.headers.get("x-razorpay-event-id") or event_payload.get("id")
     if not event_id:
         return {"status": "ignored", "reason": "no event id"}
-        
+
     # Idempotency check: Have we processed this event before?
     existing = db.query(RecoveryCase).filter(RecoveryCase.razorpay_event_id == event_id).first()
     if existing:
         return {"status": "ignored", "reason": "duplicate event"}
-        
+
     event_name = event_payload.get("event", "")
     data = event_payload.get("payload", {})
 
     # ── Payment success → close the linked case ──
     if event_name in ("payment.captured", "order.paid", "invoice.paid", "payment_link.paid"):
-        payment_entity = data.get("payment", {}).get("entity", {}) or data.get("payment_link", {}).get("entity", {})
-        notes = payment_entity.get("notes", {})
-        case_id = notes.get("case_id")
+        # Bug #4 fix: Check every entity the event may carry — the case_id
+        # lives in the notes of whichever entity we created.
+        case_id = None
+        for key in ("payment_link", "payment", "invoice", "order"):
+            notes = (data.get(key, {}).get("entity", {}) or {}).get("notes", {}) or {}
+            case_id = notes.get("case_id")
+            if case_id:
+                break
         if case_id:
             _simulate_payment(db, case_id)
             return {"status": "payment_confirmed", "case_id": case_id}
@@ -342,7 +344,7 @@ def reject_case(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    """Reject an escalated action — re-runs the AI pipeline."""
+    """Reject an escalated action — stores feedback and re-runs the AI pipeline."""
     case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
     if not case:
         raise HTTPException(404, "Case not found")
@@ -351,8 +353,13 @@ def reject_case(
 
     case.approval_status = ApprovalStatus.REJECTED
     case.status = CaseStatus.IN_PROGRESS
+    # Store rejection feedback so the AI doesn't re-propose the same action
+    case.last_rejection_note = getattr(body, 'note', None) or "Reviewer rejected the proposed action."
+    case.pending_decision_json = None
+    case.pending_decision_id = None
+    case.pending_decision_hash = None
     _audit(db, case.id, "REJECTED", f"Rejected by {body.reviewer_id}",
-           "Returned to AI pipeline for re-evaluation.")
+           f"Feedback: {case.last_rejection_note}")
     db.commit()
 
     background_tasks.add_task(_run_pipeline_safe, case_id)
@@ -462,32 +469,28 @@ def run_batch(db: Session = Depends(get_db)):
         "case_ids": created_ids,
         "results": results,
         "status_counts": status_counts,
+        "outcomes_simulated": True,
     }
 
 
 # ── Follow-Up Re-loop (Feature 6 tone ramp + Feature 7 re-loop) ─────────
 
 @app.post("/api/v1/jobs/run-follow-ups")
-def run_follow_ups(db: Session = Depends(get_db)):
+def run_follow_ups(force: bool = False, db: Session = Depends(get_db)):
     """
-    Re-engage PAYMENT_PENDING cases that have sat unpaid for longer than
-    POLICY['follow_up_after_hours'] with an escalated tone/channel, bounded
-    by POLICY['max_follow_ups']. This is what actually makes Feature 7's
-    "system with memory, not a one-shot script" true at runtime, and what
-    exercises Feature 6's gentle->firm->final tone ramp beyond a single
-    contact.
-
-    Point a cron / Celery-beat / GitHub Actions schedule at this endpoint in
-    production. It's also called automatically by the background loop below
-    when ENABLE_FOLLOW_UP_SCHEDULER=1, and can be triggered manually here at
-    any time — e.g. right after a demo batch, instead of waiting out the
-    real follow_up_after_hours window, to show the re-loop working live.
+    Re-engage PAYMENT_PENDING cases with an escalated tone/channel.
+    force=True bypasses the follow_up_after_hours window — use this in demos.
     """
-    results = run_follow_up_check(db)
+    results = run_follow_up_check(db, force=force)
     status_counts: dict = {}
     for r in results:
         status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
-    return {"cases_checked": len(results), "results": results, "status_counts": status_counts}
+    return {
+        "cases_checked": len(results),
+        "forced": force,
+        "results": results,
+        "status_counts": status_counts,
+    }
 
 
 # ── Demo Endpoints ──────────────────────────────────────────────────────
@@ -544,19 +547,14 @@ def get_analytics(db: Session = Depends(get_db)):
                 "net_recovered_paise": 0, "recovery_rate_percent": 0.0,
                 "net_recovery_rate_percent": 0.0, "total_discount_cost_paise": 0,
                 "total_comms_cost_paise": 0, "breakdown_by_case_type": {},
-                "breakdown_by_status": {}, "breakdown_by_channel": {}, "exceptions": []}
+                "breakdown_by_status": {}, "breakdown_by_channel": {},
+                "exceptions": [], "stopped_by_rule": []}
 
     at_risk = sum(c.amount_paise for c in cases)
     recovered_count = sum(1 for c in cases if c.status == CaseStatus.RECOVERED)
     recovered_paise = sum(c.recovered_amount_paise for c in cases)
     discounts = sum(c.cumulative_discount_paise for c in cases)
     comms_cost = sum(c.cumulative_comms_cost_paise for c in cases)
-    # recovered_amount_paise is already net of any discount applied
-    # (_simulate_payment stores amount_paise - cumulative_discount_paise),
-    # so net recovery only needs to subtract comms cost on top of that.
-    # total_discount_cost_paise is still returned below as an informational
-    # figure — it must NOT be subtracted again here or every discounted,
-    # recovered case gets double-counted against net.
     net = recovered_paise - comms_cost
 
     # Breakdown by case type
@@ -589,11 +587,17 @@ def get_analytics(db: Session = Depends(get_db)):
             by_channel[ch]["recovered"] += 1
         by_channel[ch]["recovered_paise"] += c.recovered_amount_paise
 
-    # Exception list (Feature 12)
+    # Split exceptions (unresolved) from stopped-by-rule (system working correctly)
+    UNRESOLVED = (CaseStatus.FAILED, CaseStatus.ESCALATED)
     exceptions = [
         {"case_id": c.id, "status": c.status.value, "case_type": c.case_type.value,
          "amount_paise": c.amount_paise}
-        for c in cases if c.status in (CaseStatus.FAILED, CaseStatus.ESCALATED, CaseStatus.CLOSED)
+        for c in cases if c.status in UNRESOLVED
+    ]
+    stopped_by_rule = [
+        {"case_id": c.id, "status": c.status.value, "case_type": c.case_type.value,
+         "amount_paise": c.amount_paise}
+        for c in cases if c.status == CaseStatus.CLOSED
     ]
 
     return {
@@ -609,6 +613,7 @@ def get_analytics(db: Session = Depends(get_db)):
         "breakdown_by_status": by_status,
         "breakdown_by_channel": by_channel,
         "exceptions": exceptions,
+        "stopped_by_rule": stopped_by_rule,
     }
 
 
@@ -644,9 +649,12 @@ def _run_pipeline_safe(case_id: str):
 
 
 def _execute_approved(case_id: str):
-    """Execute a human-approved action."""
+    """Execute a human-approved action, re-checking deterministic money
+    caps a human is NOT allowed to override."""
     from app.database import SessionLocal
+
     db = SessionLocal()
+    case = None
     try:
         case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
         if not case or not case.pending_decision_json:
@@ -655,29 +663,77 @@ def _execute_approved(case_id: str):
             return
 
         decision = DecisionResult.model_validate(case.pending_decision_json)
-        executor = Executor()
-        exec_result = executor.execute(case, decision)
 
+        # Integrity: the stored decision must still hash to what was approved.
+        if decision.canonical_hash() != case.approved_decision_hash:
+            _audit(db, case.id, "APPROVAL_INTEGRITY_FAILED",
+                   "Stored decision no longer matches the approved hash — refusing to execute.",
+                   "Possible tampering or a stale write; returned to escalation queue.")
+            case.status = CaseStatus.ESCALATED
+            db.commit()
+            return
+
+        # Re-run the guardrails. Human approval clears the high-value gate
+        # only — it cannot override the discount cap or the hard-decline block.
+        diagnosis = DiagnosisResult.model_validate(case.pending_diagnosis_json)
+        policy = evaluate_policy(case, decision, diagnosis, human_approved=True)
+        _audit(db, case.id, "POLICY_EVALUATED",
+               f"Post-approval re-check {'APPROVED' if policy.allowed else 'REJECTED'}: {policy.reason}",
+               json.dumps({"human_approved": True, "rules": policy.rules_checked}))
+        if not policy.allowed:
+            case.status = CaseStatus.FAILED
+            _audit(db, case.id, "POLICY_BLOCKED",
+                   f"Approved action still breaches a hard cap: {policy.reason}",
+                   "Human approval does not override discount/hard-decline limits.")
+            db.commit()
+            return
+
+        action = decision.recommended_action
+        if action in CUSTOMER_FACING_ACTIONS:
+            case.contact_count += 1
+            channel = decision.action_parameters.get("channel", "email")
+            message = generate_message(case, diagnosis, case.contact_count, channel)
+            case.latest_comms_preview = message
+            case.latest_channel = channel
+            case.cumulative_comms_cost_paise += 25
+            _audit(db, case.id, "COMMUNICATION_GENERATED",
+                   f"Message generated (contact #{case.contact_count}, channel: {channel})", message)
+
+        exec_result = Executor().execute(case, decision)
         _audit(db, case.id, "ACTION_EXECUTED",
                f"Approved action executed: {exec_result.status.value}",
                json.dumps({"reason": exec_result.reason,
                            "external_ref": exec_result.external_reference_id,
                            "params": exec_result.action_parameters_used}))
 
-        from app.models import ExecutionStatus, RecoveryActionType
         if exec_result.status in (ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN):
             if exec_result.action_taken == RecoveryActionType.OFFER_DISCOUNT:
-                discount = exec_result.action_parameters_used.get("discount_applied_paise", 0)
-                if discount:
-                    case.cumulative_discount_paise += discount
-
+                case.cumulative_discount_paise += exec_result.action_parameters_used.get(
+                    "discount_applied_paise", 0)
             case.status = CaseStatus.PAYMENT_PENDING
+            _audit(db, case.id, "AWAITING_PAYMENT",
+                   f"Approved action complete — awaiting payment. "
+                   f"Next follow-up in {POLICY['follow_up_after_hours']}h.", exec_result.reason)
         else:
-            case.status = CaseStatus.FAILED
-
+            case.status = CaseStatus.ESCALATED
+            _audit(db, case.id, "EXECUTION_FAILED",
+                   f"Approved action failed to execute: {exec_result.reason}",
+                   "Returned to the escalation queue for manual handling.")
         db.commit()
+
     except Exception as e:
         logger.error(f"Approved execution error for {case_id}: {e}")
+        db.rollback()
+        try:
+            case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+            if case:
+                case.status = CaseStatus.ESCALATED
+                _audit(db, case.id, "EXECUTION_ERROR",
+                       f"Approved action could not be executed: {e}",
+                       "Case returned to the escalation queue.")
+                db.commit()
+        except Exception:
+            pass
     finally:
         db.close()
 

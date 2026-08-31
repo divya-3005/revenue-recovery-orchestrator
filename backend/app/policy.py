@@ -33,10 +33,16 @@ def evaluate_policy(
     case: RecoveryCase,
     decision: DecisionResult,
     diagnosis: DiagnosisResult,
+    human_approved: bool = False,
 ) -> PolicyResult:
     """
     Check the AI's proposed action against every guardrail.
     Returns PolicyResult with allowed=True/False and the reason.
+
+    human_approved=True bypasses the high-value gate only (a human already
+    signed off on the amount). It does NOT override hard caps like
+    discount_cap or block_hard_decline — those are deterministic money
+    constraints no human should be able to wave through.
     """
     action = decision.recommended_action
     params = decision.action_parameters
@@ -73,7 +79,7 @@ def evaluate_policy(
     rules.append({"rule": "dispute_gate", "passed": True})
 
     # Rule 3: High-value cases need human approval for financial actions
-    if case.amount_paise > POLICY["require_human_approval_above_paise"]:
+    if case.amount_paise > POLICY["require_human_approval_above_paise"] and not human_approved:
         if action != RecoveryActionType.SEND_REMINDER:
             rules.append({"rule": "high_value_gate", "passed": False, "amount": case.amount_paise})
             return reject(

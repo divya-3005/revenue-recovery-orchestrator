@@ -158,6 +158,10 @@ def decide(case: RecoveryCase, diagnosis: DiagnosisResult, provider: AIProvider)
 
     total_attempts = case.retry_count + case.follow_up_count
 
+    rejection_note = ""
+    if hasattr(case, 'last_rejection_note') and case.last_rejection_note:
+        rejection_note = f"""\n\n[REVIEWER FEEDBACK]\nA human reviewer rejected the previous proposal: \"{case.last_rejection_note}\"\nPropose a DIFFERENT action that addresses this objection."""
+
     prompt = f"""You are an expert payments and revenue recovery AI.
 Based on the diagnosis and case state, propose the NEXT BEST recovery action.
 
@@ -183,7 +187,7 @@ Confidence: {diagnosis.confidence_score}
 6. escalate_to_human — for disputes, hard declines, high-value, unknown/low-confidence
 7. stop — unrecoverable case (fraud confirmed)
 
-Prefer "email" for a customer's first contact and "sms" for any follow-up contact (Total Contacts So Far >= 1) — a second nudge is more urgent and more likely to be read as a text.
+Prefer "email" for a customer's first contact and "sms" for any follow-up contact (Total Contacts So Far >= 1) — a second nudge is more urgent and more likely to be read as a text.{rejection_note}
 
 Output: recommended_action, action_parameters, confidence_score (0-1), reasoning (1-2 sentences)."""
 
@@ -192,13 +196,12 @@ Output: recommended_action, action_parameters, confidence_score (0-1), reasoning
     return _fallback_decide(case, diagnosis)
 
 
-def _pick_channel(total_attempts: int) -> str:
+def _pick_channel(contact_count: int) -> str:
     """First contact goes out over email; any re-engagement after that
     switches to SMS, which is more urgent and more likely to be read.
-    This is what actually makes 'Multi-Channel Recovery Execution'
-    (Feature 5) exercise more than one channel in practice — previously
-    every fallback branch hardcoded "email" and SMS was never selected."""
-    return "email" if total_attempts == 0 else "sms"
+    contact_count is the number of customer-facing messages already sent,
+    NOT total attempts (which includes silent retry_charge)."""
+    return "email" if contact_count == 0 else "sms"
 
 
 def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> DecisionResult:
@@ -208,14 +211,21 @@ def _fallback_decide(case: RecoveryCase, diagnosis: DiagnosisResult) -> Decision
     cat = diagnosis.root_cause_category
     rail = (case.payment_rail or "").lower()
     is_mandate_rail = rail in ("enach", "nach", "emandate", "mandate")
-    # retry_count = failed *execution* attempts (e.g. a Razorpay API error).
-    # follow_up_count = real-time re-engagement passes on an unpaid,
-    # PAYMENT_PENDING case (see pipeline.run_follow_up_check). Together they
-    # tell us how many times this case has already been worked, which is
-    # what stages retry_charge -> switch_rail -> create_payment_link below
-    # and what picks the channel via _pick_channel.
     total_attempts = case.retry_count + case.follow_up_count
-    channel = _pick_channel(total_attempts)
+    # Use contact_count (customer-facing messages sent) for channel picking,
+    # not total_attempts (which includes silent retry_charge).
+    contact_count = getattr(case, 'contact_count', 0) or 0
+    channel = _pick_channel(contact_count)
+
+    # If a human rejected the previous proposal, escalate rather than
+    # re-proposing the same action.
+    if hasattr(case, 'last_rejection_note') and case.last_rejection_note:
+        return DecisionResult(
+            recommended_action=RecoveryActionType.ESCALATE_TO_HUMAN,
+            confidence_score=0.60,
+            reasoning=f"Reviewer rejected the automated proposal ({case.last_rejection_note}) — "
+                      f"routing to manual handling rather than re-proposing the same action.",
+        )
 
     if cat == RootCauseCategory.HARD_DECLINE:
         return DecisionResult(

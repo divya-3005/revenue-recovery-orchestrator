@@ -143,15 +143,17 @@ def test_follow_up_reengages_stale_payment_pending_case():
         "different rail before asking for a brand-new link on the one "
         "that just failed."
     )
-    assert case.latest_channel == "sms", (
-        "Re-engagement contact should switch to SMS (more urgent than the "
-        "original email) — channel diversity never actually happened in "
-        "the rule-based fallback before this fix."
+    assert case.latest_channel == "email", (
+        "First real customer contact (after a silent retry_charge) should be "
+        "email — the gentle opener. SMS only fires on the second real contact."
     )
+    assert case.contact_count == 1, (
+        "A silent retry_charge must not consume a tone-ladder rung — the "
+        "customer's first real message has to open at 'gentle'.")
     db.close()
     types_after_1 = _audit_types(case_id)
     assert types_after_1.count("COMMUNICATION_GENERATED") == 1
-    assert any("contact #2" in l for l in
+    assert any("contact #1" in l for l in
         [log.description for log in SessionLocal().query(AuditLog).filter(
             AuditLog.case_id == case_id, AuditLog.action_type == "COMMUNICATION_GENERATED").all()])
 
@@ -291,3 +293,99 @@ def test_run_follow_ups_endpoint_and_batch_returns_results():
     policy_body = policy_resp.json()
     assert "follow_up_after_hours" in policy_body
     assert "max_follow_ups" in policy_body
+
+
+def test_approved_high_value_case_actually_executes():
+    """The approval gate must survive a decision stored by the pipeline
+    itself — not a hand-written dict that happens to validate."""
+    case_id = _create_case_direct(
+        "subscription_failed", 7_500_000,
+        payload={"reason": "insufficient_funds"},
+        payment_rail="card",
+    )
+    # Pipeline writes pending_decision_json via model_dump
+    run_pipeline(SessionLocal(), case_id)
+
+    db = SessionLocal()
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    assert case.status == CaseStatus.AWAITING_APPROVAL, (
+        f"High-value case should hit the approval gate, got {case.status}")
+    did = case.pending_decision_id
+    dh = case.pending_decision_hash
+    db.close()
+
+    resp = client.post(f"/api/v1/cases/{case_id}/approve", json={
+        "decision_id": did, "decision_hash": dh, "reviewer_id": "admin"})
+    assert resp.status_code == 200
+
+    # Wait for background task (TestClient runs them synchronously)
+    db = SessionLocal()
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    assert case.status != CaseStatus.AWAITING_APPROVAL, (
+        "Approved case is still parked in AWAITING_APPROVAL — the background "
+        "execution silently failed (Bug #1: canonical_json() omits confidence_score).")
+    assert "ACTION_EXECUTED" in _audit_types(case_id)
+    db.close()
+
+
+def test_webhook_reads_event_id_from_header():
+    """Razorpay sends x-razorpay-event-id as a header, not a body field.
+    The endpoint must accept it from the header."""
+    resp = client.post(
+        "/api/v1/webhooks/razorpay",
+        headers={"x-razorpay-event-id": "evt_hdr_test_001"},
+        json={
+            "event": "payment.failed",
+            "payload": {
+                "payment": {
+                    "entity": {
+                        "id": "pay_hdr_001", "amount": 50000,
+                        "customer_id": "cust_hdr", "email": "hdr@example.com",
+                        "method": "card", "error_reason": "insufficient_funds",
+                    }
+                }
+            }
+        })
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "created"
+
+    # Idempotency: same header event ID should be ignored
+    resp2 = client.post(
+        "/api/v1/webhooks/razorpay",
+        headers={"x-razorpay-event-id": "evt_hdr_test_001"},
+        json={"event": "payment.failed", "payload": {
+            "payment": {"entity": {"id": "pay_hdr_002", "amount": 50000,
+                                   "customer_id": "cust_hdr2", "method": "card"}}}})
+    assert resp2.json()["status"] == "ignored"
+    assert resp2.json()["reason"] == "duplicate event"
+
+
+def test_payment_link_paid_confirms_via_link_entity_notes():
+    """payment_link.paid carries the case_id in payment_link.entity.notes,
+    not payment.entity.notes. The webhook must search all entity types."""
+    # Create a case to confirm
+    case_id = _create_case_direct(
+        "checkout_abandoned", 30_000,
+        payload={"is_repeat_customer": True, "cart_value": 30_000},
+        payment_rail="upi",
+    )
+    run_pipeline(SessionLocal(), case_id)
+
+    resp = client.post(
+        "/api/v1/webhooks/razorpay",
+        headers={"x-razorpay-event-id": "evt_plink_paid_001"},
+        json={
+            "event": "payment_link.paid",
+            "payload": {
+                "payment_link": {"entity": {"id": "plink_1", "notes": {"case_id": case_id}}},
+                "payment": {"entity": {"id": "pay_plink_1", "amount": 30_000}},
+            }
+        })
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "payment_confirmed"
+
+    db = SessionLocal()
+    case = db.query(RecoveryCase).filter(RecoveryCase.id == case_id).first()
+    assert case.status == CaseStatus.RECOVERED
+    db.close()
+

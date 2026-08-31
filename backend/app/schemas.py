@@ -32,6 +32,7 @@ class ApprovalRequest(BaseModel):
     decision_id: str
     decision_hash: str
     reviewer_id: str
+    note: Optional[str] = None
 
 
 class OptOutRequest(BaseModel):
@@ -54,6 +55,7 @@ class CaseResponse(BaseModel):
     raw_signal_payload: Dict[str, Any]
     retry_count: int
     follow_up_count: int = 0
+    contact_count: int = 0
     cumulative_discount_paise: int
     cumulative_comms_cost_paise: int
     recovered_amount_paise: int = 0

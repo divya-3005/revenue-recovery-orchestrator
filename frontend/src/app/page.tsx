@@ -109,6 +109,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [noticeMsg, setNoticeMsg] = useState<string | null>(null);
 
   const reportError = async (res: Response, fallback: string) => {
     let detail = fallback;
@@ -190,9 +191,16 @@ export default function Dashboard() {
   const runFollowUps = async () => {
     setActionBusy("followups");
     setErrorMsg(null);
+    setNoticeMsg(null);
     try {
-      const res = await fetch(`${API_BASE}/jobs/run-follow-ups`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/jobs/run-follow-ups?force=true`, { method: "POST" });
       if (!res.ok) return reportError(res, "Failed to run follow-ups.");
+      const data = await res.json();
+      setNoticeMsg(
+        data.cases_checked === 0
+          ? "No unpaid cases to re-engage right now."
+          : `Re-engaged ${data.cases_checked} unpaid case(s) with an escalated message.`
+      );
       await refreshData();
     } catch {
       setErrorMsg("Couldn't reach the server to run follow-ups.");
@@ -355,10 +363,10 @@ export default function Dashboard() {
               size="sm"
               onClick={runFollowUps}
               disabled={actionBusy === "followups"}
-              title="Re-engage any PAYMENT_PENDING case that's gone stale past the follow-up window, with an escalated tone/channel"
+              title="Re-engage any unpaid PAYMENT_PENDING case immediately (bypasses the 48h window for demo purposes)"
               className="bg-white/5 border-white/10 text-slate-300 hover:bg-white/10"
             >
-              <RotateCw className="w-3.5 h-3.5 mr-1.5" /> {actionBusy === "followups" ? "Checking…" : "Run Follow-Ups"}
+              <RotateCw className="w-3.5 h-3.5 mr-1.5" /> {actionBusy === "followups" ? "Checking…" : "Re-engage Unpaid (Demo)"}
             </Button>
           </div>
         </header>
@@ -368,6 +376,16 @@ export default function Dashboard() {
             <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0 text-rose-400" />
             <p className="flex-1">{errorMsg}</p>
             <button onClick={() => setErrorMsg(null)} className="text-rose-400 hover:text-rose-200">
+              <XCircle className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {noticeMsg && (
+          <div className="flex items-start gap-2.5 p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-200 text-sm">
+            <CheckCircle2 className="w-4 h-4 mt-0.5 flex-shrink-0 text-emerald-400" />
+            <p className="flex-1">{noticeMsg}</p>
+            <button onClick={() => setNoticeMsg(null)} className="text-emerald-400 hover:text-emerald-200">
               <XCircle className="w-4 h-4" />
             </button>
           </div>
